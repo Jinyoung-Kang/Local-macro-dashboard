@@ -1,7 +1,7 @@
 """
 views/ai_report_view.py
 AI 거시경제 및 수급 심층 분석 리포트 뷰
-다형성 데이터 안전 파싱, 5대 컨텍스트 동시 수집 및 원본 검증 구역 탑재
+CFTC COT 튜플 언패킹, 다형성 데이터 안전 파싱, 5대 컨텍스트 동시 수집 및 원본 검증 구역 탑재
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -92,7 +92,8 @@ def render_ai_report_view():
                 sec_res = fut_sec.result()
                 krx_res = fut_krx.result()
                 krx_inv_res = fut_krx_inv.result()
-                cot_res = fut_cot.result()
+                cot_raw = fut_cot.result()
+                cot_res, cot_err = cot_raw if isinstance(cot_raw, tuple) else (cot_raw, None)
 
             # ------------------------------------------------------------------
             # 2단계: 기존 순서(1→2→3→4) 그대로 context 문자열 조립
