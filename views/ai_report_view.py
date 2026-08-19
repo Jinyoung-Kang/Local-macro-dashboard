@@ -1,7 +1,7 @@
 """
 views/ai_report_view.py
 AI 거시경제 및 수급 심층 분석 리포트 뷰
-컨텍스트 수집 4대 모듈 동시 병렬화 및 기존 순차 조립 구조 유지
+컨텍스트 수집 4대 모듈 동시 병렬화 및 ai_service 규격 정밀 매핑
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_call(fn, *args, **kwargs):
-    """ThreadPoolExecutor 내 예외 방어 래퍼"""
+    """ThreadPoolExecutor 내 안전 호출 래퍼"""
     try:
         return fn(*args, **kwargs)
     except Exception as e:
@@ -91,18 +91,19 @@ def render_ai_report_view():
             context += "#### 1. 거시경제 및 채권/금리 지표\n"
             if macro_res and isinstance(macro_res, tuple) and len(macro_res) >= 5:
                 collected_macro, r10_curr, r10_prev, r2_curr, r2_prev = macro_res
-                spread_curr = round(r10_curr - r2_curr, 3)
-                context += f"- 미국채 10년물 금리: {r10_curr:.2f}% (전일: {r10_prev:.2f}%)\n"
-                context += f"- 미국채 2년물 금리: {r2_curr:.2f}% (전일: {r2_prev:.2f}%)\n"
-                context += f"- 10Y-2Y 장단기 금리차: {spread_curr:+.3f}%p\n"
+                if r10_curr is not None and r2_curr is not None:
+                    spread_curr = round(r10_curr - r2_curr, 3)
+                    context += f"- 미국채 10년물 금리: {r10_curr:.2f}% (전일: {r10_prev:.2f}%)\n"
+                    context += f"- 미국채 2년물 금리: {r2_curr:.2f}% (전일: {r2_prev:.2f}%)\n"
+                    context += f"- 10Y-2Y 장단기 금리차: {spread_curr:+.3f}%p\n"
+
+                target_names = ["달러 인덱스", "WTI 원유", "금 (Gold)", "비트코인"]
                 if isinstance(collected_macro, dict):
-                    for k in ["달러 인덱스", "WTI 원유", "금 (Gold)", "비트코인"]:
-                        df_item = collected_macro.get(k)
-                        if df_item is not None and not df_item.empty and len(df_item) >= 2:
-                            curr_val = df_item["Close"].iloc[-1]
-                            prev_val = df_item["Close"].iloc[-2]
-                            chg = ((curr_val - prev_val) / prev_val) * 100
-                            context += f"- {k}: {curr_val:,.2f} ({chg:+.2f}%)\n"
+                    for cat_items in collected_macro.values():
+                        if isinstance(cat_items, list):
+                            for item in cat_items:
+                                if isinstance(item, dict) and item.get("name") in target_names and item.get("status") == "ok":
+                                    context += f"- {item['name']}: {item.get('price_str', '')} ({item.get('delta_str', '')})\n"
             else:
                 context += "- 거시경제 데이터 수집 실패 또는 지연\n"
             context += "\n"
@@ -145,7 +146,7 @@ def render_ai_report_view():
                 context += "- CFTC COT 포지션 리포트 수신 대기 중\n"
 
             # ------------------------------------------------------------------
-            # 3단계: AI 추론 엔진 호출 및 리포트 렌더링
+            # 3단계: AI 추론 엔진 호출 (올바른 prompt 인자 전달 및 dict 파싱)
             # ------------------------------------------------------------------
             system_prompt = (
                 "당신은 글로벌 헤지펀드의 최고투자책임자(CIO) 관점에서 시장을 분석하는 수석 매크로 전략가입니다. "
@@ -153,13 +154,20 @@ def render_ai_report_view():
                 "명확하고 구조화된 서식으로 제시하십시오."
             )
 
-            ai_response = call_selected_ai_engine(
+            res = call_selected_ai_engine(
                 engine_name=ai_engine,
-                system_prompt=system_prompt,
-                user_prompt=context
+                prompt=context,
+                system_prompt=system_prompt
             )
 
+            ai_response_text = res.get("response", res.get("error", "데이터 처리에 실패했습니다."))
+            pipeline_step = res.get("pipeline_step", "단일 호출 완료")
+
+            # ------------------------------------------------------------------
+            # 4단계: 리포트 렌더링
+            # ------------------------------------------------------------------
             st.markdown("---")
+            st.caption(f"⚡ 실행 엔진 파이프라인: `{pipeline_step}`")
             st.markdown(f"### 📋 {report_type} 분석 리포트")
             st.caption(f"분석 엔진: `{ai_engine}` | 생성 완료 시각: `{now_kst.strftime('%H:%M:%S KST')}`")
-            st.markdown(ai_response)
+            st.markdown(ai_response_text)
