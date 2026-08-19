@@ -1,4 +1,7 @@
-# config.py
+"""
+config.py
+매크로 대시보드 환경설정, API 엔드포인트/시크릿 관리 및 시장 지표·해석 메타데이터 정의
+"""
 import os
 import streamlit as st
 
@@ -16,6 +19,10 @@ def get_secret(key_path: str, default: str = "") -> str:
             for k in keys:
                 if hasattr(val, "get") and val.get(k) is not None:
                     val = val.get(k)
+                elif hasattr(val, "get") and val.get(k.lower()) is not None:
+                    val = val.get(k.lower())
+                elif hasattr(val, "get") and val.get(k.upper()) is not None:
+                    val = val.get(k.upper())
                 elif hasattr(val, "__getitem__") and k in val:
                     val = val[k]
                 else:
@@ -26,10 +33,11 @@ def get_secret(key_path: str, default: str = "") -> str:
 
             # 2. 단일 키 탐색
             leaf = keys[-1]
-            if hasattr(st.secrets, "get") and st.secrets.get(leaf) is not None:
-                return str(st.secrets.get(leaf)).strip()
-            if hasattr(st.secrets, "get") and st.secrets.get(leaf.upper()) is not None:
-                return str(st.secrets.get(leaf.upper())).strip()
+            for candidate in [key_path, key_path.replace(".", "_"), leaf, leaf.lower(), leaf.upper()]:
+                if hasattr(st.secrets, "get") and st.secrets.get(candidate) is not None:
+                    return str(st.secrets.get(candidate)).strip()
+                if hasattr(st.secrets, "__contains__") and candidate in st.secrets:
+                    return str(st.secrets[candidate]).strip()
     except Exception:
         pass
     return os.environ.get(key_path, os.environ.get(key_path.replace(".", "_").upper(), default))
@@ -48,12 +56,28 @@ def get_krx_key() -> str:
         key = get_secret("krx_api_key", "")
     return key
 
+
+def get_fred_key() -> str:
+    """
+    Streamlit Secrets의 [fred] api_key 또는 FRED_API_KEY 등 자동 탐색
+    """
+    key = get_secret("fred.api_key", "")
+    if not key:
+        key = get_secret("FRED_API_KEY", "")
+    if not key:
+        key = get_secret("fred_api_key", "")
+    return key
+
+
 # 앱 비밀번호
 APP_PASSWORD = get_secret("auth.password", get_secret("APP_PASSWORD", "admin1234@"))
+AUTH_PASSWORD = APP_PASSWORD
 
-# KRX Open API 설정
+# KRX / FRED Open API 설정
 KRX_AUTH_KEY = get_krx_key()
-KRX_BASE_URL = "http://data-dbg.krx.co.kr/svc/apis"
+KRX_BASE_URL = "https://data-dbg.krx.co.kr/svc/apis"
+FRED_BASE_URL = "https://api.stlouisfed.org/fred"
+
 
 # ==============================================================================
 # 1. 거시경제 매크로 지표 카테고리 매핑
@@ -89,6 +113,7 @@ MACRO_CATEGORIES = {
     }
 }
 
+
 # ==============================================================================
 # 2. SEC 13F 주요 기관 매핑
 # ==============================================================================
@@ -107,6 +132,7 @@ INSTITUTIONS = {
     "🇺🇸 사이언 자산운용 (Scion Asset Management)": {"cik": "0001649339", "desc": "마이클 버리의 역발상 딥밸류 및 숏(풋옵션)/롱 전략 "}
 }
 
+
 # ==============================================================================
 # 3. 11대 S&P 500 섹터 ETF 매핑
 # ==============================================================================
@@ -124,6 +150,7 @@ SECTOR_ETFS = {
     "XLRE": {"name": "부동산 (Real Estate)", "type": "방어주 / 금리민감"}
 }
 
+
 # ==============================================================================
 # 4. 글로벌 주요 자산군 ETF 매핑
 # ==============================================================================
@@ -140,6 +167,7 @@ ASSET_CLASS_ETFS = {
     "DBA": {"name": "농산물 (Agriculture)", "category": "원자재"},
     "UUP": {"name": "미국 달러 인덱스 ETF", "category": "통화"}
 }
+
 
 # ==============================================================================
 # 5. 장단기 금리차 및 리스크 모델 해석 테이블
@@ -189,6 +217,7 @@ RISK_MODEL_TABLE = {
         "18개 금융시장 지표(자금, 채권, 주식 등)를 종합한 복합 척도. 0보다 크면 스트레스 고조, 1.0 초과 시 시스템 위기."
     ]
 }
+
 
 # ==============================================================================
 # 6. 실시간 거래소 시계 & 휴장 판별 HTML
