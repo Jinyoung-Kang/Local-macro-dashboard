@@ -6,6 +6,7 @@ ThreadPoolExecutor 기반 I/O 병렬 처리 및 macro_view 계약(Contract) 100%
 import io
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import pandas as pd
@@ -47,17 +48,14 @@ def get_fred_key() -> str:
 # ==============================================================================
 # 1. UI 헬퍼 및 브리핑 생성기 (views/macro_view.py 필수 의존성)
 # ==============================================================================
-def clean_tag_ui(val, prefix="", suffix="", is_pct=False):
-    """지표 수치 포맷팅 헬퍼"""
-    if val is None or pd.isna(val):
-        return "-"
-    try:
-        f = float(val)
-        if is_pct:
-            return f"{prefix}{f:+.2f}%{suffix}"
-        return f"{prefix}{f:,.2f}{suffix}"
-    except Exception:
-        return str(val)
+def clean_tag_ui(tag_str: str) -> str:
+    """UI 상에 지표 이름의 마크다운 스타일 태그(:gray[...], [[...]] 등)를 정제"""
+    if not isinstance(tag_str, str):
+        return str(tag_str)
+    clean = re.sub(r':gray\[.*?\]', '', tag_str)
+    clean = re.sub(r'\[\[.*?\]\]', '', clean)
+    clean = re.sub(r'\[.*?\]', '', clean)
+    return clean.strip()
 
 
 def generate_briefing_text(
