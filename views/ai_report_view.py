@@ -1,7 +1,7 @@
 """
 views/ai_report_view.py
 AI 거시경제 및 수급 심층 분석 리포트 뷰
-다형성 데이터(DataFrame/List/Dict) 안전 파싱, ai_service 연동 및 데이터 출처 검증 구역 탑재
+다형성 데이터 안전 파싱, 5대 컨텍스트 동시 수집 및 원본 검증 구역 탑재
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 from services.ai_service import call_selected_ai_engine
 from services.cot_service import fetch_cftc_cot_legacy
-from services.krx_service import get_krx_futures_history
+from services.krx_service import get_krx_futures_history, get_krx_investor_derivatives_summary
 from services.macro_service import get_collected_macro_data
 from services.sec_service import load_all_institutions_data
 
@@ -77,19 +77,21 @@ def render_ai_report_view():
         generate_btn = st.button("🚀 리포트 생성", type="primary", use_container_width=True)
 
     if generate_btn:
-        with st.spinner("⚡ 4개 영역 시장 데이터 병렬 수집 및 AI 심층 추론 중..."):
+        with st.spinner("⚡ 5개 영역 시장 데이터 병렬 수집 및 AI 심층 추론 중..."):
             # ------------------------------------------------------------------
-            # 1단계: 4대 독립 데이터 소스를 ThreadPoolExecutor로 동시에 수집
+            # 1단계: 5대 독립 데이터 소스를 ThreadPoolExecutor로 동시에 수집
             # ------------------------------------------------------------------
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=5) as executor:
                 fut_macro = executor.submit(_safe_call, get_collected_macro_data)
                 fut_sec = executor.submit(_safe_call, load_all_institutions_data)
                 fut_krx = executor.submit(_safe_call, get_krx_futures_history, 40)
-                fut_cot = executor.submit(_safe_call, fetch_cftc_cot_legacy, "099741")
+                fut_krx_inv = executor.submit(_safe_call, get_krx_investor_derivatives_summary)
+                fut_cot = executor.submit(_safe_call, fetch_cftc_cot_legacy, "13874A")
 
                 macro_res = fut_macro.result()
                 sec_res = fut_sec.result()
                 krx_res = fut_krx.result()
+                krx_inv_res = fut_krx_inv.result()
                 cot_res = fut_cot.result()
 
             # ------------------------------------------------------------------
@@ -108,13 +110,14 @@ def render_ai_report_view():
                     context += f"- 미국채 2년물 금리: {r2_curr:.2f}% (전일: {r2_prev:.2f}%)\n"
                     context += f"- 10Y-2Y 장단기 금리차: {spread_curr:+.3f}%p\n"
 
-                target_names = ["달러 인덱스", "WTI 원유", "금 (Gold)", "비트코인"]
                 if isinstance(collected_macro, dict):
-                    for cat_items in collected_macro.values():
-                        if isinstance(cat_items, list):
-                            for item in cat_items:
-                                if isinstance(item, dict) and item.get("name") in target_names and item.get("status") == "ok":
-                                    context += f"- {item['name']}: {item.get('price_str', '')} ({item.get('delta_str', '')})\n"
+                    for cat_name, items in collected_macro.items():
+                        if isinstance(items, list) and items:
+                            ok_items = [it for it in items if isinstance(it, dict) and it.get("status") == "ok"]
+                            if ok_items:
+                                context += f"\n**{cat_name}**\n"
+                                for item in ok_items:
+                                    context += f"- {item.get('name','')}: {item.get('price_str','')} ({item.get('delta_str','')})\n"
             else:
                 context += "- 거시경제 데이터 수집 실패 또는 지연\n"
             context += "\n"
@@ -148,42 +151,40 @@ def render_ai_report_view():
                 context += "- SEC 13F 데이터 수집 대기 상태\n"
             context += "\n"
 
-            # #### 3. KRX 외국인/기관 선물 누적 순매수
+            # #### 3. KRX 외국인/기관 선물 누적 수급 동향
             context += "#### 3. KRX 외국인/기관 선물 누적 수급 동향\n"
-            if _is_valid_data(krx_res):
-                if isinstance(krx_res, pd.DataFrame):
-                    latest_krx = krx_res.iloc[-1]
-                    f_cum = latest_krx.get("Foreigner_Cum", 0)
-                    i_cum = latest_krx.get("Institution_Cum", 0)
-                    context += f"- 외국인 선물 누적 순매수: {f_cum:+,} 계약\n"
-                    context += f"- 기관 선물 누적 순매수: {i_cum:+,} 계약\n"
-                elif isinstance(krx_res, list) and len(krx_res) > 0:
-                    latest_krx = krx_res[-1]
-                    if isinstance(latest_krx, dict):
-                        f_cum = latest_krx.get("Foreigner_Cum", 0)
-                        i_cum = latest_krx.get("Institution_Cum", 0)
-                        context += f"- 외국인 선물 누적 순매수: {f_cum:+,} 계약\n"
-                        context += f"- 기관 선물 누적 순매수: {i_cum:+,} 계약\n"
+            if _is_valid_data(krx_res) and isinstance(krx_res, pd.DataFrame):
+                latest_krx = krx_res.iloc[-1]
+                context += f"- 선물 종가: {latest_krx.get('Futures_Close', 0)} pt\n"
+                context += f"- 시장 베이시스: {latest_krx.get('Market_Basis', 0):+.2f} pt\n"
+                context += f"- 미결제약정: {int(latest_krx.get('Open_Interest', 0)):,} 계약\n"
+                context += f"- 파생 수급 국면: {latest_krx.get('Market_Phase', '알수없음')}\n"
+                context += f"- 한국판 COT Index: {float(latest_krx.get('COT_OI_Index', 0)):.1f}%\n"
             else:
-                context += "- KRX 파생상품 수급 데이터 원장 정리 중\n"
+                context += "- KRX 선물 시계열 데이터 수집 대기 상태\n"
+
+            if _is_valid_data(krx_inv_res) and isinstance(krx_inv_res, pd.DataFrame):
+                context += "- 주요 투자자 20일 누적 순매수:\n"
+                for _, r in krx_inv_res.iterrows():
+                    subj = r.get("투자 주체", r.get("주체", "Unknown"))
+                    amt = r.get("20일 누적", r.get("20일 누적 순매수 (계약)", 0))
+                    context += f"  * {subj}: {amt:+,} 계약\n"
             context += "\n"
 
             # #### 4. CFTC COT 선물 투기적 포지션
             context += "#### 4. CFTC COT 투기적 포지션 동향\n"
-            if _is_valid_data(cot_res):
-                if isinstance(cot_res, pd.DataFrame):
-                    latest_cot = cot_res.iloc[-1]
-                    net_pos = latest_cot.get("Net_Positions", "N/A")
-                    comm_pos = latest_cot.get("Commercial_Net", "N/A")
-                    context += f"- S&P500 비상업(투기적) 순포지션: {net_pos}\n"
-                    context += f"- 상업(헤지) 순포지션: {comm_pos}\n"
-                elif isinstance(cot_res, list) and len(cot_res) > 0:
-                    latest_cot = cot_res[-1]
-                    if isinstance(latest_cot, dict):
-                        net_pos = latest_cot.get("Net_Positions", "N/A")
-                        comm_pos = latest_cot.get("Commercial_Net", "N/A")
-                        context += f"- S&P500 비상업(투기적) 순포지션: {net_pos}\n"
-                        context += f"- 상업(헤지) 순포지션: {comm_pos}\n"
+            if _is_valid_data(cot_res) and isinstance(cot_res, pd.DataFrame) and "nc_net" in cot_res.columns:
+                df_sorted = cot_res.sort_values("date")
+                latest_cot = df_sorted.iloc[-1]
+                prev_cot = df_sorted.iloc[-2] if len(df_sorted) > 1 else latest_cot
+                date_val = latest_cot.get("date")
+                date_str = date_val.strftime("%Y-%m-%d") if hasattr(date_val, "strftime") else str(date_val)
+                nc_net = latest_cot.get("nc_net", 0)
+                comm_net = latest_cot.get("comm_net", 0)
+                nc_chg = nc_net - prev_cot.get("nc_net", nc_net)
+                context += f"- 기준일: {date_str}\n"
+                context += f"- 비상업(투기적/스마트머니) 순포지션: {int(nc_net):+,} 계약 (전주 대비 {int(nc_chg):+,})\n"
+                context += f"- 상업(헤지) 순포지션: {int(comm_net):+,} 계약\n"
             else:
                 context += "- CFTC COT 포지션 리포트 수신 대기 중\n"
 
@@ -215,7 +216,7 @@ def render_ai_report_view():
             st.markdown(ai_response_text)
 
             # ------------------------------------------------------------------
-            # 5단계: [신규] 수집 데이터 출처(Data Provenance) 및 원본 검증 구역
+            # 5단계: 수집 데이터 출처(Data Provenance) 및 원본 검증 구역
             # ------------------------------------------------------------------
             st.markdown("---")
             st.markdown("#### 🔍 AI 리포트 작성에 수집·활용된 데이터 출처 및 원본 데이터셋")
@@ -229,7 +230,7 @@ def render_ai_report_view():
                 st.caption("• 소스: `U.S. SEC EDGAR (Form 13F)`\n• 대상: 버크셔, 브릿지워터, 사이언 등")
             with p3:
                 st.markdown("**3. KRX 선물 누적 수급**")
-                st.caption("• 소스: `한국거래소(KRX) OpenAPI / KIS`\n• 대상: KOSPI 200 선물 외인/기관 포지션")
+                st.caption("• 소스: `한국거래소(KRX) OpenAPI`\n• 대상: KOSPI 200 선물 외인/기관 포지션")
             with p4:
                 st.markdown("**4. CFTC COT 선물 포지션**")
                 st.caption("• 소스: `U.S. CFTC (Commitments of Traders)`\n• 대상: S&P500 비상업 순포지션")
