@@ -1,7 +1,7 @@
 """
 services/macro_service.py
 거시경제 지표, 금리, 환율, 원자재 데이터 수집 엔진
-ThreadPoolExecutor 기반 I/O 병렬 처리 및 macro_view 계약(Contract) 100% 준수
+ThreadPoolExecutor 기반 I/O 병렬 처리 및 macro_view DatetimeIndex 계약 완벽 준수
 """
 import io
 import logging
@@ -87,23 +87,22 @@ def generate_briefing_text(
             f"(10Y-2Y 스프레드: `{spread:+.3f}%p` - **{spread_status}**)"
         )
 
-    # 2. 시장 리스크 및 변동성 지표
+    # 2. 시장 리스크 및 변동성 지표 (.iloc[:, 0]으로 컬럼명 불문 안전 접근)
     risk_items = []
     if vix_hist is not None and isinstance(vix_hist, pd.DataFrame) and not vix_hist.empty:
-        vix_val = vix_hist["Close"].iloc[-1]
+        vix_val = vix_hist.iloc[:, 0].iloc[-1] if "Close" not in vix_hist.columns else vix_hist["Close"].iloc[-1]
         risk_items.append(f"VIX `{vix_val:.2f}`")
     if move_hist is not None and isinstance(move_hist, pd.DataFrame) and not move_hist.empty:
-        move_val = move_hist["Close"].iloc[-1]
+        move_val = move_hist.iloc[:, 0].iloc[-1] if "Close" not in move_hist.columns else move_hist["Close"].iloc[-1]
         risk_items.append(f"MOVE `{move_val:.2f}`")
     if hy_df is not None and isinstance(hy_df, pd.DataFrame) and not hy_df.empty:
-        hy_val = hy_df["Close"].iloc[-1]
+        hy_val = hy_df.iloc[:, 0].iloc[-1]
         risk_items.append(f"HY 스프레드 `{hy_val:.2f}%`")
     if cp_spread_df is not None and isinstance(cp_spread_df, pd.DataFrame) and not cp_spread_df.empty:
-        col = "Spread" if "Spread" in cp_spread_df.columns else "Close"
-        cp_val = cp_spread_df[col].iloc[-1]
+        cp_val = cp_spread_df.iloc[:, 0].iloc[-1]
         risk_items.append(f"3M CP 스프레드 `{cp_val:.2f}%p`")
     if stlfsi_df is not None and isinstance(stlfsi_df, pd.DataFrame) and not stlfsi_df.empty:
-        stlfsi_val = stlfsi_df["Close"].iloc[-1]
+        stlfsi_val = stlfsi_df.iloc[:, 0].iloc[-1]
         risk_items.append(f"STLFSI4 `{stlfsi_val:.3f}`")
 
     if risk_items:
@@ -128,99 +127,106 @@ def generate_briefing_text(
 
 
 # ==============================================================================
-# 2. yfinance / FRED 데이터 수집 엔진
+# 2. yfinance / FRED 데이터 수집 엔진 (DatetimeIndex 보존)
 # ==============================================================================
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_ticker_data(symbol: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
-    """단일 티커 yfinance 데이터 수집 (^MOVE 특수 처리 포함)"""
-    try:
-        sym = symbol
-        if sym == "^MOVE":
+def fetch_ticker_data(symbol: str, period: str = "1mo", interval: str = "1d") -> pd.DataFrame:
+    """단일 티커 yfinance 데이터 수집 (DatetimeIndex 보존 및 ^MOVE 특수 처리)"""
+    if not symbol:
+        return pd.DataFrame()
+
+    if symbol in ["^MOVE", "MOVE", "MOVE:INDEX"]:
+        try:
             tk = yf.Ticker("^MOVE")
             df = tk.history(period="1mo", interval="1d")
             if df.empty:
                 tk = yf.Ticker("MOVE")
                 df = tk.history(period="1mo", interval="1d")
-        else:
-            tk = yf.Ticker(sym)
-            df = tk.history(period=period, interval=interval)
-
-        if df.empty or len(df) == 0:
-            return pd.DataFrame()
-        df = df.reset_index()
-        df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
-        return df.sort_values("Date").reset_index(drop=True)
-    except Exception as e:
-        logger.warning(f"티커({symbol}) 조회 실패: {e}")
+            if not df.empty:
+                return df
+        except Exception as e:
+            logger.warning(f"MOVE 조회 실패: {e}")
         return pd.DataFrame()
+
+    try:
+        tk = yf.Ticker(symbol)
+        df = tk.history(period=period, interval=interval)
+        if df is not None and not df.empty:
+            df = df.dropna(subset=['Close'])
+            df = df[df['Close'] > 0]
+            if len(df) >= 1:
+                return df
+    except Exception as e:
+        logger.warning(f"yfinance 수집 실패 ({symbol}): {e}")
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_fred_series(series_id: str, start_date: str = None, api_key: str = None) -> pd.DataFrame:
-    """FRED 시계열 수집 (1차: REST API -> 2차: Direct CSV 다운로드)"""
+def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = None) -> pd.DataFrame:
+    """FRED 시계열 수집 (DatetimeIndex 인덱스 및 series_id 컬럼명 매핑)"""
     key = api_key or get_fred_key()
+    start_date = (datetime.now() - timedelta(days=period_years * 365 + 60)).strftime("%Y-%m-%d")
 
-    if not start_date:
-        start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
-
+    # 1차: 공식 FRED REST API
     if key:
-        url = f"{FRED_BASE_URL}/series/observations"
-        params = {
-            "series_id": series_id,
-            "api_key": key,
-            "file_type": "json",
-            "observation_start": start_date,
-            "sort_order": "asc"
-        }
         try:
-            res = requests.get(url, params=params, timeout=5)
+            url = f"{FRED_BASE_URL}/series/observations"
+            params = {
+                "series_id": series_id,
+                "api_key": key,
+                "file_type": "json",
+                "observation_start": start_date,
+                "sort_order": "asc"
+            }
+            res = requests.get(url, params=params, timeout=10)
             if res.status_code == 200:
-                obs = res.json().get("observations", [])
-                if obs:
-                    records = []
-                    for o in obs:
-                        v = o.get("value", ".")
-                        if v != ".":
-                            records.append({"Date": pd.to_datetime(o["date"]), "Close": float(v)})
-                    df = pd.DataFrame(records)
-                    if not df.empty:
-                        return df.sort_values("Date").reset_index(drop=True)
-        except Exception:
-            pass
+                data = res.json().get("observations", [])
+                if data:
+                    df = pd.DataFrame(data)[["date", "value"]]
+                    df["date"] = pd.to_datetime(df["date"])
+                    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                    df = df.dropna().rename(columns={"value": series_id}).set_index("date")
+                    if not df.empty and len(df) >= 2:
+                        return df
+        except Exception as e:
+            logger.warning(f"FRED API 실패 ({series_id}): {e}")
 
+    # 2차: FRED Direct CSV 다운로드 폴백
     try:
         csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         headers = {"User-Agent": "Mozilla/5.0"}
-        res_csv = requests.get(csv_url, headers=headers, timeout=5)
-        if res_csv.status_code == 200:
-            df_csv = pd.read_csv(io.StringIO(res_csv.text))
-            df_csv.columns = ["Date", "Close"]
-            df_csv["Close"] = pd.to_numeric(df_csv["Close"], errors="coerce")
+        res_csv = requests.get(csv_url, headers=headers, timeout=15)
+        if res_csv.status_code == 200 and len(res_csv.text) > 30:
+            df_csv = pd.read_csv(io.StringIO(res_csv.text), parse_dates=["DATE"], index_col="DATE", na_values=".")
             df_csv = df_csv.dropna()
-            df_csv["Date"] = pd.to_datetime(df_csv["Date"])
-            if not df_csv.empty:
-                return df_csv.sort_values("Date").reset_index(drop=True)
+            df_csv.columns = [series_id]
+            if not df_csv.empty and len(df_csv) >= 2:
+                return df_csv
     except Exception as e:
-        logger.warning(f"FRED CSV({series_id}) 수집 실패: {e}")
+        logger.warning(f"FRED CSV 다운로드 실패 ({series_id}): {e}")
 
     return pd.DataFrame()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
-    """FRED Commercial Paper Spread (30일물 CP vs 3개월 국채) 산출"""
+    """FRED Commercial Paper Spread (30일물 CP vs 3개월 국채, 컬럼명: CP_SPREAD)"""
     key = api_key or get_fred_key()
-    df_cp = fetch_fred_series("RIFSPPNA30NB", api_key=key)
-    df_tb = fetch_fred_series("DTB3", api_key=key)
+    df_cp = fetch_fred_series("CPF3M", api_key=key)
+    df_tb = fetch_fred_series("DGS3MO", api_key=key)
+    if df_tb.empty:
+        df_tb = fetch_fred_series("DFF", api_key=key)
+
     if not df_cp.empty and not df_tb.empty:
-        df = pd.merge(df_cp, df_tb, on="Date", suffixes=("_CP", "_TB")).dropna()
-        df["Spread"] = df["Close_CP"] - df["Close_TB"]
-        return df[["Date", "Spread"]]
+        combined = pd.DataFrame({"CP": df_cp.iloc[:, 0], "TB": df_tb.iloc[:, 0]}).ffill().dropna()
+        combined["CP_SPREAD"] = (combined["CP"] - combined["TB"]).round(2)
+        if not combined.empty and len(combined) >= 2:
+            return combined[["CP_SPREAD"]]
     return pd.DataFrame()
 
 
 # ==============================================================================
-# 3. 매크로 데이터 병렬 수집 (views/macro_view.py 원본 계약 완전 일치)
+# 3. 매크로 데이터 병렬 수집 (views/macro_view.py 원본 계약 완전 준수)
 # ==============================================================================
 @st.cache_data(ttl=30, show_spinner=False)
 def get_collected_macro_data():
