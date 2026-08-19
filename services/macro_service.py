@@ -1,7 +1,7 @@
 """
 services/macro_service.py
 거시경제 지표, 금리, 환율, 원자재 데이터 수집 엔진
-ThreadPoolExecutor 기반 I/O 병렬 처리 및 macro_view 계약 완벽 준수
+ThreadPoolExecutor 기반 I/O 병렬 처리 및 macro_view 계약(Contract) 100% 준수
 """
 import io
 import logging
@@ -60,32 +60,72 @@ def clean_tag_ui(val, prefix="", suffix="", is_pct=False):
         return str(val)
 
 
-def generate_briefing_text(collected_data, r10_c, r10_p, r2_c, r2_p) -> str:
-    """수집된 매크로 데이터를 바탕으로 시장 국면 자동 브리핑 요약문 생성"""
+def generate_briefing_text(
+    collected_data,
+    rate_10y_curr=None,
+    rate_10y_prev=None,
+    rate_2y_curr=None,
+    rate_2y_prev=None,
+    vix_hist=None,
+    move_hist=None,
+    hy_df=None,
+    cp_spread_df=None,
+    stlfsi_df=None,
+    now_str_kst=None,
+    *args,
+    **kwargs
+) -> str:
+    """수집된 매크로 데이터를 바탕으로 시장 국면 자동 브리핑 요약문 생성 (11개 인자 완전 수용)"""
     lines = []
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines.append(f"📌 **[{now_str} KST] 글로벌 매크로 시장 동향 브리핑**\n")
+    ts = now_str_kst or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"📌 **[{ts} KST] 글로벌 매크로 및 금융시장 동향 브리핑**\n")
 
-    if r10_c is not None and r2_c is not None:
-        spread = r10_c - r2_c
-        spread_status = "정상화(확대)" if spread > 0 else "역전(경기침체 신호)"
+    # 1. 금리 및 장단기 스프레드
+    if rate_10y_curr is not None and rate_2y_curr is not None:
+        spread = rate_10y_curr - rate_2y_curr
+        spread_status = "정상화(확대)" if spread > 0 else "역전(경기침체 경고)"
         lines.append(
-            f"- **미국 국채 금리**: 10Y `{r10_c:.2f}%`, 2Y `{r2_c:.2f}%` "
+            f"- **미국 국채 금리**: 10Y `{rate_10y_curr:.2f}%`, 2Y `{rate_2y_curr:.2f}%` "
             f"(10Y-2Y 스프레드: `{spread:+.3f}%p` - **{spread_status}**)"
         )
 
-    highlights = []
+    # 2. 시장 리스크 및 변동성 지표
+    risk_items = []
+    if vix_hist is not None and isinstance(vix_hist, pd.DataFrame) and not vix_hist.empty:
+        vix_val = vix_hist["Close"].iloc[-1]
+        risk_items.append(f"VIX `{vix_val:.2f}`")
+    if move_hist is not None and isinstance(move_hist, pd.DataFrame) and not move_hist.empty:
+        move_val = move_hist["Close"].iloc[-1]
+        risk_items.append(f"MOVE `{move_val:.2f}`")
+    if hy_df is not None and isinstance(hy_df, pd.DataFrame) and not hy_df.empty:
+        hy_val = hy_df["Close"].iloc[-1]
+        risk_items.append(f"HY 스프레드 `{hy_val:.2f}%`")
+    if cp_spread_df is not None and isinstance(cp_spread_df, pd.DataFrame) and not cp_spread_df.empty:
+        col = "Spread" if "Spread" in cp_spread_df.columns else "Close"
+        cp_val = cp_spread_df[col].iloc[-1]
+        risk_items.append(f"3M CP 스프레드 `{cp_val:.2f}%p`")
+    if stlfsi_df is not None and isinstance(stlfsi_df, pd.DataFrame) and not stlfsi_df.empty:
+        stlfsi_val = stlfsi_df["Close"].iloc[-1]
+        risk_items.append(f"STLFSI4 `{stlfsi_val:.3f}`")
+
+    if risk_items:
+        lines.append(f"- **금융 스트레스 & 변동성**: {', '.join(risk_items)}")
+
+    # 3. 주요 자산 변동 하이라이트 (±1.0% 이상)
+    movers = []
     if isinstance(collected_data, dict):
         for cat_name, items in collected_data.items():
             if isinstance(items, list):
                 for it in items:
-                    if it.get("status") == "ok" and abs(it.get("pct", 0)) >= 1.0:
-                        highlights.append(f"{it['name']} ({it['delta_str']})")
+                    if isinstance(it, dict) and it.get("status") == "ok":
+                        pct = abs(it.get("pct", 0))
+                        if pct >= 1.0:
+                            movers.append(f"{it.get('name', '')} ({it.get('delta_str', '')})")
 
-    if highlights:
-        lines.append(f"- **주요 변동 자산(±1% 이상)**: {', '.join(highlights[:6])}")
+    if movers:
+        lines.append(f"- **주요 시장 변동 자산(±1% 이상)**: {', '.join(movers[:6])}")
 
-    lines.append("\n💡 *본 데이터는 실시간 시장 지표를 기반으로 자동 집계된 브리핑입니다.*")
+    lines.append("\n💡 *본 데이터는 FRED 및 실시간 시장 지표를 기반으로 자동 집계된 브리핑입니다.*")
     return "\n".join(lines)
 
 
