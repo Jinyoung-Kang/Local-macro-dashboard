@@ -9,7 +9,6 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import streamlit as st
 from services.ai_service import call_selected_ai_engine
-from services.consensus_service import get_market_consensus_summary
 from services.cot_service import fetch_cftc_cot_legacy
 from services.krx_service import get_krx_futures_history
 from services.macro_service import get_collected_macro_data
