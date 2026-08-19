@@ -1,7 +1,7 @@
 """
 views/ai_report_view.py
 AI 거시경제 및 수급 심층 분석 리포트 뷰
-CFTC COT 튜플 언패킹, 다형성 데이터 안전 파싱, 5대 컨텍스트 동시 수집 및 원본 검증 구역 탑재
+SEC 13F 종목별 요약 정제, CFTC COT 튜플 언패킹, 다형성 데이터 안전 파싱, 5대 컨텍스트 동시 수집 및 원본 검증 구역 탑재
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -123,10 +123,27 @@ def render_ai_report_view():
                 context += "- 거시경제 데이터 수집 실패 또는 지연\n"
             context += "\n"
 
-            # #### 2. 글로벌 기관투자가 (13F) 포트폴리오 (다형성 안전 파싱)
+            # #### 2. 글로벌 기관투자가 (13F) 포트폴리오 (정제된 상위 종목 요약)
             context += "#### 2. 글로벌 기관투자가 (13F) 포트폴리오 동향\n"
             if _is_valid_data(sec_res):
-                if isinstance(sec_res, pd.DataFrame):
+                if isinstance(sec_res, dict):
+                    context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
+                    for inst_name, payload in list(sec_res.items())[:5]:
+                        if isinstance(payload, dict) and isinstance(payload.get("df"), pd.DataFrame) and not payload["df"].empty:
+                            df_inst = payload["df"]
+                            if "weight" in df_inst.columns:
+                                top_row = df_inst.sort_values("weight", ascending=False).iloc[0]
+                            else:
+                                top_row = df_inst.iloc[0]
+                            top_name = top_row.get("name", "N/A")
+                            try:
+                                top_weight = float(top_row.get("weight", 0))
+                                context += f"  * {inst_name}: 최대 비중 종목 {top_name} (비중 {top_weight:.2f}%)\n"
+                            except Exception:
+                                context += f"  * {inst_name}: 최대 비중 종목 {top_name}\n"
+                        else:
+                            context += f"  * {inst_name}: 보유 데이터 없음\n"
+                elif isinstance(sec_res, pd.DataFrame):
                     context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
                     top_inst = sec_res.head(5)
                     for _, r in top_inst.iterrows():
@@ -144,10 +161,6 @@ def render_ai_report_view():
                             context += f"  * {inst_nm}: 총자산 ${val_b}B | 최대 비중: {top_hold}\n"
                         else:
                             context += f"  * {r}\n"
-                elif isinstance(sec_res, dict):
-                    context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
-                    for k, v in list(sec_res.items())[:5]:
-                        context += f"  * {k}: {v}\n"
             else:
                 context += "- SEC 13F 데이터 수집 대기 상태\n"
             context += "\n"
