@@ -1,12 +1,13 @@
 """
 views/ai_report_view.py
 AI 거시경제 및 수급 심층 분석 리포트 뷰
-컨텍스트 수집 4대 모듈 동시 병렬화 및 ai_service 규격 정밀 매핑
+다형성 데이터(DataFrame/List/Dict) 안전 파싱 및 ai_service 연동
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import pandas as pd
 import streamlit as st
 from services.ai_service import call_selected_ai_engine
 from services.cot_service import fetch_cftc_cot_legacy
@@ -24,6 +25,17 @@ def _safe_call(fn, *args, **kwargs):
     except Exception as e:
         logger.warning(f"AI 컨텍스트 데이터 수집 중 예외 ({fn.__name__}): {e}")
         return None
+
+
+def _is_valid_data(val) -> bool:
+    """DataFrame, List, Dict 등 다양한 반환 타입의 비어있음 여부 안전 검사"""
+    if val is None:
+        return False
+    if isinstance(val, pd.DataFrame):
+        return not val.empty
+    if isinstance(val, (list, dict, tuple)):
+        return len(val) > 0
+    return bool(val)
 
 
 def render_ai_report_view():
@@ -107,45 +119,76 @@ def render_ai_report_view():
                 context += "- 거시경제 데이터 수집 실패 또는 지연\n"
             context += "\n"
 
-            # #### 2. 글로벌 기관투자가 (13F) 포트폴리오
+            # #### 2. 글로벌 기관투자가 (13F) 포트폴리오 (다형성 안전 파싱)
             context += "#### 2. 글로벌 기관투자가 (13F) 포트폴리오 동향\n"
-            if sec_res is not None and not sec_res.empty:
-                context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
-                top_inst = sec_res.head(5)
-                for _, r in top_inst.iterrows():
-                    inst_nm = r.get("institution", "N/A")
-                    top_hold = r.get("top_holding", "N/A")
-                    val_b = r.get("total_value_bil", 0)
-                    context += f"  * {inst_nm}: 총자산 ${val_b:,.1f}B | 최대 비중 종목: {top_hold}\n"
+            if _is_valid_data(sec_res):
+                if isinstance(sec_res, pd.DataFrame):
+                    context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
+                    top_inst = sec_res.head(5)
+                    for _, r in top_inst.iterrows():
+                        inst_nm = r.get("institution", r.get("name", "N/A"))
+                        top_hold = r.get("top_holding", "N/A")
+                        val_b = r.get("total_value_bil", r.get("value_bil", 0))
+                        context += f"  * {inst_nm}: 총자산 ${val_b}B | 최대 비중 종목: {top_hold}\n"
+                elif isinstance(sec_res, list):
+                    context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
+                    for r in sec_res[:5]:
+                        if isinstance(r, dict):
+                            inst_nm = r.get("institution", r.get("name", r.get("cik", "N/A")))
+                            top_hold = r.get("top_holding", r.get("top_stock", "N/A"))
+                            val_b = r.get("total_value_bil", r.get("value_bil", 0))
+                            context += f"  * {inst_nm}: 총자산 ${val_b}B | 최대 비중: {top_hold}\n"
+                        else:
+                            context += f"  * {r}\n"
+                elif isinstance(sec_res, dict):
+                    context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
+                    for k, v in list(sec_res.items())[:5]:
+                        context += f"  * {k}: {v}\n"
             else:
                 context += "- SEC 13F 데이터 수집 대기 상태\n"
             context += "\n"
 
             # #### 3. KRX 외국인/기관 선물 누적 순매수
             context += "#### 3. KRX 외국인/기관 선물 누적 수급 동향\n"
-            if krx_res is not None and not krx_res.empty:
-                latest_krx = krx_res.iloc[-1]
-                f_cum = latest_krx.get("Foreigner_Cum", 0)
-                i_cum = latest_krx.get("Institution_Cum", 0)
-                context += f"- 외국인 선물 누적 순매수: {f_cum:+,} 계약\n"
-                context += f"- 기관 선물 누적 순매수: {i_cum:+,} 계약\n"
+            if _is_valid_data(krx_res):
+                if isinstance(krx_res, pd.DataFrame):
+                    latest_krx = krx_res.iloc[-1]
+                    f_cum = latest_krx.get("Foreigner_Cum", 0)
+                    i_cum = latest_krx.get("Institution_Cum", 0)
+                    context += f"- 외국인 선물 누적 순매수: {f_cum:+,} 계약\n"
+                    context += f"- 기관 선물 누적 순매수: {i_cum:+,} 계약\n"
+                elif isinstance(krx_res, list) and len(krx_res) > 0:
+                    latest_krx = krx_res[-1]
+                    if isinstance(latest_krx, dict):
+                        f_cum = latest_krx.get("Foreigner_Cum", 0)
+                        i_cum = latest_krx.get("Institution_Cum", 0)
+                        context += f"- 외국인 선물 누적 순매수: {f_cum:+,} 계약\n"
+                        context += f"- 기관 선물 누적 순매수: {i_cum:+,} 계약\n"
             else:
                 context += "- KRX 파생상품 수급 데이터 원장 정리 중\n"
             context += "\n"
 
             # #### 4. CFTC COT 선물 투기적 포지션
             context += "#### 4. CFTC COT 투기적 포지션 동향\n"
-            if cot_res is not None and not cot_res.empty:
-                latest_cot = cot_res.iloc[-1]
-                net_pos = latest_cot.get("Net_Positions", "N/A")
-                comm_pos = latest_cot.get("Commercial_Net", "N/A")
-                context += f"- S&P500 비상업(투기적) 순포지션: {net_pos}\n"
-                context += f"- 상업(헤지) 순포지션: {comm_pos}\n"
+            if _is_valid_data(cot_res):
+                if isinstance(cot_res, pd.DataFrame):
+                    latest_cot = cot_res.iloc[-1]
+                    net_pos = latest_cot.get("Net_Positions", "N/A")
+                    comm_pos = latest_cot.get("Commercial_Net", "N/A")
+                    context += f"- S&P500 비상업(투기적) 순포지션: {net_pos}\n"
+                    context += f"- 상업(헤지) 순포지션: {comm_pos}\n"
+                elif isinstance(cot_res, list) and len(cot_res) > 0:
+                    latest_cot = cot_res[-1]
+                    if isinstance(latest_cot, dict):
+                        net_pos = latest_cot.get("Net_Positions", "N/A")
+                        comm_pos = latest_cot.get("Commercial_Net", "N/A")
+                        context += f"- S&P500 비상업(투기적) 순포지션: {net_pos}\n"
+                        context += f"- 상업(헤지) 순포지션: {comm_pos}\n"
             else:
                 context += "- CFTC COT 포지션 리포트 수신 대기 중\n"
 
             # ------------------------------------------------------------------
-            # 3단계: AI 추론 엔진 호출 (올바른 prompt 인자 전달 및 dict 파싱)
+            # 3단계: AI 추론 엔진 호출
             # ------------------------------------------------------------------
             system_prompt = (
                 "당신은 글로벌 헤지펀드의 최고투자책임자(CIO) 관점에서 시장을 분석하는 수석 매크로 전략가입니다. "
