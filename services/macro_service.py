@@ -1,23 +1,51 @@
 """
 services/macro_service.py
 거시경제 지표, 금리, 환율, 원자재 데이터 수집 엔진
-ThreadPoolExecutor 기반 I/O 병렬 처리 및 원본 데이터 계약(Contract) 완전 준수
+ThreadPoolExecutor 기반 I/O 병렬 처리 및 macro_view 계약 완벽 준수
 """
 import io
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
-from config import MACRO_CATEGORIES, FRED_BASE_URL, get_fred_key
+from config import MACRO_CATEGORIES, FRED_BASE_URL
 
 logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# 1. UI 헬퍼 및 텍스트 브리핑 생성기 (views/macro_view.py 필수 의존성)
+# 0. FRED API Key 안전 로더
+# ==============================================================================
+def get_fred_key() -> str:
+    """Streamlit Secrets 및 환경변수에서 FRED API Key 안전 로드"""
+    try:
+        from config import get_secret
+        val = get_secret("fred.api_key", get_secret("FRED_API_KEY", get_secret("fred_api_key", "")))
+        if val:
+            return str(val).strip()
+    except Exception:
+        pass
+
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            if "fred" in st.secrets and hasattr(st.secrets["fred"], "get"):
+                return str(st.secrets["fred"].get("api_key", "")).strip()
+            if "fred_api_key" in st.secrets:
+                return str(st.secrets["fred_api_key"]).strip()
+            if "FRED_API_KEY" in st.secrets:
+                return str(st.secrets["FRED_API_KEY"]).strip()
+    except Exception:
+        pass
+
+    return os.environ.get("FRED_API_KEY", "")
+
+
+# ==============================================================================
+# 1. UI 헬퍼 및 브리핑 생성기 (views/macro_view.py 필수 의존성)
 # ==============================================================================
 def clean_tag_ui(val, prefix="", suffix="", is_pct=False):
     """지표 수치 포맷팅 헬퍼"""
@@ -38,7 +66,6 @@ def generate_briefing_text(collected_data, r10_c, r10_p, r2_c, r2_p) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines.append(f"📌 **[{now_str} KST] 글로벌 매크로 시장 동향 브리핑**\n")
 
-    # 1. 금리 및 장단기 스프레드
     if r10_c is not None and r2_c is not None:
         spread = r10_c - r2_c
         spread_status = "정상화(확대)" if spread > 0 else "역전(경기침체 신호)"
@@ -47,7 +74,6 @@ def generate_briefing_text(collected_data, r10_c, r10_p, r2_c, r2_p) -> str:
             f"(10Y-2Y 스프레드: `{spread:+.3f}%p` - **{spread_status}**)"
         )
 
-    # 2. 주요 변동 자산 하이라이트
     highlights = []
     if isinstance(collected_data, dict):
         for cat_name, items in collected_data.items():
@@ -64,7 +90,7 @@ def generate_briefing_text(collected_data, r10_c, r10_p, r2_c, r2_p) -> str:
 
 
 # ==============================================================================
-# 2. yfinance / FRED 단일 데이터 수집 엔진
+# 2. yfinance / FRED 데이터 수집 엔진
 # ==============================================================================
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_ticker_data(symbol: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
@@ -93,13 +119,12 @@ def fetch_ticker_data(symbol: str, period: str = "5d", interval: str = "1d") -> 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fred_series(series_id: str, start_date: str = None, api_key: str = None) -> pd.DataFrame:
-    """FRED 시계열 수집 (1차: API JSON -> 2차: FRED CSV 다운로드 3단계 폴백)"""
+    """FRED 시계열 수집 (1차: REST API -> 2차: Direct CSV 다운로드)"""
     key = api_key or get_fred_key()
 
     if not start_date:
         start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
-    # 1차: 공식 FRED REST API
     if key:
         url = f"{FRED_BASE_URL}/series/observations"
         params = {
@@ -125,7 +150,6 @@ def fetch_fred_series(series_id: str, start_date: str = None, api_key: str = Non
         except Exception:
             pass
 
-    # 2차: FRED Direct CSV 다운로드 폴백
     try:
         csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -158,13 +182,13 @@ def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 3. 매크로 데이터 병렬 수집 및 카테고리별 집계 (views/macro_view.py 원본 계약)
+# 3. 매크로 데이터 병렬 수집 (views/macro_view.py 원본 계약 완전 일치)
 # ==============================================================================
 @st.cache_data(ttl=30, show_spinner=False)
 def get_collected_macro_data():
     """
     모든 거시경제 티커를 ThreadPoolExecutor로 병렬 수집한 후
-    views/macro_view.py가 기대하는 카테고리별 통계 리스트 구조로 반환
+    views/macro_view.py가 요구하는 카테고리별 리스트 구조로 반환
     """
     collected = {}
     rate_10y_curr, rate_10y_prev = None, None
