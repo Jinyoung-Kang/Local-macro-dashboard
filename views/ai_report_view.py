@@ -1,7 +1,7 @@
 """
 views/ai_report_view.py
 AI 거시경제 및 수급 심층 분석 리포트 뷰
-다형성 데이터(DataFrame/List/Dict) 안전 파싱 및 ai_service 연동
+데이터 수집 출처(Data Provenance) 및 원본 컨텍스트 검증 구역 탑재
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -206,10 +206,33 @@ def render_ai_report_view():
             pipeline_step = res.get("pipeline_step", "단일 호출 완료")
 
             # ------------------------------------------------------------------
-            # 4단계: 리포트 렌더링
+            # 4단계: 리포트 본문 렌더링
             # ------------------------------------------------------------------
             st.markdown("---")
             st.caption(f"⚡ 실행 엔진 파이프라인: `{pipeline_step}`")
             st.markdown(f"### 📋 {report_type} 분석 리포트")
             st.caption(f"분석 엔진: `{ai_engine}` | 생성 완료 시각: `{now_kst.strftime('%H:%M:%S KST')}`")
             st.markdown(ai_response_text)
+
+            # ------------------------------------------------------------------
+            # 5단계: 수집 데이터 출처(Data Provenance) 및 원본 검증 구역
+            # ------------------------------------------------------------------
+            st.markdown("---")
+            st.markdown("#### 🔍 AI 리포트 작성에 수집·활용된 데이터 출처 및 원본 데이터셋")
+            
+            p1, p2, p3, p4 = st.columns(4)
+            with p1:
+                st.markdown("**1. 거시경제 & 국채 금리**")
+                st.caption("• 소스: `Yahoo Finance` & `FRED`\n• 지표: 10Y/2Y 금리, DXY, WTI, Gold, BTC")
+            with p2:
+                st.markdown("**2. 글로벌 13F 기관 지분**")
+                st.caption("• 소스: `U.S. SEC EDGAR (Form 13F)`\n• 대상: 버크셔, 브릿지워터, 사이언 등")
+            with p3:
+                st.markdown("**3. KRX 선물 누적 수급**")
+                st.caption("• 소스: `한국거래소(KRX) OpenAPI / KIS`\n• 대상: KOSPI 200 선물 외인/기관 포지션")
+            with p4:
+                st.markdown("**4. CFTC COT 선물 포지션**")
+                st.caption("• 소스: `U.S. CFTC (Commitments of Traders)`\n• 대상: S&P500 비상업 순포지션")
+
+            with st.expander("📄 AI 프롬프트에 주입된 실시간 원본 텍스트 데이터(Context) 확인", expanded=False):
+                st.code(context, language="markdown")
