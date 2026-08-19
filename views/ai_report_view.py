@@ -1,7 +1,7 @@
 """
 views/ai_report_view.py
 AI 거시경제 및 수급 심층 분석 리포트 뷰
-데이터 수집 출처(Data Provenance) 및 원본 컨텍스트 검증 구역 탑재
+다형성 데이터(DataFrame/List/Dict) 안전 파싱, ai_service 연동 및 데이터 출처 검증 구역 탑재
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +33,7 @@ def _is_valid_data(val) -> bool:
         return False
     if isinstance(val, pd.DataFrame):
         return not val.empty
-    if isinstance(val, (list, dict, tuple)):
+    if isinstance(val, (list, dict, tuple, set)):
         return len(val) > 0
     return bool(val)
 
@@ -215,11 +215,11 @@ def render_ai_report_view():
             st.markdown(ai_response_text)
 
             # ------------------------------------------------------------------
-            # 5단계: 수집 데이터 출처(Data Provenance) 및 원본 검증 구역
+            # 5단계: [신규] 수집 데이터 출처(Data Provenance) 및 원본 검증 구역
             # ------------------------------------------------------------------
             st.markdown("---")
             st.markdown("#### 🔍 AI 리포트 작성에 수집·활용된 데이터 출처 및 원본 데이터셋")
-            
+
             p1, p2, p3, p4 = st.columns(4)
             with p1:
                 st.markdown("**1. 거시경제 & 국채 금리**")
