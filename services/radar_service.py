@@ -1,7 +1,7 @@
 """
 services/radar_service.py
 6단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
-[KIS & LS 병렬 레이스 -> KRX -> Daum -> Naver -> PyKrx]
+[KIS & LS 병렬 레이스 (TimeoutError 방어) -> KRX -> Daum -> Naver -> PyKrx]
 """
 import logging
 import re
@@ -172,9 +172,14 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
 
                 if name and code:
                     records.append({
-                        "순위": idx, "종목코드": code, "종목명": name, "현재가": price,
-                        "등락률(%)": change_pct, "순매수대금(억)": amt_eok,
-                        "시가총액_가중": max(price * 1000, 500), "데이터_출처": f"KIS 증권사 API ({target_date})"
+                        "순위": idx,
+                        "종목코드": code,
+                        "종목명": name,
+                        "현재가": price,
+                        "등락률(%)": change_pct,
+                        "순매수대금(억)": amt_eok,
+                        "시가총액_가중": max(price * 1000, 500),
+                        "데이터_출처": f"KIS 증권사 API ({target_date})"
                     })
             if records:
                 return pd.DataFrame(records)
@@ -215,9 +220,14 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 
                     if name and code:
                         records.append({
-                            "순위": idx, "종목코드": code, "종목명": name, "현재가": price,
-                            "등락률(%)": change_pct, "순매수대금(억)": net_amt_eok,
-                            "시가총액_가중": max(price * 1000, 500), "데이터_출처": f"LS 증권사 API ({target_date})"
+                            "순위": idx,
+                            "종목코드": code,
+                            "종목명": name,
+                            "현재가": price,
+                            "등락률(%)": change_pct,
+                            "순매수대금(억)": net_amt_eok,
+                            "시가총액_가중": max(price * 1000, 500),
+                            "데이터_출처": f"LS 증권사 API ({target_date})"
                         })
                 if records:
                     return pd.DataFrame(records)
@@ -254,9 +264,14 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 
                     if name and code:
                         records.append({
-                            "순위": idx, "종목코드": code, "종목명": name, "현재가": price,
-                            "등락률(%)": change_pct, "순매수대금(억)": net_amt_eok,
-                            "시가총액_가중": max(price * 1000, 500), "데이터_출처": f"LS 증권사 API ({target_date})"
+                            "순위": idx,
+                            "종목코드": code,
+                            "종목명": name,
+                            "현재가": price,
+                            "등락률(%)": change_pct,
+                            "순매수대금(억)": net_amt_eok,
+                            "시가총액_가중": max(price * 1000, 500),
+                            "데이터_출처": f"LS 증권사 API ({target_date})"
                         })
                 if records:
                     return pd.DataFrame(records)
@@ -307,14 +322,18 @@ def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, tr
                             price = float(str(r.get(price_col, 0)).replace(",", ""))
                             fluc = float(str(r.get(fluc_col, 0)).replace(",", ""))
                             amt_val = float(str(r.get(net_col, 0)).replace(",", ""))
-                        except:
+                        except Exception:
                             continue
 
                         amt_eok = round(amt_val / 100000000.0, 1)
                         if price > 0 and name:
                             records.append({
-                                "종목코드": code, "종목명": name, "현재가": price, "등락률(%)": fluc,
-                                "순매수대금(억)": amt_eok, "시가총액_가중": price * 1000,
+                                "종목코드": code,
+                                "종목명": name,
+                                "현재가": price,
+                                "등락률(%)": fluc,
+                                "순매수대금(억)": amt_eok,
+                                "시가총액_가중": price * 1000,
                                 "데이터_출처": f"KRX 공식 OpenAPI ({target_date})"
                             })
 
@@ -345,7 +364,8 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
     url = f"https://finance.daum.net/api/trend/investors/{action}?market={market_param}&investorType={inv_param}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://finance.daum.net/trend/investors", "Accept": "application/json, text/plain, */*"
+        "Referer": "https://finance.daum.net/trend/investors",
+        "Accept": "application/json, text/plain, */*"
     }
 
     try:
@@ -367,9 +387,14 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
                         amt_eok = -abs(amt_eok)
 
                     records.append({
-                        "순위": idx, "종목코드": code, "종목명": name, "현재가": price,
-                        "등락률(%)": round(change_pct, 2), "순매수대금(억)": amt_eok,
-                        "시가총액_가중": max(price * 1000, 500), "데이터_출처": f"Daum 실시간 API ({target_date})"
+                        "순위": idx,
+                        "종목코드": code,
+                        "종목명": name,
+                        "현재가": price,
+                        "등락률(%)": round(change_pct, 2),
+                        "순매수대금(억)": amt_eok,
+                        "시가총액_가중": max(price * 1000, 500),
+                        "데이터_출처": f"Daum 실시간 API ({target_date})"
                     })
                 return pd.DataFrame(records)
     except Exception as e:
@@ -412,7 +437,7 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
                             def clean(x):
                                 try:
                                     return float(x.text.replace(",", "").replace("+", "").replace("%", "").strip())
-                                except:
+                                except Exception:
                                     return 0.0
 
                             price = clean(cols[2])
@@ -423,9 +448,14 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
                                 net_amt_eok = -abs(net_amt_eok)
 
                             records.append({
-                                "순위": rank, "종목코드": code, "종목명": name, "현재가": price,
-                                "등락률(%)": change_pct, "순매수대금(억)": net_amt_eok,
-                                "시가총액_가중": max(price * 1000, 500), "데이터_출처": f"Naver 실시간 API ({target_date})"
+                                "순위": rank,
+                                "종목코드": code,
+                                "종목명": name,
+                                "현재가": price,
+                                "등락률(%)": change_pct,
+                                "순매수대금(억)": net_amt_eok,
+                                "시가총액_가중": max(price * 1000, 500),
+                                "데이터_출처": f"Naver 실시간 API ({target_date})"
                             })
                             rank += 1
                             if rank > top_n:
@@ -476,9 +506,14 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
                 fluc = float(p_row["등락률"])
 
             records.append({
-                "순위": idx, "종목코드": code, "종목명": name, "현재가": price,
-                "등락률(%)": fluc, "순매수대금(억)": amt_eok,
-                "시가총액_가중": max(price * 1000, 500), "데이터_출처": f"PyKrx API ({target_date})"
+                "순위": idx,
+                "종목코드": code,
+                "종목명": name,
+                "현재가": price,
+                "등락률(%)": fluc,
+                "순매수대금(억)": amt_eok,
+                "시가총액_가중": max(price * 1000, 500),
+                "데이터_출처": f"PyKrx API ({target_date})"
             })
         return pd.DataFrame(records)
     except Exception as e:
@@ -487,7 +522,7 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
 
 
 # ==============================================================================
-# 8. 6단계 폴백 및 KIS/LS 병렬 동시 레이스 엔진
+# 8. 6단계 폴백 및 KIS/LS 병렬 동시 레이스 (TimeoutError 방어 탑재)
 # ==============================================================================
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: str = "외국인", trade_type: str = "순매수", top_n: int = 30) -> pd.DataFrame:
@@ -509,15 +544,18 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
             def _try_ls():
                 return fetch_ls_deal_ranking(search_date_str, market, investor, trade_type, top_n)
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = [executor.submit(_try_kis), executor.submit(_try_ls)]
-                for fut in as_completed(futures, timeout=4):
-                    try:
-                        df_res = fut.result()
-                        if df_res is not None and not df_res.empty and len(df_res) >= 1:
-                            return df_res
-                    except Exception:
-                        pass
+            try:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(_try_kis), executor.submit(_try_ls)]
+                    for fut in as_completed(futures, timeout=4):
+                        try:
+                            df_res = fut.result()
+                            if df_res is not None and not df_res.empty and len(df_res) >= 1:
+                                return df_res
+                        except Exception:
+                            pass
+            except (TimeoutError, Exception):
+                pass  # KIS/LS 4초 내 미응답 시 예외를 던지지 않고 KRX 폴백으로 진행
 
         # (2) KRX 공식 OpenAPI 시도 (단축된 타임아웃 4초)
         df = fetch_krx_date_deal_ranking(search_date_str, market, investor, trade_type, top_n)
