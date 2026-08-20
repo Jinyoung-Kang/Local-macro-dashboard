@@ -1,7 +1,7 @@
 """
 views/ai_report_view.py
 AI 매크로 & 멀티에셋 종합 리포트 뷰
-공통 AI 모델 레지스트리 셀렉터 및 5대 영역 데이터 수집/검증 구역 탑재
+build_comprehensive_context() 헬퍼 및 5대 영역 데이터 수집/검증 구역 완벽 탑재
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +40,121 @@ def _is_valid_data(val) -> bool:
     return bool(val)
 
 
+def build_comprehensive_context(report_type: str = "종합 거시경제 & 수급 전략") -> str:
+    """5개 영역 시장 데이터를 병렬 수집하여 종합 분석용 컨텍스트 텍스트를 구성"""
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        fut_macro = executor.submit(_safe_call, get_collected_macro_data)
+        fut_sec = executor.submit(_safe_call, load_all_institutions_data)
+        fut_krx = executor.submit(_safe_call, get_krx_futures_history, 40)
+        fut_krx_inv = executor.submit(_safe_call, get_krx_investor_derivatives_summary)
+        fut_cot = executor.submit(_safe_call, fetch_cftc_cot_legacy, "13874A")
+
+        macro_res = fut_macro.result()
+        sec_res = fut_sec.result()
+        krx_res = fut_krx.result()
+        krx_inv_res = fut_krx_inv.result()
+        cot_raw = fut_cot.result()
+        cot_res, cot_err = cot_raw if isinstance(cot_raw, tuple) else (cot_raw, None)
+
+    context = f"[기준 시각] {now_kst.strftime('%Y-%m-%d %H:%M:%S KST')}\n"
+    context += f"[분석 요청 유형] {report_type}\n\n"
+
+    # 1. 거시경제 및 채권/금리 지표
+    context += "#### 1. 거시경제 및 채권/금리 지표\n"
+    if macro_res and isinstance(macro_res, tuple) and len(macro_res) >= 5:
+        collected_macro, r10_curr, r10_prev, r2_curr, r2_prev = macro_res
+        if r10_curr is not None and r2_curr is not None:
+            spread_curr = round(r10_curr - r2_curr, 3)
+            context += f"- 미국채 10년물 금리: {r10_curr:.2f}% (전일: {r10_prev:.2f}%)\n"
+            context += f"- 미국채 2년물 금리: {r2_curr:.2f}% (전일: {r2_prev:.2f}%)\n"
+            context += f"- 10Y-2Y 장단기 금리차: {spread_curr:+.3f}%p\n"
+
+        if isinstance(collected_macro, dict):
+            for cat_name, items in collected_macro.items():
+                if isinstance(items, list) and items:
+                    ok_items = [it for it in items if isinstance(it, dict) and it.get("status") == "ok"]
+                    if ok_items:
+                        context += f"\n**{cat_name}**\n"
+                        for item in ok_items:
+                            context += f"- {item.get('name','')}: {item.get('price_str','')} ({item.get('delta_str','')})\n"
+    else:
+        context += "- 거시경제 데이터 수집 실패 또는 지연\n"
+    context += "\n"
+
+    # 2. 글로벌 기관투자가 (13F) 포트폴리오
+    context += "#### 2. 글로벌 기관투자가 (13F) 포트폴리오 동향\n"
+    if _is_valid_data(sec_res):
+        if isinstance(sec_res, dict):
+            context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
+            for inst_name, payload in list(sec_res.items())[:5]:
+                if isinstance(payload, dict) and isinstance(payload.get("df"), pd.DataFrame) and not payload["df"].empty:
+                    df_inst = payload["df"]
+                    if "weight" in df_inst.columns:
+                        top_row = df_inst.sort_values("weight", ascending=False).iloc[0]
+                    else:
+                        top_row = df_inst.iloc[0]
+                    top_name = top_row.get("name", "N/A")
+                    try:
+                        top_weight = float(top_row.get("weight", 0))
+                        context += f"  * {inst_name}: 최대 비중 종목 {top_name} (비중 {top_weight:.2f}%)\n"
+                    except Exception:
+                        context += f"  * {inst_name}: 최대 비중 종목 {top_name}\n"
+                else:
+                    context += f"  * {inst_name}: 보유 데이터 없음\n"
+        elif isinstance(sec_res, pd.DataFrame):
+            context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
+            top_inst = sec_res.head(5)
+            for _, r in top_inst.iterrows():
+                inst_nm = r.get("institution", r.get("name", "N/A"))
+                top_hold = r.get("top_holding", "N/A")
+                val_b = r.get("total_value_bil", r.get("value_bil", 0))
+                context += f"  * {inst_nm}: 총자산 ${val_b}B | 최대 비중 종목: {top_hold}\n"
+    else:
+        context += "- SEC 13F 데이터 수집 대기 상태\n"
+    context += "\n"
+
+    # 3. KRX 외국인/기관 선물 누적 수급 동향
+    context += "#### 3. KRX 외국인/기관 선물 누적 수급 동향\n"
+    if _is_valid_data(krx_res) and isinstance(krx_res, pd.DataFrame):
+        latest_krx = krx_res.iloc[-1]
+        context += f"- 선물 종가: {latest_krx.get('Futures_Close', 0)} pt\n"
+        context += f"- 시장 베이시스: {latest_krx.get('Market_Basis', 0):+.2f} pt\n"
+        context += f"- 미결제약정: {int(latest_krx.get('Open_Interest', 0)):,} 계약\n"
+        context += f"- 파생 수급 국면: {latest_krx.get('Market_Phase', '알수없음')}\n"
+        context += f"- 한국판 COT Index: {float(latest_krx.get('COT_OI_Index', 0)):.1f}%\n"
+    else:
+        context += "- KRX 선물 시계열 데이터 수집 대기 상태\n"
+
+    if _is_valid_data(krx_inv_res) and isinstance(krx_inv_res, pd.DataFrame):
+        context += "- 주요 투자자 20일 누적 순매수:\n"
+        for _, r in krx_inv_res.iterrows():
+            subj = r.get("투자 주체", r.get("주체", "Unknown"))
+            amt = r.get("20일 누적", r.get("20일 누적 순매수 (계약)", 0))
+            context += f"  * {subj}: {amt:+,} 계약\n"
+    context += "\n"
+
+    # 4. CFTC COT 선물 투기적 포지션
+    context += "#### 4. CFTC COT 투기적 포지션 동향\n"
+    if _is_valid_data(cot_res) and isinstance(cot_res, pd.DataFrame) and "nc_net" in cot_res.columns:
+        df_sorted = cot_res.sort_values("date")
+        latest_cot = df_sorted.iloc[-1]
+        prev_cot = df_sorted.iloc[-2] if len(df_sorted) > 1 else latest_cot
+        date_val = latest_cot.get("date")
+        date_str = date_val.strftime("%Y-%m-%d") if hasattr(date_val, "strftime") else str(date_val)
+        nc_net = latest_cot.get("nc_net", 0)
+        comm_net = latest_cot.get("comm_net", 0)
+        nc_chg = nc_net - prev_cot.get("nc_net", nc_net)
+        context += f"- 기준일: {date_str}\n"
+        context += f"- 비상업(투기적/스마트머니) 순포지션: {int(nc_net):+,} 계약 (전주 대비 {int(nc_chg):+,})\n"
+        context += f"- 상업(헤지) 순포지션: {int(comm_net):+,} 계약\n"
+    else:
+        context += "- CFTC COT 포지션 리포트 수신 대기 중\n"
+
+    return context
+
+
 def render_ai_report_view():
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
 
@@ -76,123 +191,7 @@ def render_ai_report_view():
 
     if generate_btn:
         with st.spinner("⚡ 5개 영역 시장 데이터 병렬 수집 및 AI 심층 추론 중..."):
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                fut_macro = executor.submit(_safe_call, get_collected_macro_data)
-                fut_sec = executor.submit(_safe_call, load_all_institutions_data)
-                fut_krx = executor.submit(_safe_call, get_krx_futures_history, 40)
-                fut_krx_inv = executor.submit(_safe_call, get_krx_investor_derivatives_summary)
-                fut_cot = executor.submit(_safe_call, fetch_cftc_cot_legacy, "13874A")
-
-                macro_res = fut_macro.result()
-                sec_res = fut_sec.result()
-                krx_res = fut_krx.result()
-                krx_inv_res = fut_krx_inv.result()
-                cot_raw = fut_cot.result()
-                cot_res, cot_err = cot_raw if isinstance(cot_raw, tuple) else (cot_raw, None)
-
-            context = f"[기준 시각] {now_kst.strftime('%Y-%m-%d %H:%M:%S KST')}\n"
-            context += f"[분석 요청 유형] {report_type}\n\n"
-
-            # 1. 거시경제 및 채권/금리 지표
-            context += "#### 1. 거시경제 및 채권/금리 지표\n"
-            if macro_res and isinstance(macro_res, tuple) and len(macro_res) >= 5:
-                collected_macro, r10_curr, r10_prev, r2_curr, r2_prev = macro_res
-                if r10_curr is not None and r2_curr is not None:
-                    spread_curr = round(r10_curr - r2_curr, 3)
-                    context += f"- 미국채 10년물 금리: {r10_curr:.2f}% (전일: {r10_prev:.2f}%)\n"
-                    context += f"- 미국채 2년물 금리: {r2_curr:.2f}% (전일: {r2_prev:.2f}%)\n"
-                    context += f"- 10Y-2Y 장단기 금리차: {spread_curr:+.3f}%p\n"
-
-                if isinstance(collected_macro, dict):
-                    for cat_name, items in collected_macro.items():
-                        if isinstance(items, list) and items:
-                            ok_items = [it for it in items if isinstance(it, dict) and it.get("status") == "ok"]
-                            if ok_items:
-                                context += f"\n**{cat_name}**\n"
-                                for item in ok_items:
-                                    context += f"- {item.get('name','')}: {item.get('price_str','')} ({item.get('delta_str','')})\n"
-            else:
-                context += "- 거시경제 데이터 수집 실패 또는 지연\n"
-            context += "\n"
-
-            # 2. 글로벌 기관투자가 (13F) 포트폴리오
-            context += "#### 2. 글로벌 기관투자가 (13F) 포트폴리오 동향\n"
-            if _is_valid_data(sec_res):
-                if isinstance(sec_res, dict):
-                    context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
-                    for inst_name, payload in list(sec_res.items())[:5]:
-                        if isinstance(payload, dict) and isinstance(payload.get("df"), pd.DataFrame) and not payload["df"].empty:
-                            df_inst = payload["df"]
-                            if "weight" in df_inst.columns:
-                                top_row = df_inst.sort_values("weight", ascending=False).iloc[0]
-                            else:
-                                top_row = df_inst.iloc[0]
-                            top_name = top_row.get("name", "N/A")
-                            try:
-                                top_weight = float(top_row.get("weight", 0))
-                                context += f"  * {inst_name}: 최대 비중 종목 {top_name} (비중 {top_weight:.2f}%)\n"
-                            except Exception:
-                                context += f"  * {inst_name}: 최대 비중 종목 {top_name}\n"
-                        else:
-                            context += f"  * {inst_name}: 보유 데이터 없음\n"
-                elif isinstance(sec_res, pd.DataFrame):
-                    context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
-                    top_inst = sec_res.head(5)
-                    for _, r in top_inst.iterrows():
-                        inst_nm = r.get("institution", r.get("name", "N/A"))
-                        top_hold = r.get("top_holding", "N/A")
-                        val_b = r.get("total_value_bil", r.get("value_bil", 0))
-                        context += f"  * {inst_nm}: 총자산 ${val_b}B | 최대 비중 종목: {top_hold}\n"
-                elif isinstance(sec_res, list):
-                    context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
-                    for r in sec_res[:5]:
-                        if isinstance(r, dict):
-                            inst_nm = r.get("institution", r.get("name", r.get("cik", "N/A")))
-                            top_hold = r.get("top_holding", r.get("top_stock", "N/A"))
-                            val_b = r.get("total_value_bil", r.get("value_bil", 0))
-                            context += f"  * {inst_nm}: 총자산 ${val_b}B | 최대 비중: {top_hold}\n"
-                        else:
-                            context += f"  * {r}\n"
-            else:
-                context += "- SEC 13F 데이터 수집 대기 상태\n"
-            context += "\n"
-
-            # 3. KRX 외국인/기관 선물 누적 수급 동향
-            context += "#### 3. KRX 외국인/기관 선물 누적 수급 동향\n"
-            if _is_valid_data(krx_res) and isinstance(krx_res, pd.DataFrame):
-                latest_krx = krx_res.iloc[-1]
-                context += f"- 선물 종가: {latest_krx.get('Futures_Close', 0)} pt\n"
-                context += f"- 시장 베이시스: {latest_krx.get('Market_Basis', 0):+.2f} pt\n"
-                context += f"- 미결제약정: {int(latest_krx.get('Open_Interest', 0)):,} 계약\n"
-                context += f"- 파생 수급 국면: {latest_krx.get('Market_Phase', '알수없음')}\n"
-                context += f"- 한국판 COT Index: {float(latest_krx.get('COT_OI_Index', 0)):.1f}%\n"
-            else:
-                context += "- KRX 선물 시계열 데이터 수집 대기 상태\n"
-
-            if _is_valid_data(krx_inv_res) and isinstance(krx_inv_res, pd.DataFrame):
-                context += "- 주요 투자자 20일 누적 순매수:\n"
-                for _, r in krx_inv_res.iterrows():
-                    subj = r.get("투자 주체", r.get("주체", "Unknown"))
-                    amt = r.get("20일 누적", r.get("20일 누적 순매수 (계약)", 0))
-                    context += f"  * {subj}: {amt:+,} 계약\n"
-            context += "\n"
-
-            # 4. CFTC COT 선물 투기적 포지션
-            context += "#### 4. CFTC COT 투기적 포지션 동향\n"
-            if _is_valid_data(cot_res) and isinstance(cot_res, pd.DataFrame) and "nc_net" in cot_res.columns:
-                df_sorted = cot_res.sort_values("date")
-                latest_cot = df_sorted.iloc[-1]
-                prev_cot = df_sorted.iloc[-2] if len(df_sorted) > 1 else latest_cot
-                date_val = latest_cot.get("date")
-                date_str = date_val.strftime("%Y-%m-%d") if hasattr(date_val, "strftime") else str(date_val)
-                nc_net = latest_cot.get("nc_net", 0)
-                comm_net = latest_cot.get("comm_net", 0)
-                nc_chg = nc_net - prev_cot.get("nc_net", nc_net)
-                context += f"- 기준일: {date_str}\n"
-                context += f"- 비상업(투기적/스마트머니) 순포지션: {int(nc_net):+,} 계약 (전주 대비 {int(nc_chg):+,})\n"
-                context += f"- 상업(헤지) 순포지션: {int(comm_net):+,} 계약\n"
-            else:
-                context += "- CFTC COT 포지션 리포트 수신 대기 중\n"
+            context = build_comprehensive_context(report_type=report_type)
 
             system_prompt = (
                 "당신은 글로벌 헤지펀드의 최고투자책임자(CIO) 관점에서 시장을 분석하는 수석 매크로 전략가입니다. "
