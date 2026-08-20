@@ -1,9 +1,9 @@
 streamlit
 requests
-pandas
+pandas>=2.2.0,<3.0
 numpy
 yfinance
 plotly
 streamlit-autorefresh
 urllib3
-pykrx
+pykrx==1.2.8
