@@ -1,7 +1,7 @@
 """
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
-[KIS(FHPTJ04400000 - 외인/기관 FID 분리 적용) -> KRX -> Daum -> Naver -> PyKrx]
+[KIS(FHPTJ04400000 - 공식 외인/기관/투신/기금 필드 매핑) -> KRX -> Daum -> Naver -> PyKrx]
 (LS는 시장 전체 랭킹 TR 미보유로 당일 폴백에서 제외, 종목별 조회용 t1717은 추후 별도 기능으로 검토)
 """
 import logging
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# 1. KIS / LS 증권사 API 실시간 연결 상태 진단 함수
+# 1. KIS / LS / PyKrx API 실시간 연결 상태 진단 함수
 # ==============================================================================
 def test_kis_connection():
     params = {
@@ -125,14 +125,32 @@ def test_ls_connection():
         return False, f"예외 발생: {str(e)}"
 
 
+def test_pykrx_connection():
+    """PyKrx(KRX 웹 스크래핑 기반)의 실제 통신 가능 여부 진단"""
+    if not PYKRX_AVAILABLE:
+        return False, "pykrx 라이브러리가 설치되지 않았습니다 (requirements.txt 확인 필요)"
+
+    try:
+        now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+        # 최근 5영업일 이내에서 확정 데이터가 있는 날짜를 역순으로 탐색
+        for i in range(1, 6):
+            check_date = (now_kst - timedelta(days=i)).strftime("%Y%m%d")
+            df = stock.get_market_ohlcv(check_date, check_date, "KOSPI")
+            if df is not None and not df.empty:
+                return True, f"정상 통신 성공 ({check_date} 기준, 조회 종목 수: {len(df)}개)"
+        return False, "최근 5영업일 내 pykrx 응답이 비어있습니다 (KRX 웹 접근 차단 가능성)"
+    except Exception as e:
+        return False, f"예외 발생 (KRX 웹 접근 차단 가능성): {str(e)}"
+
+
 # ==============================================================================
-# 2. KIS 증권사 API (FHPTJ04400000: FID_DIV_CLS_CODE & FID_RANK_SORT_CLS_CODE 분리)
+# 2. KIS 증권사 API (FHPTJ04400000: 공식 투자자별 필드 매핑 및 자체 재정렬)
 # ==============================================================================
 def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     is_kospi = "KOSPI" in market.upper() or "코스피" in market
     fid_iscd = "0000" if is_kospi else "1001"
 
-    # 투자자 구분: 외국인="0", 기관="1" (기타 세부기관은 1차로 기관("1") 매핑)
+    # 투자자 구분: 외국인="0", 기관="1"
     div_cls = "0" if investor == "외국인" else "1"
     # 순매수="0", 순매도="1"
     rank_sort = "0" if trade_type == "순매수" else "1"
@@ -194,25 +212,36 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                 output = res_alt.get("output", [])
 
         if output:
+            # 투자자 유형별 공식 필드 매핑 (금액 필드 우선, 수량 필드 보조)
+            inv_field_map = {
+                "외국인": ("frgn_ntby_tr_pbmn", "frgn_ntby_qty"),
+                "기관": ("orgn_ntby_tr_pbmn", "orgn_ntby_qty"),
+                "투신": ("ivtr_ntby_tr_pbmn", "ivtr_ntby_qty"),
+                "연기금": ("fund_ntby_tr_pbmn", "fund_ntby_qty"),
+                "금융투자": ("bank_ntby_tr_pbmn", "bank_ntby_qty"),
+            }
+            pbmn_col, qty_col = inv_field_map.get(investor, ("orgn_ntby_tr_pbmn", "orgn_ntby_qty"))
+
             records = []
             for row in output:
                 code = row.get("stck_shrn_iscd", row.get("mksc_shrn_iscd", ""))
                 name = row.get("hts_kor_isnm", "")
-                price = float(row.get("stck_prpr", 0))
-                change_pct = float(row.get("prdy_ctrt", 0))
+                price = float(row.get("stck_prpr", 0) or 0)
+                change_pct = float(row.get("prdy_ctrt", 0) or 0)
 
-                # FHPTJ04400000 가집계 수량 필드 매핑 및 금액 계산
-                if investor == "외국인":
-                    qty = float(row.get("frgn_fake_ntby_qty", row.get("frgn_pure_byqty", row.get("frgn_ntby_qty", 0))))
-                else:
-                    qty = float(row.get("orgn_fake_ntby_qty", row.get("organ_pure_byqty", row.get("orgn_ntby_qty", 0))))
+                # 1순위: 공식 금액 필드 조회
+                amt_raw = float(row.get(pbmn_col, 0) or 0)
 
-                amt_raw = qty * price
-                # 직접 금액 필드 폴백
+                # 2순위: 금액 필드가 0일 경우 공식 수량 필드 * 현재가로 산출
                 if amt_raw == 0:
-                    direct_amt = float(row.get("ntby_tr_pbmn", row.get("frgn_pure_bysum" if investor == "외국인" else "organ_pure_bysum", 0)))
-                    if direct_amt != 0:
-                        amt_raw = direct_amt
+                    qty = float(row.get(qty_col, 0) or 0)
+                    amt_raw = qty * price
+
+                # 3순위: 기타 대체 필드 폴백
+                if amt_raw == 0:
+                    alt_amt = float(row.get("ntby_tr_pbmn", row.get("frgn_pure_bysum" if investor == "외국인" else "organ_pure_bysum", 0)) or 0)
+                    if alt_amt != 0:
+                        amt_raw = alt_amt
 
                 amt_eok = round(amt_raw / 100000000.0, 1) if abs(amt_raw) > 100000 else round(amt_raw, 1)
 
@@ -600,7 +629,7 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
         search_date_str = current_date_obj.strftime("%Y%m%d")
         is_today = (search_date_str == today_str)
 
-        # (1) 당일 조회 시 KIS 호출 (외국인 및 기관)
+        # (1) 당일 조회 시 KIS 호출
         if is_today:
             try:
                 df_kis = fetch_kis_deal_ranking(search_date_str, market, investor, trade_type, top_n)
