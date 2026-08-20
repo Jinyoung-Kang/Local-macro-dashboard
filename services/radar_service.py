@@ -1,7 +1,7 @@
 """
 services/radar_service.py
 6단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
-[KIS & LS 병렬 레이스 (TimeoutError 방어) -> KRX -> Daum -> Naver -> PyKrx]
+[KIS(FHPTJ04400000) & LS 병렬 레이스 -> KRX -> Daum -> Naver -> PyKrx]
 """
 import logging
 import re
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 def test_kis_connection():
     params = {
-        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_COND_MRKT_DIV_CODE": "V",
         "FID_COND_SCR_DIV_CODE": "16449",
         "FID_INPUT_ISCD": "0000",
         "FID_DIV_CLS_CODE": "0",
@@ -39,12 +39,31 @@ def test_kis_connection():
         "FID_ETC_CLS_CODE": "0"
     }
     try:
-        res = call_kis_api(tr_id="FHPST01710000", endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total", params=params)
+        # 1차: 공식 외국인/기관 가집계 TR (FHPTJ04400000)
+        res = call_kis_api(
+            tr_id="FHPTJ04400000",
+            endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total",
+            params=params
+        )
         if res and res.get("rt_cd") == "0":
             output = res.get("output", [])
             if len(output) > 0:
                 return True, f"정상 통신 성공 (조회된 상위 종목 수: {len(output)}개)"
 
+        # 2차: 시장구분코드 'J'로 전환 시도
+        params["FID_COND_MRKT_DIV_CODE"] = "J"
+        params["FID_DIV_CLS_CODE"] = "1"
+        res_j = call_kis_api(
+            tr_id="FHPTJ04400000",
+            endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total",
+            params=params
+        )
+        if res_j and res_j.get("rt_cd") == "0":
+            output_j = res_j.get("output", [])
+            if len(output_j) > 0:
+                return True, f"정상 통신 성공 (J구분 상위 종목 수: {len(output_j)}개)"
+
+        # 3차: 일별 순위 TR (FHPST01740000) 폴백
         params_sub = {
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_COND_SCR_DIV_CODE": "16449",
@@ -59,7 +78,11 @@ def test_kis_connection():
             "FID_VOL_CNT": "",
             "FID_INPUT_DATE_1": ""
         }
-        res_sub = call_kis_api(tr_id="FHPST01740000", endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-daily-ranking", params=params_sub)
+        res_sub = call_kis_api(
+            tr_id="FHPST01740000",
+            endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-daily-ranking",
+            params=params_sub
+        )
         if res_sub and res_sub.get("rt_cd") == "0":
             output_sub = res_sub.get("output", [])
             if len(output_sub) > 0:
@@ -104,7 +127,7 @@ def test_ls_connection():
 
 
 # ==============================================================================
-# 2. KIS 증권사 API (순매수/순매도 전용 TR)
+# 2. KIS 증권사 API (FHPTJ04400000 / FHPST01740000)
 # ==============================================================================
 def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     is_kospi = "KOSPI" in market.upper() or "코스피" in market
@@ -116,18 +139,36 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
         rank_sort = "2" if trade_type == "순매수" else "3"
 
     params = {
-        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_COND_MRKT_DIV_CODE": "V",
         "FID_COND_SCR_DIV_CODE": "16449",
         "FID_INPUT_ISCD": fid_iscd,
-        "FID_DIV_CLS_CODE": "1",
+        "FID_DIV_CLS_CODE": "0",
         "FID_RANK_SORT_CLS_CODE": rank_sort,
         "FID_ETC_CLS_CODE": "0"
     }
 
     try:
-        res = call_kis_api(tr_id="FHPST01710000", endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total", params=params)
+        # 1차 시도: FHPTJ04400000 (V 코드)
+        res = call_kis_api(
+            tr_id="FHPTJ04400000",
+            endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total",
+            params=params
+        )
         output = res.get("output", []) if (res and res.get("rt_cd") == "0") else []
 
+        # 2차 시도: FHPTJ04400000 (J 코드)
+        if not output:
+            params["FID_COND_MRKT_DIV_CODE"] = "J"
+            params["FID_DIV_CLS_CODE"] = "1"
+            res_j = call_kis_api(
+                tr_id="FHPTJ04400000",
+                endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total",
+                params=params
+            )
+            if res_j and res_j.get("rt_cd") == "0":
+                output = res_j.get("output", [])
+
+        # 3차 시도: FHPST01740000 폴백
         if not output:
             params_alt = {
                 "FID_COND_MRKT_DIV_CODE": "J",
@@ -143,7 +184,11 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                 "FID_VOL_CNT": "",
                 "FID_INPUT_DATE_1": ""
             }
-            res_alt = call_kis_api(tr_id="FHPST01740000", endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-daily-ranking", params=params_alt)
+            res_alt = call_kis_api(
+                tr_id="FHPST01740000",
+                endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-daily-ranking",
+                params=params_alt
+            )
             if res_alt and res_alt.get("rt_cd") == "0":
                 output = res_alt.get("output", [])
 
@@ -536,7 +581,7 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
         search_date_str = current_date_obj.strftime("%Y%m%d")
         is_today = (search_date_str == today_str)
 
-        # (1) 당일 조회 시 KIS와 LS를 내부 함수로 분리하여 ThreadPoolExecutor(max_workers=2)로 동시 실행
+        # (1) 당일 조회 시 KIS(FHPTJ04400000)와 LS를 ThreadPoolExecutor(max_workers=2)로 동시 실행
         if is_today:
             def _try_kis():
                 return fetch_kis_deal_ranking(search_date_str, market, investor, trade_type, top_n)
@@ -555,7 +600,7 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
                         except Exception:
                             pass
             except (TimeoutError, Exception):
-                pass  # KIS/LS 4초 내 미응답 시 예외를 던지지 않고 KRX 폴백으로 진행
+                pass  # KIS/LS 4초 내 미응답 시 예외 전파 없이 KRX 폴백으로 진행
 
         # (2) KRX 공식 OpenAPI 시도 (단축된 타임아웃 4초)
         df = fetch_krx_date_deal_ranking(search_date_str, market, investor, trade_type, top_n)
