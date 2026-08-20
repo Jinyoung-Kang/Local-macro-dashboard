@@ -1,7 +1,7 @@
 """
 views/radar_view.py
 외국인/기관 수급 레이더 대시보드 뷰
-실시간 순매수/순매도 스캐닝, 트리맵 시각화 및 종목별 기준일 누적 수급 차트
+실시간 순매수/순매도 스캐닝, 개선된 트리맵 시각화 및 종목별 기준일 누적 수급 차트
 """
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -114,21 +114,35 @@ def render_radar_view():
     
     df_plot = df_radar.copy()
     df_plot["절대대금"] = df_plot["순매수대금(억)"].abs()
+    df_plot["절대대금_표시용"] = df_plot["절대대금"].apply(lambda x: max(x, 1.0))
     
+    max_abs_pct = float(df_plot["등락률(%)"].abs().quantile(0.95)) if len(df_plot) > 0 else 8.0
+    color_bound = max(max_abs_pct, 5.0)
+
     fig_treemap = px.treemap(
         df_plot,
         path=["종목명"],
-        values="절대대금",
+        values="절대대금_표시용",
         color="등락률(%)",
-        color_continuous_scale="RdBu_r",
+        color_continuous_scale=["#1F6FEB", "#0D1117", "#F85149"],
         color_continuous_midpoint=0.0,
-        hover_data={"현재가": ":,.0f", "순매수대금(억)": ":,.1f", "등락률(%)": ":+.2f%"},
+        range_color=[-color_bound, color_bound],
+        custom_data=["현재가", "순매수대금(억)", "등락률(%)"],
         title=f"{target_date} {market_sel} {investor_sel} {trade_type_sel} Top {len(df_plot)}"
     )
+
+    fig_treemap.update_traces(
+        textposition="middle center",
+        insidetextanchor="middle",
+        textfont=dict(size=14, color="white"),
+        hovertemplate="<b>%{label}</b><br>현재가: %{customdata[0]:,.0f}원<br>순매수대금: %{customdata[1]:+,.1f}억원<br>등락률: %{customdata[2]:+.2f}%<extra></extra>"
+    )
+
     fig_treemap.update_layout(
         template="plotly_dark",
+        uniformtext=dict(minsize=10, mode="hide"),
         margin=dict(t=30, l=10, r=10, b=10),
-        height=380
+        height=450
     )
     st.plotly_chart(fig_treemap, use_container_width=True)
 
