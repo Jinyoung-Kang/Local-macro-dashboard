@@ -9,10 +9,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from config import INSTITUTIONS
-from services.ai_service import call_selected_ai_engine
+from services.ai_service import (
+    call_selected_ai_engine,
+    get_ai_engine_options,
+    format_ai_engine
+)
 from services.macro_service import fetch_ticker_data
 from services.prompts import SEC_13F_CONSENSUS_PROMPT
 from services.sec_service import classify_qoq_action, fetch_sec_13f_multi_quarters
+
 
 def render_sec_view():
     st.title("📑 주요 기관들의 포트폴리오 (13F Holdings & QoQ Analysis)")
@@ -28,13 +33,9 @@ def render_sec_view():
         with col_ai_sel:
             ai_engine = st.selectbox(
                 "분석에 사용할 AI 엔진을 선택하세요",
-                [
-                    "🛡️ 자동 탐색 (4단 Failover 무중단)",
-                    "🥇 1순위: NVIDIA Nemotron-3 Super (120B)",
-                    "🥈 2순위: Cloudflare AI (DeepSeek-R1-32B)",
-                    "🥉 3순위: NVIDIA GPT-OSS-20B",
-                    "🏅 4순위: Cerebras Cloud (Llama-3.3)"
-                ],
+                options=get_ai_engine_options(include_auto=True),
+                format_func=format_ai_engine,
+                index=0,
                 key="sec_ai_engine_select"
             )
         with col_ai_btn:
@@ -67,17 +68,19 @@ def render_sec_view():
                         f"위 13F 공통 매수 데이터를 심층 분석하여 글로벌 기관들의 핵심 투자 내러티브와 공통 철학을 구조화된 형식으로 작성해줘."
                     )
                     
-                    with st.spinner(f"'{ai_engine}' 엔진으로 13F 스마트머니 내러티브를 분석 중..."):
-                        res = call_selected_ai_engine(ai_engine, user_prompt, SEC_13F_CONSENSUS_PROMPT)
+                    with st.spinner(f"'{format_ai_engine(ai_engine)}' 엔진으로 13F 스마트머니 내러티브를 분석 중..."):
+                        res = call_selected_ai_engine(
+                            engine_name=ai_engine,
+                            prompt=user_prompt,
+                            system_prompt=SEC_13F_CONSENSUS_PROMPT
+                        )
 
-                    if res.get("status"):
-                        st.success(f"✅ 분석 완료 (엔진: {res['provider']} | 지연시간: {res['latency_ms']} ms)")
-                        if "translation_info" in res:
-                            st.caption(f"**번역 상태:** {res['translation_info']}")
+                    if res.get("response"):
+                        st.success(f"✅ 분석 완료 (파이프라인: {res.get('pipeline_step')} | 소요시간: {res.get('latency', 0.0)}초)")
                         st.markdown(f"<div style='padding:1rem; border-radius:0.5rem; background-color:rgba(0,100,255,0.1);'>{res['response']}</div>", unsafe_allow_html=True)
                     else:
                         st.error("🔴 분석 생성 실패")
-                        st.caption(res.get("response", "응답 생성 실패"))
+                        st.caption(res.get("error", "응답 생성 실패"))
 
     st.divider()
 
