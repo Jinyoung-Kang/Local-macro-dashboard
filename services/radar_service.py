@@ -2,7 +2,7 @@
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
 [KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
-투자주체별(개인/외국인/기관합계/금융투자/투신/연기금) 원본 거래대금 필드 매핑 및 부호 필터링 탑재
+투자주체별(개인/외국인/기관합계/금융투자/투신/연기금) 원본 거래대금 및 수량 필드 보존
 """
 import logging
 import re
@@ -292,6 +292,7 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                         "현재가": price,
                         "등락률(%)": change_pct,
                         "순매수대금(억)": round(amount_eok, 1),
+                        "원본_순매수거래대금": raw_amount,
                         "원본_순매수수량": qty,
                         "금액_산출기준": amount_basis,
                         "조회시각": captured_at,
