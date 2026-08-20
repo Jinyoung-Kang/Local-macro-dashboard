@@ -2,6 +2,7 @@
 services/sector_service.py
 섹터 및 자산군 시계열/로테이션 수집 엔진
 기존 ETF 수집 헬퍼 및 calculate_returns_matrix 복원 완료, AI Context용 모멘텀 변환 포함
+(sector_view.py 호환을 위한 딕셔너리 구조 및 Close Series 반환 버그 수정 반영)
 """
 import logging
 from datetime import datetime
@@ -13,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 0. 로테이션 ETF 자산군 매핑
+# 로테이션 ETF 자산군 매핑
 # ==============================================================================
 ROTATION_SECTORS = {
     "정보기술": "XLK",
@@ -62,7 +63,7 @@ def fetch_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
 
 
 # ==============================================================================
-# 1. [복구됨] 기존 sector_view.py 호환용 calculate_returns_matrix
+# [수정 완료] 기존 sector_view.py 호환용 calculate_returns_matrix
 # ==============================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def calculate_returns_matrix(
@@ -80,33 +81,37 @@ def calculate_returns_matrix(
 
     반환:
     - DataFrame: 기존 sector_view.py 호환 컬럼
-    - dict: 티커별 yfinance 시계열
+    - dict: 티커별 yfinance 시계열 (Close Series만 포함)
     """
     tickers = list(etf_dict.keys())
 
     if benchmark_ticker not in tickers:
         tickers.append(benchmark_ticker)
 
-    hist_map = fetch_etf_history_map(
+    raw_hist_map = fetch_etf_history_map(
         tuple(tickers),
         period="2y",
     )
+
+    history_map = {}
+
+    # 이전 요청사항 적용: Close Series만 추출하여 history_map 구성
+    for ticker, df in raw_hist_map.items():
+        if df is None or df.empty or "Close" not in df.columns:
+            continue
+
+        close = df["Close"].dropna()
+
+        if not close.empty:
+            history_map[ticker] = close
 
     current_year = datetime.now().year
     records = []
 
     for ticker, info in etf_dict.items():
-        df = hist_map.get(ticker)
+        close = history_map.get(ticker)
 
-        if df is None or df.empty:
-            continue
-
-        if "Close" not in df.columns:
-            continue
-
-        close = df["Close"].dropna()
-
-        if len(close) < 20:
+        if close is None or len(close) < 20:
             continue
 
         current_price = float(close.iloc[-1])
@@ -129,6 +134,7 @@ def calculate_returns_matrix(
                 ytd_return = 0.0
             else:
                 ytd_price = float(ytd_series.iloc[0])
+
                 ytd_return = (
                     (current_price / ytd_price - 1) * 100
                     if ytd_price != 0
@@ -152,9 +158,9 @@ def calculate_returns_matrix(
         })
 
     if not records:
-        return pd.DataFrame(), hist_map
+        return pd.DataFrame(), history_map
 
-    return pd.DataFrame(records), hist_map
+    return pd.DataFrame(records), history_map
 
 
 # ==============================================================================
