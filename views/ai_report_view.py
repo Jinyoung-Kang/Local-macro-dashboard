@@ -1,7 +1,7 @@
 """
 views/ai_report_view.py
-AI 거시경제 및 수급 심층 분석 리포트 뷰
-SEC 13F 종목별 요약 정제, CFTC COT 튜플 언패킹, 다형성 데이터 안전 파싱, 5대 컨텍스트 동시 수집 및 원본 검증 구역 탑재
+AI 매크로 & 멀티에셋 종합 리포트 뷰
+공통 AI 모델 레지스트리 셀렉터 및 5대 영역 데이터 수집/검증 구역 탑재
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +9,11 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
-from services.ai_service import call_selected_ai_engine
+from services.ai_service import (
+    call_selected_ai_engine,
+    get_ai_engine_options,
+    format_ai_engine
+)
 from services.cot_service import fetch_cftc_cot_legacy
 from services.krx_service import get_krx_futures_history, get_krx_investor_derivatives_summary
 from services.macro_service import get_collected_macro_data
@@ -19,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_call(fn, *args, **kwargs):
-    """ThreadPoolExecutor 내 안전 호출 래퍼"""
     try:
         return fn(*args, **kwargs)
     except Exception as e:
@@ -28,7 +31,6 @@ def _safe_call(fn, *args, **kwargs):
 
 
 def _is_valid_data(val) -> bool:
-    """DataFrame, List, Dict 등 다양한 반환 타입의 비어있음 여부 안전 검사"""
     if val is None:
         return False
     if isinstance(val, pd.DataFrame):
@@ -56,14 +58,10 @@ def render_ai_report_view():
     with c1:
         ai_engine = st.selectbox(
             "분석 AI 엔진 선택",
-            options=[
-                "NVIDIA (Nemotron-3-Super 120B)",
-                "Cerebras (Llama-3.1-70B)",
-                "Cloudflare (DeepSeek-R1-32B)",
-                "Cloudflare (Llama-3.1-8B)"
-            ],
+            options=get_ai_engine_options(include_auto=True),
+            format_func=format_ai_engine,
             index=0,
-            key="ai_view_engine"
+            key="ai_report_engine"
         )
     with c2:
         report_type = st.selectbox(
@@ -78,9 +76,6 @@ def render_ai_report_view():
 
     if generate_btn:
         with st.spinner("⚡ 5개 영역 시장 데이터 병렬 수집 및 AI 심층 추론 중..."):
-            # ------------------------------------------------------------------
-            # 1단계: 5대 독립 데이터 소스를 ThreadPoolExecutor로 동시에 수집
-            # ------------------------------------------------------------------
             with ThreadPoolExecutor(max_workers=5) as executor:
                 fut_macro = executor.submit(_safe_call, get_collected_macro_data)
                 fut_sec = executor.submit(_safe_call, load_all_institutions_data)
@@ -95,13 +90,10 @@ def render_ai_report_view():
                 cot_raw = fut_cot.result()
                 cot_res, cot_err = cot_raw if isinstance(cot_raw, tuple) else (cot_raw, None)
 
-            # ------------------------------------------------------------------
-            # 2단계: 기존 순서(1→2→3→4) 그대로 context 문자열 조립
-            # ------------------------------------------------------------------
             context = f"[기준 시각] {now_kst.strftime('%Y-%m-%d %H:%M:%S KST')}\n"
             context += f"[분석 요청 유형] {report_type}\n\n"
 
-            # #### 1. 거시경제 및 채권/금리 지표
+            # 1. 거시경제 및 채권/금리 지표
             context += "#### 1. 거시경제 및 채권/금리 지표\n"
             if macro_res and isinstance(macro_res, tuple) and len(macro_res) >= 5:
                 collected_macro, r10_curr, r10_prev, r2_curr, r2_prev = macro_res
@@ -123,7 +115,7 @@ def render_ai_report_view():
                 context += "- 거시경제 데이터 수집 실패 또는 지연\n"
             context += "\n"
 
-            # #### 2. 글로벌 기관투자가 (13F) 포트폴리오 (정제된 상위 종목 요약)
+            # 2. 글로벌 기관투자가 (13F) 포트폴리오
             context += "#### 2. 글로벌 기관투자가 (13F) 포트폴리오 동향\n"
             if _is_valid_data(sec_res):
                 if isinstance(sec_res, dict):
@@ -165,7 +157,7 @@ def render_ai_report_view():
                 context += "- SEC 13F 데이터 수집 대기 상태\n"
             context += "\n"
 
-            # #### 3. KRX 외국인/기관 선물 누적 수급 동향
+            # 3. KRX 외국인/기관 선물 누적 수급 동향
             context += "#### 3. KRX 외국인/기관 선물 누적 수급 동향\n"
             if _is_valid_data(krx_res) and isinstance(krx_res, pd.DataFrame):
                 latest_krx = krx_res.iloc[-1]
@@ -185,7 +177,7 @@ def render_ai_report_view():
                     context += f"  * {subj}: {amt:+,} 계약\n"
             context += "\n"
 
-            # #### 4. CFTC COT 선물 투기적 포지션
+            # 4. CFTC COT 선물 투기적 포지션
             context += "#### 4. CFTC COT 투기적 포지션 동향\n"
             if _is_valid_data(cot_res) and isinstance(cot_res, pd.DataFrame) and "nc_net" in cot_res.columns:
                 df_sorted = cot_res.sort_values("date")
@@ -202,12 +194,9 @@ def render_ai_report_view():
             else:
                 context += "- CFTC COT 포지션 리포트 수신 대기 중\n"
 
-            # ------------------------------------------------------------------
-            # 3단계: AI 추론 엔진 호출
-            # ------------------------------------------------------------------
             system_prompt = (
                 "당신은 글로벌 헤지펀드의 최고투자책임자(CIO) 관점에서 시장을 분석하는 수석 매크로 전략가입니다. "
-                "제공된 4개 영역의 데이터를 기반으로 시장 국면, 수급 불균형, 핵심 리스크, 주간 포트폴리오 대응 전략을 "
+                "제공된 5개 영역의 데이터를 기반으로 시장 국면, 수급 불균형, 핵심 리스크, 주간 포트폴리오 대응 전략을 "
                 "명확하고 구조화된 서식으로 제시하십시오."
             )
 
@@ -220,18 +209,12 @@ def render_ai_report_view():
             ai_response_text = res.get("response", res.get("error", "데이터 처리에 실패했습니다."))
             pipeline_step = res.get("pipeline_step", "단일 호출 완료")
 
-            # ------------------------------------------------------------------
-            # 4단계: 리포트 본문 렌더링
-            # ------------------------------------------------------------------
             st.markdown("---")
             st.caption(f"⚡ 실행 엔진 파이프라인: `{pipeline_step}`")
             st.markdown(f"### 📋 {report_type} 분석 리포트")
-            st.caption(f"분석 엔진: `{ai_engine}` | 생성 완료 시각: `{now_kst.strftime('%H:%M:%S KST')}`")
+            st.caption(f"분석 엔진: `{format_ai_engine(ai_engine)}` | 생성 완료 시각: `{now_kst.strftime('%H:%M:%S KST')}`")
             st.markdown(ai_response_text)
 
-            # ------------------------------------------------------------------
-            # 5단계: 수집 데이터 출처(Data Provenance) 및 원본 검증 구역
-            # ------------------------------------------------------------------
             st.markdown("---")
             st.markdown("#### 🔍 AI 리포트 작성에 수집·활용된 데이터 출처 및 원본 데이터셋")
 
