@@ -157,13 +157,26 @@ def summarize_cot_asset(asset_name: str, df: pd.DataFrame) -> str:
     )
 
 
-def cot_history_to_markdown(df: pd.DataFrame, asset_name: str) -> str:
-    """상세 COT 분석 모드용 전체 원본 마크다운 변환"""
+def cot_history_to_markdown(
+    df: pd.DataFrame,
+    asset_name: str,
+    max_rows: int = 13,
+) -> str:
+    """
+    AI Context용 COT 상세 데이터를 Markdown으로 변환합니다.
+    max_rows=13: 약 3개월의 주간 COT 데이터만 넣어 컨텍스트 길이를 최적화합니다.
+    """
     if df is None or df.empty:
         return f"\n##### {asset_name}\n데이터 없음\n"
 
     cols = ["date", "nc_net", "comm_net", "nr_net"]
-    out = df[cols].sort_values("date").copy()
+
+    out = (
+        df[cols]
+        .sort_values("date")
+        .tail(max_rows)
+        .copy()
+    )
 
     lines = [
         f"\n##### {asset_name}",
