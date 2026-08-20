@@ -1,7 +1,7 @@
 """
 views/radar_view.py
 외국인/기관 수급 레이더 대시보드 뷰
-실시간 순매수/순매도 스캐닝, 트리맵 시각화(Plotly 호환성 패치) 및 종목별 기준일 누적 수급 차트
+실시간 순매수/순매도 스캐닝, 개선된 트리맵 시각화(Plotly textposition 중앙 정렬) 및 종목별 기준일 누적 수급 차트
 """
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -131,8 +131,9 @@ def render_radar_view():
         title=f"{target_date} {market_sel} {investor_sel} {trade_type_sel} Top {len(df_plot)}"
     )
 
-    # Plotly Treemap 전용 유효 속성 적용
+    # Plotly Treemap 전용 중앙 정렬 속성 적용 (textposition="middle center")
     fig_treemap.update_traces(
+        textposition="middle center",
         textfont=dict(size=14, color="white"),
         hovertemplate="<b>%{label}</b><br>현재가: %{customdata[0]:,.0f}원<br>순매수대금: %{customdata[1]:+,.1f}억원<br>등락률: %{customdata[2]:+.2f}%<extra></extra>"
     )
