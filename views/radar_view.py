@@ -131,9 +131,8 @@ def render_radar_view():
         title=f"{target_date} {market_sel} {investor_sel} {trade_type_sel} Top {len(df_plot)}"
     )
 
-    # Plotly Treemap 전용 속성 적용 (textposition 제거)
+    # Plotly Treemap 전용 유효 속성 적용
     fig_treemap.update_traces(
-        insidetextanchor="middle",
         textfont=dict(size=14, color="white"),
         hovertemplate="<b>%{label}</b><br>현재가: %{customdata[0]:,.0f}원<br>순매수대금: %{customdata[1]:+,.1f}억원<br>등락률: %{customdata[2]:+.2f}%<extra></extra>"
     )
