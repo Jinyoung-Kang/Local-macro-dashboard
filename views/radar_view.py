@@ -1,7 +1,7 @@
 """
 views/radar_view.py
 외국인/기관 수급 레이더 대시보드 뷰
-실시간 순매수/순매도 스캐닝, 개선된 트리맵 시각화(Plotly textposition 중앙 정렬) 및 종목별 기준일 누적 수급 차트
+실시간 순매수/순매도 스캐닝, 캐시 즉시 초기화/강제 새로고침 컨트롤 및 종목별 기준일 누적 수급 차트
 """
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -82,6 +82,17 @@ def render_radar_view():
         top_n = st.selectbox("조회 종목 수", options=[10, 20, 30, 50], index=2, key="radar_topn")
 
     # --------------------------------------------------------------------------
+    # 1-1. 조회 조건 상태 안내 및 캐시 강제 새로고침 바
+    # --------------------------------------------------------------------------
+    col_cap, col_ref = st.columns([4, 1])
+    with col_cap:
+        st.caption(f"🔎 현재 조회 조건: `{market_sel}` / `{investor_sel}` / `{trade_type_sel}` / `{target_date}` (Top {top_n})")
+    with col_ref:
+        if st.button("🔄 데이터 강제 새로고침", use_container_width=True):
+            get_market_radar_scanner.clear()
+            st.rerun()
+
+    # --------------------------------------------------------------------------
     # 2. 데이터 수집
     # --------------------------------------------------------------------------
     with st.spinner(f"🔍 {target_date} [{market_sel} - {investor_sel} {trade_type_sel}] 수급 스캐닝 중..."):
@@ -140,7 +151,6 @@ def render_radar_view():
         title=f"{target_date} {market_sel} {investor_sel} {trade_type_sel} Top {len(df_plot)}"
     )
 
-    # Plotly Treemap 전용 중앙 정렬 속성 적용 (textposition="middle center")
     fig_treemap.update_traces(
         textposition="middle center",
         textfont=dict(size=14, color="white"),
