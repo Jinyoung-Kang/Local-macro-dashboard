@@ -1,7 +1,7 @@
 """
 services/ai_service.py
 AI 모델 레지스트리 기반 엔진 (NVIDIA, Cloudflare, Cerebras 및 자동 Failover 파이프라인)
-신규 모델: meta/llama-3.3-70b-instruct, openai/gpt-oss-120b 지원 및 레거시 함수 하위 호환성 100% 보장
+신규 모델: meta/llama-3.3-70b-instruct, openai/gpt-oss-120b 지원 및 레거시 함수(test_cloudflare_ai 등) 하위 호환 완벽 보장
 """
 import logging
 import time
@@ -308,11 +308,9 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
     if engine_name == "auto" or "자동" in engine_name:
         return generate_ai_briefing_with_failover(prompt=prompt, system_prompt=system_prompt)
 
-    # 1. ID로 직접 검색
     config = AI_MODEL_REGISTRY.get(engine_name)
     engine_id = engine_name
 
-    # 2. 레이블 또는 구버전 문자열로 역방향 검색
     if not config:
         for k, v in AI_MODEL_REGISTRY.items():
             if v["label"] == engine_name or v["model"] == engine_name:
@@ -320,7 +318,6 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
                 engine_id = k
                 break
 
-    # 3. 구버전 키워드 매핑
     if not config:
         if "Nemotron" in engine_name:
             config = AI_MODEL_REGISTRY["nvidia_nemotron"]
@@ -419,7 +416,7 @@ def generate_ai_briefing_with_failover(prompt: str, system_prompt: str = None) -
 
 
 # ==============================================================================
-# 3. 레거시 호환 헬퍼 함수
+# 3. 레거시 및 개별 테스트 호환 함수 (ImportError 완벽 방어)
 # ==============================================================================
 def ask_krx_cot_agent(prompt: str, engine_name: str = "auto") -> dict:
     """krx_cot_view 하위 호환용 헬퍼"""
@@ -442,6 +439,11 @@ def test_nvidia_gpt_oss_20b(api_key: str, prompt: str, system_prompt: str = None
     return call_nvidia_model("nvidia_gpt_oss_20b", api_key, prompt, system_prompt)
 
 
+def test_nvidia_gpt_oss(api_key: str, prompt: str, system_prompt: str = None) -> dict:
+    """기존 ai_test_view 호환용 (20B 모델 연결)"""
+    return test_nvidia_gpt_oss_20b(api_key, prompt, system_prompt)
+
+
 def test_nvidia_llama_33_70b(api_key: str, prompt: str, system_prompt: str = None) -> dict:
     return call_nvidia_model("nvidia_llama_33_70b", api_key, prompt, system_prompt)
 
@@ -454,58 +456,15 @@ def test_cloudflare_llama(account_id: str, api_token: str, prompt: str, system_p
     return call_cloudflare_model("@cf/meta/llama-3.1-8b-instruct", account_id, api_token, prompt, system_prompt)
 
 
+def test_cloudflare_ai(account_id: str, api_token: str, prompt: str, system_prompt: str = None) -> dict:
+    """기존 ai_test_view 호환용 (DeepSeek-R1 연결)"""
+    return test_cloudflare_deepseek(account_id, api_token, prompt, system_prompt)
+
+
 def test_cerebras_llama(api_key: str, prompt: str, system_prompt: str = None) -> dict:
     return call_cerebras_model("llama-3.3-70b", api_key, prompt, system_prompt)
 
-# ==============================================================================
-# 4. 기존 ai_test_view.py 호환용 레거시 래퍼
-# ==============================================================================
 
-def test_cloudflare_ai(
-    account_id: str,
-    api_token: str,
-    prompt: str,
-    system_prompt: str = None,
-) -> dict:
-    """
-    기존 ai_test_view.py 호환 함수.
-    Cloudflare DeepSeek-R1 모델로 연결합니다.
-    """
-    return test_cloudflare_deepseek(
-        account_id=account_id,
-        api_token=api_token,
-        prompt=prompt,
-        system_prompt=system_prompt,
-    )
-
-
-def test_nvidia_gpt_oss(
-    api_key: str,
-    prompt: str,
-    system_prompt: str = None,
-) -> dict:
-    """
-    기존 ai_test_view.py 호환 함수.
-    기존 GPT-OSS 호출은 20B 모델로 연결합니다.
-    """
-    return test_nvidia_gpt_oss_20b(
-        api_key=api_key,
-        prompt=prompt,
-        system_prompt=system_prompt,
-    )
-
-
-def test_cerebras(
-    api_key: str,
-    prompt: str,
-    system_prompt: str = None,
-) -> dict:
-    """
-    기존 ai_test_view.py 호환 함수.
-    Cerebras Llama 3.3 70B 호출로 연결합니다.
-    """
-    return test_cerebras_llama(
-        api_key=api_key,
-        prompt=prompt,
-        system_prompt=system_prompt,
-    )
+def test_cerebras(api_key: str, prompt: str, system_prompt: str = None) -> dict:
+    """기존 ai_test_view 호환용 (Cerebras Llama-3.3 연결)"""
+    return test_cerebras_llama(api_key, prompt, system_prompt)
