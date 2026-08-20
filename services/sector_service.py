@@ -1,108 +1,154 @@
-# services/sector_service.py
-import streamlit as st
-import yfinance as yf
+"""
+services/sector_service.py
+섹터 및 자산군 시계열/로테이션 수집 엔진
+기존 ETF 수집 헬퍼에 AI Context용 1/3개월 모멘텀 로테이션 수치 변환 추가
+"""
+import logging
 import pandas as pd
-from datetime import datetime
+import yfinance as yf
+import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# [신규] 로테이션 ETF 자산군 매핑
+# ==============================================================================
+ROTATION_SECTORS = {
+    "정보기술": "XLK",
+    "금융": "XLF",
+    "헬스케어": "XLV",
+    "임의소비재": "XLY",
+    "산업재": "XLI",
+    "통신서비스": "XLC",
+    "에너지": "XLE",
+    "필수소비재": "XLP",
+    "부동산": "XLRE",
+    "유틸리티": "XLU",
+    "소재": "XLB",
+}
+
+ROTATION_ASSET_CLASSES = {
+    "미국 주식": "SPY",
+    "글로벌 주식": "ACWI",
+    "미국 장기국채": "TLT",
+    "미국 중기국채": "IEF",
+    "하이일드채권": "HYG",
+    "금": "GLD",
+    "원유": "USO",
+    "달러": "UUP",
+    "원자재 종합": "DBC",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
+    results = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_ticker = {
+            executor.submit(yf.Ticker(t).history, period=period): t
+            for t in tickers
+        }
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                df = future.result()
+                results[ticker] = df
+            except Exception as e:
+                logger.warning(f"ETF 수집 실패 ({ticker}): {e}")
+                results[ticker] = pd.DataFrame()
+    return results
+
+
+# ==============================================================================
+# [신규] 로테이션 모멘텀 계산 및 AI Context 포맷 변환
+# ==============================================================================
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_etf_history_map(tickers: tuple, period: str = "2y"):
+def get_rotation_momentum_for_ai() -> dict:
     """
-    지정된 ETF 티커들의 수정종가(Close) 히스토리를 딕셔너리로 반환합니다.
+    섹터 및 자산군의 1주/1개월/3개월 모멘텀을 계산.
     """
-    data_map = {}
-    for ticker in tickers:
-        try:
-            t = yf.Ticker(ticker)
-            df = t.history(period=period)
-            if df is not None and not df.empty:
-                df = df.dropna(subset=['Close'])
-                if df.index.tz is not None:
-                    df.index = df.index.tz_localize(None)
-                data_map[ticker] = df['Close']
-        except Exception:
-            continue
-    return data_map
-
-def calculate_returns_matrix(etf_info_dict: dict, benchmark_ticker: str = "SPY"):
-    """
-    모든 대상 ETF의 기간별(1W, 1M, 3M, 6M, 1Y, YTD) 수익률 및 벤치마크 대비 알파를 연산합니다.
-    """
-    all_tickers = tuple(list(etf_info_dict.keys()) + [benchmark_ticker])
-    history_map = fetch_etf_history_map(all_tickers, period="2y")
-    
-    if benchmark_ticker not in history_map or history_map[benchmark_ticker].empty:
-        return None, None
-
-    bench_series = history_map[benchmark_ticker]
-    curr_year = datetime.now().year
-    
-    records = []
-    
-    for ticker, info in etf_info_dict.items():
-        if ticker not in history_map or len(history_map[ticker]) < 10:
-            continue
-            
-        s = history_map[ticker]
-        curr_price = s.iloc[-1]
-        
-        # 기간별 시작 종가 산출 (영업일 기준 근사치)
-        p_1w = s.iloc[-6] if len(s) >= 6 else s.iloc[0]
-        p_1m = s.iloc[-22] if len(s) >= 22 else s.iloc[0]
-        p_3m = s.iloc[-64] if len(s) >= 64 else s.iloc[0]
-        p_6m = s.iloc[-127] if len(s) >= 127 else s.iloc[0]
-        p_1y = s.iloc[-253] if len(s) >= 253 else s.iloc[0]
-        
-        # YTD 기준일 (당해 첫 거래일 종가)
-        ytd_sub = s[s.index.year == curr_year]
-        p_ytd = ytd_sub.iloc[0] if not ytd_sub.empty else curr_price
-        
-        # 수익률 (%)
-        r_1w = ((curr_price - p_1w) / p_1w) * 100
-        r_1m = ((curr_price - p_1m) / p_1m) * 100
-        r_3m = ((curr_price - p_3m) / p_3m) * 100
-        r_6m = ((curr_price - p_6m) / p_6m) * 100
-        r_1y = ((curr_price - p_1y) / p_1y) * 100
-        r_ytd = ((curr_price - p_ytd) / p_ytd) * 100
-        
-        records.append({
-            "ticker": ticker,
-            "name": info["name"],
-            "type": info.get("type", info.get("category", "-")),
-            "price": curr_price,
-            "1W": r_1w,
-            "1M": r_1m,
-            "3M": r_3m,
-            "6M": r_6m,
-            "1Y": r_1y,
-            "YTD": r_ytd
-        })
-
-    if not records:
-        return None, None
-
-    df_matrix = pd.DataFrame(records)
-
-    # 벤치마크(SPY) 수익률 산출
-    b_curr = bench_series.iloc[-1]
-    b_1w = bench_series.iloc[-6] if len(bench_series) >= 6 else bench_series.iloc[0]
-    b_1m = bench_series.iloc[-22] if len(bench_series) >= 22 else bench_series.iloc[0]
-    b_3m = bench_series.iloc[-64] if len(bench_series) >= 64 else bench_series.iloc[0]
-    b_6m = bench_series.iloc[-127] if len(bench_series) >= 127 else bench_series.iloc[0]
-    b_1y = bench_series.iloc[-253] if len(bench_series) >= 253 else bench_series.iloc[0]
-    b_ytd_sub = bench_series[bench_series.index.year == curr_year]
-    b_ytd = b_ytd_sub.iloc[0] if not b_ytd_sub.empty else b_curr
-
-    bench_returns = {
-        "1W": ((b_curr - b_1w) / b_1w) * 100,
-        "1M": ((b_curr - b_1m) / b_1m) * 100,
-        "3M": ((b_curr - b_3m) / b_3m) * 100,
-        "6M": ((b_curr - b_6m) / b_6m) * 100,
-        "1Y": ((b_curr - b_1y) / b_1y) * 100,
-        "YTD": ((b_curr - b_ytd) / b_ytd) * 100
+    ticker_map = {
+        **ROTATION_SECTORS,
+        **ROTATION_ASSET_CLASSES,
     }
 
-    # 벤치마크 대비 초과성과 (Alpha = Sector Return - SPY Return)
-    for p in ["1W", "1M", "3M", "6M", "1Y", "YTD"]:
-        df_matrix[f"{p}_alpha"] = df_matrix[p] - bench_returns[p]
+    histories = fetch_etf_history_map(
+        tuple(ticker_map.values()),
+        period="6mo"
+    )
 
-    return df_matrix, history_map
+    windows = {
+        "1주": 5,
+        "1개월": 21,
+        "3개월": 63,
+    }
+
+    records = []
+
+    for name, ticker in ticker_map.items():
+        df = histories.get(ticker)
+
+        if df is None or df.empty or len(df) < 64:
+            continue
+
+        close = df["Close"].dropna()
+
+        if len(close) < 64:
+            continue
+
+        row = {
+            "자산": name,
+            "티커": ticker,
+            "최신가": float(close.iloc[-1]),
+        }
+
+        for period_name, days in windows.items():
+            old_price = float(close.iloc[-(days + 1)])
+            current_price = float(close.iloc[-1])
+
+            row[period_name] = (
+                (current_price / old_price) - 1
+            ) * 100
+
+        records.append(row)
+
+    df_result = pd.DataFrame(records)
+
+    if not df_result.empty:
+        for period_name in windows:
+            df_result[f"{period_name}_순위"] = (
+                df_result[period_name]
+                .rank(ascending=False, method="min")
+                .astype(int)
+            )
+
+    return {
+        "sector": df_result[
+            df_result["자산"].isin(ROTATION_SECTORS.keys())
+        ].copy() if not df_result.empty else pd.DataFrame(),
+        "asset_class": df_result[
+            df_result["자산"].isin(ROTATION_ASSET_CLASSES.keys())
+        ].copy() if not df_result.empty else pd.DataFrame(),
+    }
+
+
+def rotation_dataframe_to_context(df: pd.DataFrame, title: str) -> str:
+    """모멘텀 순위 DF를 프롬프트 주입용 마크다운 표로 변환"""
+    if df is None or df.empty:
+        return f"\n#### {title}\n데이터 없음\n"
+
+    result = [f"\n#### {title}"]
+    result.append("| 자산 | 티커 | 1주 | 1개월 | 3개월 | 3개월 순위 |")
+    result.append("|---|---|---:|---:|---:|---:|")
+
+    for _, row in df.sort_values("3개월", ascending=False).iterrows():
+        result.append(
+            f"| {row['자산']} | {row['티커']} | "
+            f"{row['1주']:+.2f}% | "
+            f"{row['1개월']:+.2f}% | "
+            f"{row['3개월']:+.2f}% | "
+            f"{row['3개월_순위']} |"
+        )
+
+    return "\n".join(result)
