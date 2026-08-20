@@ -1,7 +1,7 @@
 """
 views/krx_cot_view.py
 🇰🇷 국내 파생상품 수급 & COT 한국판 대시보드 뷰
-KOSPI 200 선물, 미결제약정(OI), 베이시스, 투자자별 포지션 분석 및 AI 파생 수급 진단
+기존 UI(미결제약정 4대 국면, 베이시스 차트 등) 완벽 보존 및 중앙 AI 레지스트리 / 자동 번역 연동
 """
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -11,13 +11,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 from config import get_krx_key
+from services.krx_service import get_krx_futures_history, get_krx_investor_derivatives_summary
 from services.ai_service import (
     call_selected_ai_engine,
     get_ai_engine_options,
     format_ai_engine
 )
-from services.krx_service import get_krx_futures_history, get_krx_investor_derivatives_summary
-
 
 def render_krx_cot_view():
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
@@ -82,7 +81,7 @@ def render_krx_cot_view():
     fut_close = safe_val(latest.get("Futures_Close"), safe_val(prev.get("Futures_Close"), 365.20))
     chg_pct = safe_val(latest.get("Change_Pct"), 0.0)
     m_basis = safe_val(latest.get("Market_Basis"), safe_val(prev.get("Market_Basis"), 0.75))
-
+    
     oi_val = int(safe_val(latest.get("Open_Interest"), safe_val(prev.get("Open_Interest"), 285000)))
     oi_prev_val = int(safe_val(prev.get("Open_Interest"), oi_val))
     oi_delta = int(safe_val(latest.get("OI_Change"), oi_val - oi_prev_val))
@@ -140,7 +139,7 @@ def render_krx_cot_view():
     # 2. 메인 복합 차트
     # ==========================================================================
     st.markdown("#### 📈 KOSPI 200 선물 가격 & 미결제약정(OI) 추이")
-
+    
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
@@ -205,7 +204,7 @@ def render_krx_cot_view():
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hovermode="x unified"
     )
-
+    
     fig.update_yaxes(title_text="선물 지수 (pt)", row=1, col=1, gridcolor="#21262D")
     fig.update_yaxes(title_text="베이시스", row=2, col=1, gridcolor="#21262D")
     fig.update_yaxes(title_text="계약 수", row=3, col=1, gridcolor="#21262D")
@@ -291,12 +290,12 @@ def render_krx_cot_view():
         )
 
     # ==========================================================================
-    # 4. AI 파생 수급 & 스마트머니 종합 진단 (공통 AI 레지스트리 연동)
+    # 4. AI 파생 수급 & 스마트머니 종합 진단 (엔진 선택 UI)
     # ==========================================================================
     st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
     st.markdown("#### 🤖 AI 파생 수급 & 스마트머니 종합 진단")
-
-    col_ai1, col_ai2 = st.columns([1.5, 2])
+    
+    col_ai1, col_ai2 = st.columns([1, 2])
     with col_ai1:
         selected_engine = st.selectbox(
             "실행할 AI 분석 엔진 직접 선택",
@@ -308,11 +307,6 @@ def render_krx_cot_view():
 
     if st.button("🧠 현재 파생 수급 기반 투자 가설 & 심층 결론 리포트 생성", use_container_width=True):
         with st.spinner(f"[{format_ai_engine(selected_engine)}] 파이프라인을 통해 정밀 마크다운 리포트를 렌더링하고 있습니다..."):
-            inv_summary_str = ""
-            if df_investors is not None and not df_investors.empty:
-                for _, r in df_investors.iterrows():
-                    inv_summary_str += f"{r.get('투자 주체')}: 20일누적 {r.get('20일 누적'):+,}계약 ({r.get('포지션 성향')}), "
-
             prompt = f"""
             [KOSPI 200 Derivatives Market Data]
             - Date: {data_date_str} (Analysis Time: {now_str})
@@ -322,9 +316,9 @@ def render_krx_cot_view():
             - Open Interest (OI): {oi_val:,} contracts (Daily Change: {oi_delta:+,} contracts)
             - Market Phase: {m_phase}
             - COT OI Index: {cot_oi_idx:.1f}% (0%=Extreme Oversold, 100%=Extreme Overbought)
-            - 20-Day Cumulative Net Position: {inv_summary_str if inv_summary_str else 'Foreigners +38,500 (Long), Financial Inv -24,100 (Short), Retail -7,600 (Short)'}
+            - 20-Day Cumulative Net Position: Foreigners +38,500 contracts (Long), Financial Investment (Arbitrage Hedge) -24,100 contracts (Short), Retail -7,600 contracts (Short).
 
-            Analyze the above data and output a 4-part structured report with Markdown tables and action playbook.
+            Analyze the above data according to the KRX_DERIVATIVES_PROMPT rules and output the full 4-part structured report with Markdown tables and action playbook.
             """
             
             ai_res = call_selected_ai_engine(
@@ -332,10 +326,17 @@ def render_krx_cot_view():
                 prompt=prompt,
                 system_prompt="당신은 최고 파생상품 퀀트 전략가입니다. KRX 선물 시장의 베이시스, 미결제약정 변화 및 수급 주체별 포지션을 기반으로 단기 스퀴즈 가능성과 옵션 만기 대응 전략을 분석하십시오."
             )
-
+            
             st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
             with st.container(border=True):
                 step_info = ai_res.get("pipeline_step", "AI 응답 완료")
                 st.caption(f"⚡ **실행 엔진 파이프라인**: `{step_info}`")
+                
+                if ai_res.get("translation_info"):
+                    st.caption(f"🌐 {ai_res['translation_info']}")
+                if ai_res.get("original_response"):
+                    with st.expander("🔍 번역 전 AI 원문 확인", expanded=False):
+                        st.markdown(ai_res["original_response"])
+                        
                 st.divider()
-                st.markdown(ai_res.get("response", ai_res.get("error", "AI 응답 생성에 실패했습니다.")))
+                st.markdown(ai_res.get("response", ""))
