@@ -1,9 +1,10 @@
 """
 services/sector_service.py
 섹터 및 자산군 시계열/로테이션 수집 엔진
-기존 ETF 수집 헬퍼에 AI Context용 1/3개월 모멘텀 로테이션 수치 변환 추가
+기존 ETF 수집 헬퍼 및 calculate_returns_matrix 복원 완료, AI Context용 모멘텀 변환 포함
 """
 import logging
+from datetime import datetime
 import pandas as pd
 import yfinance as yf
 import streamlit as st
@@ -12,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# [신규] 로테이션 ETF 자산군 매핑
+# 로테이션 ETF 자산군 매핑
 # ==============================================================================
 ROTATION_SECTORS = {
     "정보기술": "XLK",
@@ -58,6 +59,63 @@ def fetch_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
                 logger.warning(f"ETF 수집 실패 ({ticker}): {e}")
                 results[ticker] = pd.DataFrame()
     return results
+
+
+# ==============================================================================
+# [복원] 기존 sector_view.py 호환용 calculate_returns_matrix
+# ==============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def calculate_returns_matrix(etf_dict: dict, benchmark_ticker: str = "SPY") -> tuple:
+    """섹터 및 자산군의 단기/장기 수익률 매트릭스 계산 (원본 복구)"""
+    tickers = list(etf_dict.values())
+    if benchmark_ticker not in tickers:
+        tickers.append(benchmark_ticker)
+        
+    hist_map = fetch_etf_history_map(tuple(tickers), period="2y")
+    curr_year = datetime.now().year
+    
+    records = []
+    for name, ticker in etf_dict.items():
+        df = hist_map.get(ticker)
+        if df is None or df.empty or len(df) < 260:
+            continue
+            
+        close = df['Close'].dropna()
+        if len(close) < 20:
+            continue
+            
+        curr_price = float(close.iloc[-1])
+        
+        # YTD calculation
+        try:
+            ytd_start_date = f"{curr_year-1}-12-31"
+            if ytd_start_date in close.index:
+                ytd_price = float(close.loc[ytd_start_date])
+            else:
+                ytd_price = float(close[close.index <= pd.to_datetime(ytd_start_date)].iloc[-1])
+            ytd_ret = (curr_price / ytd_price - 1) * 100
+        except Exception:
+            ytd_ret = 0.0
+
+        def get_ret(days):
+            if len(close) > days:
+                return (curr_price / float(close.iloc[-(days+1)]) - 1) * 100
+            return 0.0
+        
+        records.append({
+            "Sector": name,
+            "Ticker": ticker,
+            "Current Price": curr_price,
+            "1W": get_ret(5),
+            "1M": get_ret(21),
+            "3M": get_ret(63),
+            "6M": get_ret(126),
+            "YTD": ytd_ret,
+            "1Y": get_ret(252)
+        })
+        
+    res_df = pd.DataFrame(records)
+    return res_df, hist_map
 
 
 # ==============================================================================
