@@ -194,7 +194,7 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
 
         if output:
             records = []
-            for idx, row in enumerate(output[:top_n], start=1):
+            for row in output:
                 code = row.get("stck_shrn_iscd", row.get("mksc_shrn_iscd", ""))
                 name = row.get("hts_kor_isnm", "")
                 price = float(row.get("stck_prpr", 0))
@@ -207,7 +207,7 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                     qty = float(row.get("orgn_fake_ntby_qty", row.get("organ_pure_byqty", row.get("orgn_ntby_qty", 0))))
 
                 amt_raw = qty * price
-                # 만약 기존 TR의 직접 금액 필드가 있다면 폴백 적용
+                # 직접 금액 필드 폴백
                 if amt_raw == 0:
                     direct_amt = float(row.get("ntby_tr_pbmn", row.get("frgn_pure_bysum" if investor == "외국인" else "organ_pure_bysum", 0)))
                     if direct_amt != 0:
@@ -220,7 +220,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
 
                 if name and code:
                     records.append({
-                        "순위": idx,
                         "종목코드": code,
                         "종목명": name,
                         "현재가": price,
@@ -229,8 +228,21 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                         "시가총액_가중": max(price * 1000, 500),
                         "데이터_출처": f"KIS 증권사 API ({target_date})"
                     })
+
             if records:
-                return pd.DataFrame(records)
+                df_result = pd.DataFrame(records)
+                # 재계산된 순매수대금(억) 기준으로 내림차순/오름차순 재정렬
+                df_result = df_result.sort_values(
+                    "순매수대금(억)",
+                    ascending=(trade_type == "순매도")
+                ).reset_index(drop=True)
+
+                # 상위 top_n개 추출 및 순위 재부여
+                df_result = df_result.head(top_n)
+                df_result["순위"] = range(1, len(df_result) + 1)
+
+                cols = ["순위", "종목코드", "종목명", "현재가", "등락률(%)", "순매수대금(억)", "시가총액_가중", "데이터_출처"]
+                return df_result[[c for c in cols if c in df_result.columns]]
     except Exception as e:
         logger.warning(f"KIS API 호출 실패: {e}")
     return pd.DataFrame()
