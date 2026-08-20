@@ -4,6 +4,7 @@ AI 모델 레지스트리 기반 엔진 (NVIDIA, Cloudflare, Cerebras 및 자동
 신규 모델: meta/llama-3.3-70b-instruct, openai/gpt-oss-120b 지원
 """
 import logging
+import time
 import requests
 from config import get_secret
 
@@ -97,7 +98,7 @@ def format_ai_engine(engine_id: str) -> str:
 # ==============================================================================
 def _call_openai_format(engine_name: str, endpoint: str, api_key: str, model: str, prompt: str, system_prompt: str = None, timeout: int = 120) -> dict:
     if not api_key:
-        return {"response": "", "error": f"{engine_name} API Key 누락", "pipeline_step": f"{engine_name} 실패"}
+        return {"response": "", "error": f"{engine_name} API Key 누락", "pipeline_step": f"{engine_name} 실패", "latency": 0.0}
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -116,8 +117,10 @@ def _call_openai_format(engine_name: str, endpoint: str, api_key: str, model: st
         "max_tokens": 4096
     }
 
+    start_time = time.time()
     try:
         res = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+        elapsed = round(time.time() - start_time, 2)
         if res.status_code == 200:
             data = res.json()
             if "choices" in data and len(data["choices"]) > 0:
@@ -125,22 +128,28 @@ def _call_openai_format(engine_name: str, endpoint: str, api_key: str, model: st
                 response_text = message.get("content", "") or ""
                 reasoning_text = message.get("reasoning_content", "") or ""
 
-                # reasoning_content 보조 처리
                 if not response_text and reasoning_text:
                     response_text = reasoning_text
 
                 if response_text.strip():
-                    return {"response": response_text.strip(), "error": None, "pipeline_step": f"{engine_name} 성공"}
-            return {"response": "", "error": "응답 텍스트 추출 실패", "pipeline_step": f"{engine_name} 실패"}
-        return {"response": "", "error": f"HTTP {res.status_code}: {res.text[:200]}", "pipeline_step": f"{engine_name} 실패"}
+                    return {
+                        "response": response_text.strip(),
+                        "error": None,
+                        "pipeline_step": f"{engine_name} 성공",
+                        "latency": elapsed,
+                        "model": model
+                    }
+            return {"response": "", "error": "응답 텍스트 추출 실패", "pipeline_step": f"{engine_name} 실패", "latency": elapsed}
+        return {"response": "", "error": f"HTTP {res.status_code}: {res.text[:200]}", "pipeline_step": f"{engine_name} 실패", "latency": elapsed}
     except Exception as e:
-        return {"response": "", "error": str(e), "pipeline_step": f"{engine_name} 에러"}
+        elapsed = round(time.time() - start_time, 2)
+        return {"response": "", "error": str(e), "pipeline_step": f"{engine_name} 에러", "latency": elapsed}
 
 
 def call_nvidia_model(engine_id: str, api_key: str, prompt: str, system_prompt: str = None) -> dict:
     config = AI_MODEL_REGISTRY.get(engine_id)
     if not config:
-        return {"response": "", "error": f"존재하지 않는 엔진 ID: {engine_id}", "pipeline_step": "설정 에러"}
+        return {"response": "", "error": f"존재하지 않는 엔진 ID: {engine_id}", "pipeline_step": "설정 에러", "latency": 0.0}
     return _call_openai_format(
         engine_name=config["label"],
         endpoint=NVIDIA_CHAT_URL,
@@ -154,7 +163,7 @@ def call_nvidia_model(engine_id: str, api_key: str, prompt: str, system_prompt: 
 
 def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: str, system_prompt: str = None) -> dict:
     if not account_id or not api_token:
-        return {"response": "", "error": "Cloudflare 인증 정보 누락", "pipeline_step": "Cloudflare 실패"}
+        return {"response": "", "error": "Cloudflare 인증 정보 누락", "pipeline_step": "Cloudflare 실패", "latency": 0.0}
 
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
     headers = {
@@ -167,19 +176,28 @@ def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: s
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
+    start_time = time.time()
     try:
         res = requests.post(url, headers=headers, json={"messages": messages}, timeout=60)
+        elapsed = round(time.time() - start_time, 2)
         if res.status_code == 200:
             data = res.json()
             if data.get("success", False):
                 result = data.get("result", {})
                 text = result.get("response", "")
                 if text:
-                    return {"response": text.strip(), "error": None, "pipeline_step": f"Cloudflare ({model}) 성공"}
-            return {"response": "", "error": f"응답 실패: {data.get('errors')}", "pipeline_step": "Cloudflare 실패"}
-        return {"response": "", "error": f"HTTP {res.status_code}: {res.text[:200]}", "pipeline_step": "Cloudflare 실패"}
+                    return {
+                        "response": text.strip(),
+                        "error": None,
+                        "pipeline_step": f"Cloudflare ({model}) 성공",
+                        "latency": elapsed,
+                        "model": model
+                    }
+            return {"response": "", "error": f"응답 실패: {data.get('errors')}", "pipeline_step": "Cloudflare 실패", "latency": elapsed}
+        return {"response": "", "error": f"HTTP {res.status_code}: {res.text[:200]}", "pipeline_step": "Cloudflare 실패", "latency": elapsed}
     except Exception as e:
-        return {"response": "", "error": str(e), "pipeline_step": "Cloudflare 에러"}
+        elapsed = round(time.time() - start_time, 2)
+        return {"response": "", "error": str(e), "pipeline_step": "Cloudflare 에러", "latency": elapsed}
 
 
 def call_cerebras_model(model: str, api_key: str, prompt: str, system_prompt: str = None) -> dict:
@@ -203,11 +221,9 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
     cloudflare_token = get_secret("ai.cloudflare_api_token", get_secret("CLOUDFLARE_API_TOKEN", ""))
     cerebras_key = get_secret("ai.cerebras_api_key", get_secret("CEREBRAS_API_KEY", ""))
 
-    # 1. 자동 Failover 호출
     if engine_name == "auto":
         return generate_ai_briefing_with_failover(prompt=prompt, system_prompt=system_prompt)
 
-    # 2. 레지스트리 검색 (ID 매칭 실패 시 레이블 역방향 검색)
     config = AI_MODEL_REGISTRY.get(engine_name)
     engine_id = engine_name
     if not config:
@@ -222,13 +238,14 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
             "response": "",
             "error": f"지원하지 않는 AI 엔진 ID/이름입니다: {engine_name}",
             "pipeline_step": "엔진 설정 오류",
+            "latency": 0.0
         }
 
     provider = config["provider"]
 
     if provider == "nvidia":
         if not nvidia_key:
-            return {"response": "", "error": "NVIDIA API Key가 설정되지 않았습니다.", "pipeline_step": "NVIDIA 인증 오류"}
+            return {"response": "", "error": "NVIDIA API Key가 설정되지 않았습니다.", "pipeline_step": "NVIDIA 인증 오류", "latency": 0.0}
         return call_nvidia_model(engine_id=engine_id, api_key=nvidia_key, prompt=prompt, system_prompt=system_prompt)
 
     if provider == "cloudflare":
@@ -248,7 +265,7 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
             system_prompt=system_prompt
         )
 
-    return {"response": "", "error": f"처리되지 않은 provider: {provider}", "pipeline_step": "엔진 설정 오류"}
+    return {"response": "", "error": f"처리되지 않은 provider: {provider}", "pipeline_step": "엔진 설정 오류", "latency": 0.0}
 
 
 def generate_ai_briefing_with_failover(prompt: str, system_prompt: str = None) -> dict:
@@ -264,7 +281,8 @@ def generate_ai_briefing_with_failover(prompt: str, system_prompt: str = None) -
     return {
         "response": "",
         "error": "모든 AI 엔진 호출 실패 -> " + " | ".join(errors),
-        "pipeline_step": "Failover 전체 실패"
+        "pipeline_step": "Failover 전체 실패",
+        "latency": 0.0
     }
 
 
