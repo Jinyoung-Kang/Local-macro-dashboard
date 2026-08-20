@@ -2,6 +2,7 @@
 services/ai_service.py
 AI 모델 레지스트리 기반 엔진 (NVIDIA, Cloudflare, Cerebras 및 자동 Failover 파이프라인)
 분석 엔진과 번역 전용 엔진(Gemma 4 26B/31B)의 철저한 분리 및 한국어 판별 자동 번역기 탑재
+(ai_test_view.py 등 레거시 호환성을 위한 래퍼 함수 완벽 복구)
 """
 import logging
 import re
@@ -12,7 +13,7 @@ from config import get_secret
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 0. 중앙 집중형 AI 모델 레지스트리 (Single Source of Truth)
+# 0. 중앙 집중형 AI 모델 레지스트리 (분석 전용)
 # ==============================================================================
 AI_MODEL_REGISTRY = {
     "auto": {
@@ -65,6 +66,9 @@ AI_MODEL_REGISTRY = {
     },
 }
 
+# ==============================================================================
+# 0-1. 자동 한국어 번역 전용 모델 레지스트리 (분석 선택지에서 제외됨)
+# ==============================================================================
 TRANSLATION_MODELS = {
     "cloudflare": {
         "label": "Cloudflare Gemma 4 26B 번역기",
@@ -91,7 +95,7 @@ NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 
 def get_ai_engine_options(include_auto: bool = True) -> list[str]:
-    """등록된 모든 AI 엔진 ID 리스트 반환 (번역 전용 모델 제외)"""
+    """등록된 모든 AI 분석 엔진 ID 리스트 반환 (번역 전용 모델 제외)"""
     engine_ids = list(AI_MODEL_REGISTRY.keys())
     if not include_auto and "auto" in engine_ids:
         engine_ids.remove("auto")
@@ -186,6 +190,7 @@ def translate_response_if_needed(
             text=response_text,
         )
     else:
+        # Cerebras 등 기타 제공자의 경우 Cloudflare 공용 번역기로 Fallback
         translation_result = translate_with_cloudflare_gemma(
             account_id=cloudflare_account_id,
             api_token=cloudflare_token,
