@@ -1,7 +1,7 @@
 """
 views/ai_report_view.py
 AI 매크로 & 멀티에셋 종합 리포트 뷰
-build_comprehensive_context() 헬퍼 및 5대 영역 데이터 수집/검증 구역 완벽 탑재
+5대 데이터 수집 병렬 처리, 중앙 AI 레지스트리 호출 및 번역 모델 연동
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -21,14 +21,12 @@ from services.sec_service import load_all_institutions_data
 
 logger = logging.getLogger(__name__)
 
-
 def _safe_call(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
     except Exception as e:
         logger.warning(f"AI 컨텍스트 데이터 수집 중 예외 ({fn.__name__}): {e}")
         return None
-
 
 def _is_valid_data(val) -> bool:
     if val is None:
@@ -38,7 +36,6 @@ def _is_valid_data(val) -> bool:
     if isinstance(val, (list, dict, tuple, set)):
         return len(val) > 0
     return bool(val)
-
 
 def build_comprehensive_context(report_type: str = "종합 거시경제 & 수급 전략") -> str:
     """5개 영역 시장 데이터를 병렬 수집하여 종합 분석용 컨텍스트 텍스트를 구성"""
@@ -210,6 +207,13 @@ def render_ai_report_view():
 
             st.markdown("---")
             st.caption(f"⚡ 실행 엔진 파이프라인: `{pipeline_step}`")
+            
+            if res.get("translation_info"):
+                st.caption(f"🌐 {res['translation_info']}")
+            if res.get("original_response"):
+                with st.expander("🔍 번역 전 AI 원문 확인", expanded=False):
+                    st.markdown(res["original_response"])
+                    
             st.markdown(f"### 📋 {report_type} 분석 리포트")
             st.caption(f"분석 엔진: `{format_ai_engine(ai_engine)}` | 생성 완료 시각: `{now_kst.strftime('%H:%M:%S KST')}`")
             st.markdown(ai_response_text)
