@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 로테이션 ETF 자산군 매핑
+# 0. 로테이션 ETF 자산군 매핑
 # ==============================================================================
 ROTATION_SECTORS = {
     "정보기술": "XLK",
@@ -62,64 +62,103 @@ def fetch_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
 
 
 # ==============================================================================
-# [복원] 기존 sector_view.py 호환용 calculate_returns_matrix
+# 1. [복구됨] 기존 sector_view.py 호환용 calculate_returns_matrix
 # ==============================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def calculate_returns_matrix(etf_dict: dict, benchmark_ticker: str = "SPY") -> tuple:
-    """섹터 및 자산군의 단기/장기 수익률 매트릭스 계산 (원본 복구)"""
-    tickers = list(etf_dict.values())
+def calculate_returns_matrix(
+    etf_dict: dict,
+    benchmark_ticker: str = "SPY",
+) -> tuple[pd.DataFrame, dict]:
+    """
+    config.py ETF 설정 구조를 받아 기간별 수익률 매트릭스를 계산합니다.
+
+    입력 구조:
+    {
+        "XLK": {"name": "정보기술 (Technology)", "type": "공격 / 성장"},
+        "XLF": {"name": "금융 (Financials)", "type": "경기민감"},
+    }
+
+    반환:
+    - DataFrame: 기존 sector_view.py 호환 컬럼
+    - dict: 티커별 yfinance 시계열
+    """
+    tickers = list(etf_dict.keys())
+
     if benchmark_ticker not in tickers:
         tickers.append(benchmark_ticker)
-        
-    hist_map = fetch_etf_history_map(tuple(tickers), period="2y")
-    curr_year = datetime.now().year
-    
+
+    hist_map = fetch_etf_history_map(
+        tuple(tickers),
+        period="2y",
+    )
+
+    current_year = datetime.now().year
     records = []
-    for name, ticker in etf_dict.items():
+
+    for ticker, info in etf_dict.items():
         df = hist_map.get(ticker)
-        if df is None or df.empty or len(df) < 260:
+
+        if df is None or df.empty:
             continue
-            
-        close = df['Close'].dropna()
+
+        if "Close" not in df.columns:
+            continue
+
+        close = df["Close"].dropna()
+
         if len(close) < 20:
             continue
-            
-        curr_price = float(close.iloc[-1])
-        
-        # YTD calculation
-        try:
-            ytd_start_date = f"{curr_year-1}-12-31"
-            if ytd_start_date in close.index:
-                ytd_price = float(close.loc[ytd_start_date])
-            else:
-                ytd_price = float(close[close.index <= pd.to_datetime(ytd_start_date)].iloc[-1])
-            ytd_ret = (curr_price / ytd_price - 1) * 100
-        except Exception:
-            ytd_ret = 0.0
 
-        def get_ret(days):
-            if len(close) > days:
-                return (curr_price / float(close.iloc[-(days+1)]) - 1) * 100
-            return 0.0
-        
+        current_price = float(close.iloc[-1])
+
+        def calc_return(days: int) -> float:
+            if len(close) <= days:
+                return 0.0
+
+            old_price = float(close.iloc[-(days + 1)])
+
+            if old_price == 0:
+                return 0.0
+
+            return (current_price / old_price - 1) * 100
+
+        try:
+            ytd_series = close[close.index.year == current_year]
+
+            if ytd_series.empty:
+                ytd_return = 0.0
+            else:
+                ytd_price = float(ytd_series.iloc[0])
+                ytd_return = (
+                    (current_price / ytd_price - 1) * 100
+                    if ytd_price != 0
+                    else 0.0
+                )
+
+        except Exception:
+            ytd_return = 0.0
+
         records.append({
-            "Sector": name,
-            "Ticker": ticker,
-            "Current Price": curr_price,
-            "1W": get_ret(5),
-            "1M": get_ret(21),
-            "3M": get_ret(63),
-            "6M": get_ret(126),
-            "YTD": ytd_ret,
-            "1Y": get_ret(252)
+            "ticker": ticker,
+            "name": info.get("name", ticker),
+            "type": info.get("type", info.get("category", "-")),
+            "price": current_price,
+            "1W": calc_return(5),
+            "1M": calc_return(21),
+            "3M": calc_return(63),
+            "6M": calc_return(126),
+            "YTD": ytd_return,
+            "1Y": calc_return(252),
         })
-        
-    res_df = pd.DataFrame(records)
-    return res_df, hist_map
+
+    if not records:
+        return pd.DataFrame(), hist_map
+
+    return pd.DataFrame(records), hist_map
 
 
 # ==============================================================================
-# [신규] 로테이션 모멘텀 계산 및 AI Context 포맷 변환
+# 2. 로테이션 모멘텀 계산 및 AI Context 포맷 변환 (RAG 전용)
 # ==============================================================================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_rotation_momentum_for_ai() -> dict:
