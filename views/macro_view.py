@@ -1,7 +1,7 @@
 """
 views/macro_view.py
 거시경제 매크로 지표 대시보드 뷰
-장단기 금리차, 하이일드 OAS, 3M CP 스프레드, STLFSI4, 개장 상태 표시 및 AI 브리핑 연동
+기존 UI(인터랙티브 차트, 탭 등) 완벽 보존 및 중앙 AI 레지스트리 / 자동 번역 연동
 """
 from datetime import datetime
 import pandas as pd
@@ -10,11 +10,6 @@ import pytz
 import streamlit as st
 import yfinance as yf
 from config import MACRO_CATEGORIES, RISK_MODEL_TABLE, SPREAD_TABLE_DATA
-from services.ai_service import (
-    call_selected_ai_engine,
-    get_ai_engine_options,
-    format_ai_engine
-)
 from services.macro_service import (
     clean_tag_ui,
     fetch_fred_cp_spread,
@@ -22,6 +17,11 @@ from services.macro_service import (
     fetch_ticker_data,
     generate_briefing_text,
     get_collected_macro_data,
+)
+from services.ai_service import (
+    call_selected_ai_engine,
+    get_ai_engine_options,
+    format_ai_engine
 )
 
 
@@ -40,35 +40,27 @@ def inject_market_status(name: str) -> str:
     now = datetime.now(pytz.timezone('Asia/Seoul'))
     wd = now.weekday()
     hm = now.hour * 100 + now.minute
-    is_weekend = wd >= 5
-
+    is_weekend = wd >= 5 
+    
     status = "마감"
-
+    
     if "비트코인" in name or "이더리움" in name or "암호화폐" in name:
-        status = "개장"
+        status = "개장" 
     elif "코스피" in name or "코스닥" in name:
-        if not is_weekend and 900 <= hm < 1530:
-            status = "개장"
+        if not is_weekend and 900 <= hm < 1530: status = "개장"
     elif "닛케이" in name or "일본" in name:
-        if not is_weekend and 900 <= hm < 1500:
-            status = "개장"
+        if not is_weekend and 900 <= hm < 1500: status = "개장"
     elif "상하이" in name or "중국" in name:
-        if not is_weekend and 1030 <= hm < 1600:
-            status = "개장"
+        if not is_weekend and 1030 <= hm < 1600: status = "개장"
     elif "항셍" in name or "홍콩" in name:
-        if not is_weekend and 1030 <= hm < 1700:
-            status = "개장"
+        if not is_weekend and 1030 <= hm < 1700: status = "개장"
     elif any(k in name for k in ["S&P", "NASDAQ", "나스닥", "다우", "러셀"]):
         status = get_us_market_status()
     else:
-        if wd == 5 and hm >= 600:
-            status = "마감"
-        elif wd == 6:
-            status = "마감"
-        elif wd == 0 and hm < 600:
-            status = "마감"
-        else:
-            status = "개장"
+        if wd == 5 and hm >= 600: status = "마감"
+        elif wd == 6: status = "마감"
+        elif wd == 0 and hm < 600: status = "마감"
+        else: status = "개장"
 
     if "]]" in name:
         return name.replace("]]", f" / {status}]]")
@@ -108,34 +100,43 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             st.markdown("**현재 시세 텍스트 종합 브리핑**")
             st.caption("우측 상단 복사 아이콘(📋)을 눌러 즉시 복사하세요.")
             st.code(report_text, language="text")
-
+            
         st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-
+            
         with st.popover("🤖 AI로 텍스트 브리핑 보기 / 복사", use_container_width=True):
             st.markdown("**🤖 AI 기반 통합 데이터 브리핑**")
             st.caption(f"대시보드 전역의 최신 데이터를 취합하여 즉시 분석합니다.\n(기준 시각: {now_str_kst})")
-
+            
             macro_ai_engine = st.selectbox(
-                "AI 분석 엔진 선택",
+                "AI 분석 엔진 직접 선택",
                 options=get_ai_engine_options(include_auto=True),
                 format_func=format_ai_engine,
                 index=0,
                 key="popover_ai_engine"
             )
-
+            
             if st.button("🧠 AI 브리핑 생성", key="btn_macro_ai_popover", use_container_width=True):
                 with st.spinner(f"[{format_ai_engine(macro_ai_engine)}] 5대 핵심 지표 데이터를 수집 및 분석 중입니다..."):
                     try:
+                        from views.ai_report_view import build_comprehensive_context
+                        context_data = build_comprehensive_context()
+                        
                         res = call_selected_ai_engine(
-                            macro_ai_engine,
-                            prompt=report_text,
+                            engine_name=macro_ai_engine, 
+                            prompt=context_data, 
                             system_prompt="글로벌 매크로 전략가 관점에서 주요 금리, 유동성, 원자재 지표의 변동 원인과 자산배분 시사점을 3문단으로 요약하십시오."
                         )
-
+                        
                         ai_text = f"**[📅 데이터 수집 및 분석 기준 시각: {now_str_kst}]**\n\n" + res.get("response", "데이터 처리에 실패했습니다.")
-                        st.markdown(ai_text)
-                        st.caption(f"⚡ 파이프라인: `{res.get('pipeline_step')}`")
+                        
+                        if res.get("translation_info"):
+                            st.caption(f"🌐 {res['translation_info']}")
+                        if res.get("original_response"):
+                            with st.expander("🔍 번역 전 AI 원문 확인", expanded=False):
+                                st.markdown(res["original_response"])
 
+                        st.markdown(ai_text)
+                        
                         st.divider()
                         st.markdown("**📋 전체 복사용 텍스트**")
                         st.code(ai_text, language="markdown")
@@ -153,7 +154,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         cols = st.columns(len(items))
         for idx, item in enumerate(items):
             display_name = inject_market_status(item["name"])
-
+            
             if item["status"] == "ok":
                 cols[idx].metric(
                     label=display_name,
@@ -179,7 +180,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         curr_spread = rate_10y_curr - rate_2y_curr
         prev_spread = rate_10y_prev - rate_2y_prev
         spread_delta = curr_spread - prev_spread
-
+        
         if curr_spread < 0:
             status_title = "🚨 역전 (Inversion)"
             status_color = "red"
