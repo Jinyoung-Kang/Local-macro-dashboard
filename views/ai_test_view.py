@@ -1,97 +1,87 @@
-# views/ai_test_view.py
+"""
+views/ai_test_view.py
+AI 엔진 통합 진단 및 테스트 뷰
+공통 모델 레지스트리 기반 종합 테스트 및 개별 API Key 진단 지원
+"""
 import streamlit as st
+from config import get_secret
 from services.ai_service import (
-    get_secret, 
-    test_nvidia_nemotron,
-    test_cloudflare_ai,
-    test_nvidia_gpt_oss,
+    AI_MODEL_REGISTRY,
+    call_selected_ai_engine,
+    format_ai_engine,
+    get_ai_engine_options,
     test_cerebras,
-    generate_ai_briefing_with_failover,
-    call_selected_ai_engine
+    test_cerebras_llama,
+    test_cloudflare_ai,
+    test_cloudflare_deepseek,
+    test_cloudflare_llama,
+    test_nvidia_gpt_oss,
+    test_nvidia_gpt_oss_120b,
+    test_nvidia_gpt_oss_20b,
+    test_nvidia_llama_33_70b,
+    test_nvidia_nemotron
 )
-from services.prompts import INVESTMENT_AGENT_PROMPT
+
 
 def render_ai_test_view():
-    st.title("🤖 4대 AI API 통합 & Failover 테스트")
-    st.caption("1순위 Nemotron-3, 2순위 Cloudflare(DeepSeek-R1), 3순위 GPT-OSS-20B, 4순위 Cerebras 파이프라인 검증.")
-    st.divider()
+    st.markdown("""
+    <div style="padding: 4px 0 12px 0;">
+        <h2 style="margin:0; font-weight: 700; color: #F0F6FC;">
+            🤖 AI 엔진 통합 테스트 및 성능 진단
+        </h2>
+        <p style="margin: 4px 0 0 0; color: #8B949E; font-size: 0.92rem;">
+            NVIDIA NIM, Cloudflare, Cerebras 및 자동 Failover 엔진의 연결 상태, 추론 지연시간(Latency) 및 응답 품질을 검증합니다.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
 
-    sec_nv_key = get_secret("ai.nvidia_api_key", "")
-    sec_cf_id = get_secret("ai.cloudflare_account_id", "")
-    sec_cf_token = get_secret("ai.cloudflare_api_token", "")
-    sec_ce_key = get_secret("ai.cerebras_api_key", "")
-
-    # 엔진 연결 및 인증 키 로드 상태 4칸 배치
-    with st.expander("⚙️ Streamlit Secrets 인증 키 로드 상태", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown(f"**🥇 1순위 Nemotron-3:**<br>{'🟢 로드 완료' if sec_nv_key else '🔴 미설정'}", unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"**🥈 2순위 Cloudflare:**<br>{'🟢 로드 완료' if (sec_cf_id and sec_cf_token) else '🔴 미설정'}", unsafe_allow_html=True)
-        with c3:
-            st.markdown(f"**🥉 3순위 GPT-OSS-20B:**<br>{'🟢 로드 완료' if sec_nv_key else '🔴 미설정'}", unsafe_allow_html=True)
-        with c4:
-            st.markdown(f"**🏅 4순위 Cerebras:**<br>{'🟢 로드 완료' if sec_ce_key else '🔴 미설정'}", unsafe_allow_html=True)
-
-    # 🚀 커스텀 프롬프트 적용 여부 토글
-    use_custom_prompt = st.toggle("🧠 **투자 가설 검증 Agent 모드 활성화**", value=True, help="체크 시 글로벌 매크로 헤지펀 시니어의 엄격한 분석 프레임워크(사실/해석 분리, 시나리오, 체크리스트 등)가 적용됩니다.")
-
-    # 기본 프롬프트 값 설정 (모드에 따라 다르게)
-    default_prompt = "최근 연준의 금리 인하 기대감이 미국 기술주(NASDAQ) 밸류에이션에 미치는 영향을 분석해줘." if use_custom_prompt else "미국 증시와 연준 순유동성(Net Liquidity)의 상관관계를 2문장으로 핵심만 요약해줘."
-    
-    test_prompt = st.text_area("테스트 질문 프롬프트", value=default_prompt, height=100)
-    st.write("")
-    
-    # 선택형 개별 테스트 UI 도입
-    st.markdown("##### 🛠️ 테스트 방식 선택")
-    col_sel, col_empty = st.columns([1, 1])
-    with col_sel:
+    # 1. 모델 선택 및 세부 사양 표시
+    c1, c2 = st.columns([2, 1])
+    with c1:
         selected_api = st.selectbox(
-            "단일 테스트를 수행할 AI 엔진을 선택하세요.", 
-            [
-                "NVIDIA Nemotron-3 Super", 
-                "Cloudflare AI (DeepSeek-R1)", 
-                "NVIDIA GPT-OSS-20B", 
-                "Cerebras Cloud (GPT-OSS-120B)"
-            ]
+            "테스트할 AI 모델 선택",
+            options=get_ai_engine_options(include_auto=True),
+            format_func=format_ai_engine,
+            index=0,
+            key="ai_test_engine"
         )
-    
-    col_btn1, col_btn2 = st.columns(2)
-    with col_btn1:
-        run_individual = st.button("🚀 선택한 AI 엔진 단일 테스트", type="secondary", use_container_width=True)
-    with col_btn2:
-        run_failover = st.button("🛡️ 4단 Failover 무중단 파이프라인 실행", type="primary", use_container_width=True)
+    with c2:
+        model_info = AI_MODEL_REGISTRY.get(selected_api, {})
+        st.markdown(f"**제공자 (Provider)**: `{model_info.get('provider', 'N/A')}`")
+        st.caption(f"사양: {model_info.get('description', '')}")
 
-    st.divider()
+    # 2. 프롬프트 작성
+    sample_prompts = [
+        "글로벌 채권 금리 상승이 성장주 밸류에이션에 미치는 영향을 2문장으로 설명해줘.",
+        "10Y-2Y 장단기 금리차 역전 현상이 은행권 순이자마진(NIM)에 미치는 영향을 분석해줘.",
+        "달러 인덱스 강세가 신흥국 증시 수급에 미치는 파급 경로를 요약해줘."
+    ]
+    selected_sample = st.selectbox("📝 추천 테스트 프롬프트 불러오기", options=sample_prompts, index=0)
 
-    sys_prompt_to_use = INVESTMENT_AGENT_PROMPT if use_custom_prompt else None
+    test_prompt = st.text_area(
+        "테스트 프롬프트 직접 입력",
+        value=selected_sample,
+        height=100
+    )
 
-    # 1. 사용자가 선택한 단일 API 연결 상태 점검
-    if run_individual:
-        st.subheader(f"📊 {selected_api} 테스트 결과")
-        
-        with st.spinner(f"{selected_api} 엔진 호출 중..."):
-            res = call_selected_ai_engine(selected_api, test_prompt, sys_prompt_to_use)
-            
-        if res["status"]:
-            st.success(f"🟢 정상 ({res['latency_ms']} ms)")
-            if "translation_info" in res:
-                st.caption(f"**번역 상태:** {res['translation_info']}")
-            st.markdown(f"<div style='padding:1rem; border-radius:0.5rem; background-color:rgba(0,100,255,0.1);'>{res['response']}</div>", unsafe_allow_html=True)
+    # 3. 테스트 실행
+    if st.button("🧪 AI 모델 호출 테스트 실행", type="primary", use_container_width=True):
+        with st.spinner(f"'{format_ai_engine(selected_api)}' 엔진 추론 실행 중..."):
+            res = call_selected_ai_engine(
+                engine_name=selected_api,
+                prompt=test_prompt,
+                system_prompt="당신은 금융 시장을 심층 분석하는 수석 AI 분석가입니다. 반드시 한국어로 명확하고 간결하게 답변하십시오."
+            )
+
+        st.markdown("---")
+        if res.get("status") and res.get("response"):
+            st.success(f"✅ 호출 성공 (소요 시간: `{res.get('latency', 0.0)}초` / `{res.get('latency_ms', 0)}ms`)")
+            st.caption(f"⚡ 파이프라인 상태: `{res.get('pipeline_step')}` | 모델 ID: `{res.get('model', selected_api)}`")
+            st.markdown(res["response"])
         else:
-            st.error("🔴 호출 실패")
-            st.caption(res["response"])
+            st.error("❌ AI 호출 실패")
+            st.caption(f"파이프라인 단계: `{res.get('pipeline_step')}` | 소요 시간: `{res.get('latency', 0.0)}초`")
+            st.code(res.get("error", "알 수 없는 오류가 발생했습니다."))
 
-    # 2. Failover 파이프라인 실행 (우선순위에 따라 순차 처리)
-    if run_failover:
-        st.subheader("🛡️ Failover 파이프라인 실제 응답 결과")
-        with st.spinner("1순위 Nemotron부터 순차 탐색하여 브리핑을 생성하는 중..."):
-            res = generate_ai_briefing_with_failover(test_prompt, sys_prompt_to_use)
-        
-        if res["status"]:
-            st.success(f"✅ **{res['pipeline_step']}** (지연시간: {res['latency_ms']} ms | 엔진: {res['provider']})")
-            st.markdown("##### 📝 AI 생성 브리핑:")
-            st.markdown(f"<div style='padding:1rem; border-radius:0.5rem; background-color:rgba(0,100,255,0.1);'>{res['response']}</div>", unsafe_allow_html=True)
-        else:
-            st.error(f"❌ {res['pipeline_step']}")
-            st.warning(res["response"])
+        with st.expander("🔍 개발자용 원본 응답 페이로드 확인", expanded=False):
+            st.json(res)
