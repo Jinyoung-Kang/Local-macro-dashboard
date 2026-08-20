@@ -1,9 +1,9 @@
 """
 views/radar_view.py
 외국인/기관 수급 레이더 대시보드 뷰
-실시간 순매수/순매도 스캐닝, 캐시 즉시 초기화/강제 새로고침 컨트롤 및 종목별 기준일 누적 수급 차트
+실시간 순매수/순매도 스캐닝, 데이터 출처/수집시각 안내 배너, 장 마감 경고 및 누적 수급 차트
 """
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.express as px
@@ -30,7 +30,7 @@ def render_radar_view():
             🎯 외국인/기관 실시간 수급 레이더
         </h2>
         <p style="margin: 4px 0 0 0; color: #8B949E; font-size: 0.92rem;">
-            장중 실시간 및 일자별 메이저 주체(외국인·기관)의 순매수/순매도 자금 흐름을 스캐닝합니다.
+            장중 실시간 및 일자별 메이저 주체(외국인·기관·개인)의 순매수/순매도 자금 흐름을 스캐닝합니다.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -73,7 +73,7 @@ def render_radar_view():
     with c1:
         market_sel = st.selectbox("시장 선택", options=["KOSPI", "KOSDAQ"], index=0, key="radar_market")
     with c2:
-        investor_sel = st.selectbox("수급 주체", options=["외국인", "기관", "연기금", "금융투자", "투신", "개인"], index=0, key="radar_investor")
+        investor_sel = st.selectbox("수급 주체", options=["외국인", "기관", "개인", "금융투자", "투신", "연기금"], index=0, key="radar_investor")
     with c3:
         trade_type_sel = st.selectbox("매매 구분", options=["순매수", "순매도"], index=0, key="radar_tradetype")
     with c4:
@@ -105,10 +105,25 @@ def render_radar_view():
         )
 
     if df_radar is None or df_radar.empty:
-        st.warning("⚠️ 해당 일자의 수급 데이터를 수집할 수 없거나 장 시작 전/휴장일입니다.")
+        st.warning("⚠️ 해당 조건의 수급 데이터를 수집할 수 없거나 매매 기준을 만족하는 종목이 없습니다.")
         return
 
     data_source = df_radar["데이터_출처"].iloc[0] if "데이터_출처" in df_radar.columns else "수급 API"
+    captured_at = df_radar["조회시각"].iloc[0] if "조회시각" in df_radar.columns else now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
+
+    # --------------------------------------------------------------------------
+    # 2-1. 데이터 품질 안내 배너 및 장 마감 경고
+    # --------------------------------------------------------------------------
+    st.info(
+        f"📌 **데이터 출처**: `{data_source}` | ⏱️ **앱 수집 시각**: `{captured_at}`  \n"
+        "💡 *본 수치는 장중 가집계 참고용(정규장 주기적 스냅샷)이며, KRX 장마감 확정 투자자별 거래실적과 차이가 있을 수 있습니다.*"
+    )
+
+    if now_kst.time() >= time(15, 30):
+        st.warning(
+            "🔔 **장 마감 안내**: 현재 시각은 정규장 종료 후입니다. 표기된 수치는 KIS가 마지막으로 제공한 장중 가집계 스냅샷(14:30~14:40 기준)일 수 있으며, "
+            "종가 배분·시간외 거래 및 최종 기관 수급 확정치는 반영되지 않을 수 있습니다."
+        )
 
     # --------------------------------------------------------------------------
     # 3. 요약 지표 카드
@@ -170,17 +185,19 @@ def render_radar_view():
     # --------------------------------------------------------------------------
     st.markdown(f"#### 📋 {market_sel} {investor_sel} {trade_type_sel} 상위 상세 리스트")
 
-    disp_cols = ["순위", "종목코드", "종목명", "현재가", "등락률(%)", "순매수대금(억)"]
+    disp_cols = ["순위", "종목코드", "종목명", "현재가", "등락률(%)", "순매수대금(억)", "금액_산출기준"]
     existing_cols = [c for c in disp_cols if c in df_radar.columns]
 
     df_display = df_radar[existing_cols].copy()
 
+    format_dict = {
+        "현재가": "{:,.0f} 원",
+        "등락률(%)": "{:+.2f}%",
+        "순매수대금(억)": "{:+,.1f} 억"
+    }
+
     st.dataframe(
-        df_display.style.format({
-            "현재가": "{:,.0f} 원",
-            "등락률(%)": "{:+.2f}%",
-            "순매수대금(억)": "{:+,.1f} 억"
-        }).background_gradient(subset=["순매수대금(억)"], cmap="Reds" if trade_type_sel == "순매수" else "Blues"),
+        df_display.style.format(format_dict).background_gradient(subset=["순매수대금(억)"], cmap="Reds" if trade_type_sel == "순매수" else "Blues"),
         use_container_width=True,
         hide_index=True
     )
