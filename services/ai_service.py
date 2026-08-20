@@ -456,3 +456,56 @@ def test_cloudflare_llama(account_id: str, api_token: str, prompt: str, system_p
 
 def test_cerebras_llama(api_key: str, prompt: str, system_prompt: str = None) -> dict:
     return call_cerebras_model("llama-3.3-70b", api_key, prompt, system_prompt)
+
+# ==============================================================================
+# 4. 기존 ai_test_view.py 호환용 레거시 래퍼
+# ==============================================================================
+
+def test_cloudflare_ai(
+    account_id: str,
+    api_token: str,
+    prompt: str,
+    system_prompt: str = None,
+) -> dict:
+    """
+    기존 ai_test_view.py 호환 함수.
+    Cloudflare DeepSeek-R1 모델로 연결합니다.
+    """
+    return test_cloudflare_deepseek(
+        account_id=account_id,
+        api_token=api_token,
+        prompt=prompt,
+        system_prompt=system_prompt,
+    )
+
+
+def test_nvidia_gpt_oss(
+    api_key: str,
+    prompt: str,
+    system_prompt: str = None,
+) -> dict:
+    """
+    기존 ai_test_view.py 호환 함수.
+    기존 GPT-OSS 호출은 20B 모델로 연결합니다.
+    """
+    return test_nvidia_gpt_oss_20b(
+        api_key=api_key,
+        prompt=prompt,
+        system_prompt=system_prompt,
+    )
+
+
+def test_cerebras(
+    api_key: str,
+    prompt: str,
+    system_prompt: str = None,
+) -> dict:
+    """
+    기존 ai_test_view.py 호환 함수.
+    Cerebras Llama 3.3 70B 호출로 연결합니다.
+    """
+    return test_cerebras_llama(
+        api_key=api_key,
+        prompt=prompt,
+        system_prompt=system_prompt,
+    )
