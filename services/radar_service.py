@@ -2,7 +2,7 @@
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
 [KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
-캐시 TTL 20초 최적화 및 증권사/데이터 API 진단 헬퍼 탑재
+캐시 TTL 20초 최적화 및 PyKrx 임포트 상세 예외 진단 탑재
 """
 import logging
 import re
@@ -20,8 +20,10 @@ from services.kis_service import call_kis_api
 try:
     from pykrx import stock
     PYKRX_AVAILABLE = True
-except ImportError:
+    PYKRX_IMPORT_ERROR = None
+except Exception as e:
     PYKRX_AVAILABLE = False
+    PYKRX_IMPORT_ERROR = f"{type(e).__name__}: {str(e)}"
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,6 @@ def test_kis_connection():
         "FID_ETC_CLS_CODE": "0"
     }
     try:
-        # 1차: 공식 외국인/기관 가집계 TR (FHPTJ04400000)
         res = call_kis_api(
             tr_id="FHPTJ04400000",
             endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total",
@@ -50,7 +51,6 @@ def test_kis_connection():
             if len(output) > 0:
                 return True, f"정상 통신 성공 (조회된 상위 종목 수: {len(output)}개)"
 
-        # 2차: 시장구분코드 'J'로 전환 시도
         params["FID_COND_MRKT_DIV_CODE"] = "J"
         res_j = call_kis_api(
             tr_id="FHPTJ04400000",
@@ -62,7 +62,6 @@ def test_kis_connection():
             if len(output_j) > 0:
                 return True, f"정상 통신 성공 (J구분 상위 종목 수: {len(output_j)}개)"
 
-        # 3차: 일별 순위 TR (FHPST01740000) 폴백
         params_sub = {
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_COND_SCR_DIV_CODE": "16449",
@@ -128,7 +127,7 @@ def test_ls_connection():
 def test_pykrx_connection():
     """PyKrx(KRX 웹 스크래핑 기반)의 실제 통신 가능 여부 진단"""
     if not PYKRX_AVAILABLE:
-        return False, "pykrx 라이브러리가 설치되지 않았습니다 (requirements.txt 확인 필요)"
+        return False, f"pykrx 사용 불가: {PYKRX_IMPORT_ERROR}"
 
     try:
         now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
@@ -162,7 +161,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
     }
 
     try:
-        # 1차 시도: FHPTJ04400000 (V 코드)
         res = call_kis_api(
             tr_id="FHPTJ04400000",
             endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total",
@@ -170,7 +168,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
         )
         output = res.get("output", []) if (res and res.get("rt_cd") == "0") else []
 
-        # 2차 시도: FHPTJ04400000 (J 코드)
         if not output:
             params["FID_COND_MRKT_DIV_CODE"] = "J"
             res_j = call_kis_api(
@@ -181,7 +178,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
             if res_j and res_j.get("rt_cd") == "0":
                 output = res_j.get("output", [])
 
-        # 3차 시도: FHPST01740000 폴백
         if not output:
             rank_sort_alt = "0" if (investor == "외국인" and trade_type == "순매수") else \
                             "1" if (investor == "외국인" and trade_type == "순매도") else \
