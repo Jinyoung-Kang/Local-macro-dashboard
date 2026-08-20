@@ -2,7 +2,7 @@
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
 [KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
-PyKrx 지수 파싱 버그 회피 및 개별 종목 기반 연결 진단 탑재
+투자주체별(개인/외국인/기관합계/금융투자/투신/연기금) 원본 거래대금 필드 매핑 및 부호 필터링 탑재
 """
 import logging
 import re
@@ -26,6 +26,50 @@ except Exception as e:
     PYKRX_IMPORT_ERROR = f"{type(e).__name__}: {str(e)}"
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# 0. KIS FHPTJ04400000 투자주체별 공식 필드 매핑 및 수치 헬퍼
+# ==============================================================================
+KIS_INVESTOR_FIELDS = {
+    "외국인": {
+        "qty": "frgn_ntby_qty",
+        "amount": "frgn_ntby_tr_pbmn",
+        "label": "외국인",
+    },
+    "개인": {
+        "qty": "prsn_ntby_qty",
+        "amount": "prsn_ntby_tr_pbmn",
+        "label": "개인",
+    },
+    "기관": {
+        "qty": "orgn_ntby_qty",
+        "amount": "orgn_ntby_tr_pbmn",
+        "label": "기관합계",
+    },
+    "금융투자": {
+        "qty": "scrt_ntby_qty",
+        "amount": "scrt_ntby_tr_pbmn",
+        "label": "금융투자",
+    },
+    "투신": {
+        "qty": "ivtr_ntby_qty",
+        "amount": "ivtr_ntby_tr_pbmn",
+        "label": "투신",
+    },
+    "연기금": {
+        "qty": "pefund_ntby_vol",
+        "amount": "pefund_ntby_tr_pbmn",
+        "label": "연기금/사모",
+    },
+}
+
+
+def to_float(value, default=0.0):
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return default
 
 
 # ==============================================================================
@@ -133,7 +177,6 @@ def test_pykrx_connection():
         now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
         for i in range(1, 6):
             check_date = (now_kst - timedelta(days=i)).strftime("%Y%m%d")
-            # 시장 전체 지수 파싱 버그를 피해 삼성전자(005930) 개별 종목으로 테스트
             df = stock.get_market_ohlcv(check_date, check_date, "005930")
             if df is not None and not df.empty:
                 return True, f"정상 통신 성공 ({check_date} 기준 삼성전자 조회 확인)"
@@ -145,7 +188,7 @@ def test_pykrx_connection():
 
 
 # ==============================================================================
-# 2. KIS 증권사 API (FHPTJ04400000: 공식 투자자별 필드 매핑 및 자체 재정렬)
+# 2. KIS 증권사 API (FHPTJ04400000: 투자주체별 정확한 필드 추출 및 부호 필터링)
 # ==============================================================================
 def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     is_kospi = "KOSPI" in market.upper() or "코스피" in market
@@ -208,37 +251,39 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                 output = res_alt.get("output", [])
 
         if output:
-            inv_field_map = {
-                "외국인": ("frgn_ntby_tr_pbmn", "frgn_ntby_qty"),
-                "기관": ("orgn_ntby_tr_pbmn", "orgn_ntby_qty"),
-                "투신": ("ivtr_ntby_tr_pbmn", "ivtr_ntby_qty"),
-                "연기금": ("fund_ntby_tr_pbmn", "fund_ntby_qty"),
-                "금융투자": ("bank_ntby_tr_pbmn", "bank_ntby_qty"),
-            }
-            pbmn_col, qty_col = inv_field_map.get(investor, ("orgn_ntby_tr_pbmn", "orgn_ntby_qty"))
+            field_map = KIS_INVESTOR_FIELDS.get(investor)
+            if field_map is None:
+                logger.warning("KIS 미지원 투자주체 선택: %s", investor)
+                return pd.DataFrame()
+
+            now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+            captured_at = now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
 
             records = []
             for row in output:
                 code = row.get("stck_shrn_iscd", row.get("mksc_shrn_iscd", ""))
                 name = row.get("hts_kor_isnm", "")
-                price = float(row.get("stck_prpr", 0) or 0)
-                change_pct = float(row.get("prdy_ctrt", 0) or 0)
+                price = to_float(row.get("stck_prpr", 0))
+                change_pct = to_float(row.get("prdy_ctrt", 0))
 
-                amt_raw = float(row.get(pbmn_col, 0) or 0)
+                qty = to_float(row.get(field_map["qty"], 0))
+                raw_amount = to_float(row.get(field_map["amount"], 0))
 
-                if amt_raw == 0:
-                    qty = float(row.get(qty_col, 0) or 0)
-                    amt_raw = qty * price
+                # KIS 원본 거래대금(백만원 단위) 우선 사용, 0일 때 수량x현재가 보조 추정
+                if raw_amount != 0:
+                    amount_eok = raw_amount / 100.0
+                    amount_basis = "KIS 원본 거래대금"
+                elif qty != 0 and price > 0:
+                    amount_eok = (qty * price) / 100_000_000.0
+                    amount_basis = "수량×현재가 추정"
+                else:
+                    continue
 
-                if amt_raw == 0:
-                    alt_amt = float(row.get("ntby_tr_pbmn", row.get("frgn_pure_bysum" if investor == "외국인" else "organ_pure_bysum", 0)) or 0)
-                    if alt_amt != 0:
-                        amt_raw = alt_amt
-
-                amt_eok = round(amt_raw / 100000000.0, 1) if abs(amt_raw) > 100000 else round(amt_raw, 1)
-
-                if trade_type == "순매도" and amt_eok > 0:
-                    amt_eok = -amt_eok
+                # 순매수/순매도 부호에 따른 엄격한 필터링
+                if trade_type == "순매수" and amount_eok <= 0:
+                    continue
+                if trade_type == "순매도" and amount_eok >= 0:
+                    continue
 
                 if name and code:
                     records.append({
@@ -246,23 +291,24 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                         "종목명": name,
                         "현재가": price,
                         "등락률(%)": change_pct,
-                        "순매수대금(억)": amt_eok,
-                        "시가총액_가중": max(price * 1000, 500),
-                        "데이터_출처": f"KIS 증권사 API ({target_date})"
+                        "순매수대금(억)": round(amount_eok, 1),
+                        "원본_순매수수량": qty,
+                        "금액_산출기준": amount_basis,
+                        "조회시각": captured_at,
+                        "데이터_출처": f"KIS 장중 가집계 ({target_date})",
+                        "시가총액_가중": max(price * 1000, 500)
                     })
 
             if records:
                 df_result = pd.DataFrame(records)
+                # 순매수면 내림차순, 순매도면 오름차순 재정렬
                 df_result = df_result.sort_values(
                     "순매수대금(억)",
                     ascending=(trade_type == "순매도")
-                ).reset_index(drop=True)
+                ).head(top_n).reset_index(drop=True)
 
-                df_result = df_result.head(top_n)
-                df_result["순위"] = range(1, len(df_result) + 1)
-
-                cols = ["순위", "종목코드", "종목명", "현재가", "등락률(%)", "순매수대금(억)", "시가총액_가중", "데이터_출처"]
-                return df_result[[c for c in cols if c in df_result.columns]]
+                df_result["순위"] = df_result.index + 1
+                return df_result
     except Exception as e:
         logger.warning(f"KIS API 호출 실패: {e}")
     return pd.DataFrame()
