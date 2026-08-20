@@ -307,8 +307,27 @@ def get_collected_macro_data():
 # ==============================================================================
 # 4. [신규] AI Context 주입용 금융 리스크 요약 및 수집
 # ==============================================================================
-def summarize_series_for_ai(df: pd.DataFrame, value_col: str = None, label: str = "") -> str:
-    """AI 리포트용 시계열 요약기: 최신값, 변화량, 백분위 추출"""
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_macro_risk_indicators_for_ai() -> dict:
+    """
+    AI Context용 금융 리스크·변동성 지표 수집.
+    """
+    return {
+        "VIX": fetch_ticker_data("^VIX", period="3mo"),
+        "MOVE": fetch_ticker_data("^MOVE", period="3mo"),
+        "HY_OAS": fetch_fred_series("BAMLH0A0HYM2", period_years=3),
+        "CP_SPREAD": fetch_fred_cp_spread(),
+        "STLFSI4": fetch_fred_series("STLFSI4", period_years=3),
+    }
+
+def summarize_series_for_ai(
+    df: pd.DataFrame,
+    value_col: str = None,
+    label: str = "",
+) -> str:
+    """
+    시계열을 AI Context용 최신값·직전 변화·백분위 문장으로 요약.
+    """
     if df is None or df.empty:
         return f"- {label}: 데이터 수집 실패"
 
@@ -331,17 +350,6 @@ def summarize_series_for_ai(df: pd.DataFrame, value_col: str = None, label: str 
             f"(직전 대비 {change:+,.2f}, "
             f"최근 표본 내 백분위 {percentile:.1f}%)"
         )
+
     except Exception as e:
         return f"- {label}: 요약 실패 ({str(e)})"
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_macro_risk_indicators_for_ai() -> dict:
-    """AI Context용 금융 리스크·변동성 지표 수집."""
-    return {
-        "VIX": fetch_ticker_data("^VIX", period="3mo"),
-        "MOVE": fetch_ticker_data("^MOVE", period="3mo"),
-        "HY_OAS": fetch_fred_series("BAMLH0A0HYM2", period_years=3),
-        "CP_SPREAD": fetch_fred_cp_spread(),
-        "STLFSI4": fetch_fred_series("STLFSI4", period_years=3),
-    }
