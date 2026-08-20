@@ -2,7 +2,7 @@
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
 [KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
-캐시 TTL 20초 최적화 및 PyKrx 임포트 상세 예외 진단 탑재
+PyKrx 지수 파싱 버그 회피 및 개별 종목 기반 연결 진단 탑재
 """
 import logging
 import re
@@ -133,10 +133,13 @@ def test_pykrx_connection():
         now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
         for i in range(1, 6):
             check_date = (now_kst - timedelta(days=i)).strftime("%Y%m%d")
-            df = stock.get_market_ohlcv(check_date, check_date, "KOSPI")
+            # 시장 전체 지수 파싱 버그를 피해 삼성전자(005930) 개별 종목으로 테스트
+            df = stock.get_market_ohlcv(check_date, check_date, "005930")
             if df is not None and not df.empty:
-                return True, f"정상 통신 성공 ({check_date} 기준, 조회 종목 수: {len(df)}개)"
+                return True, f"정상 통신 성공 ({check_date} 기준 삼성전자 조회 확인)"
         return False, "최근 5영업일 내 pykrx 응답이 비어있습니다 (KRX 웹 접근 차단 가능성)"
+    except ValueError as e:
+        return False, f"pykrx 라이브러리 내부 버그 (KRX 데이터 포맷 변경 미대응): {e}"
     except Exception as e:
         return False, f"예외 발생 (KRX 웹 접근 차단 가능성): {str(e)}"
 
@@ -593,9 +596,12 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
                 "데이터_출처": f"PyKrx API ({target_date})"
             })
         return pd.DataFrame(records)
+    except ValueError as e:
+        logger.warning(f"PyKrx 라이브러리 내부 버그로 조회 실패: {e}")
+        return pd.DataFrame()
     except Exception as e:
         logger.warning(f"PyKrx 조회 실패: {e}")
-    return pd.DataFrame()
+        return pd.DataFrame()
 
 
 # ==============================================================================
