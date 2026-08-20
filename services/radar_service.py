@@ -1,6 +1,6 @@
 """
 services/radar_service.py
-6단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
+5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
 [KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
 (LS는 시장 전체 랭킹 TR 미보유로 당일 폴백에서 제외, 종목별 조회용 t1717은 추후 별도 기능으로 검토)
 """
@@ -200,18 +200,21 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                 price = float(row.get("stck_prpr", 0))
                 change_pct = float(row.get("prdy_ctrt", 0))
 
-                amt_raw = float(row.get("ntby_tr_pbmn", 0))
+                # FHPTJ04400000 가집계 수량 필드 매핑 및 금액 계산
+                if investor == "외국인":
+                    qty = float(row.get("frgn_fake_ntby_qty", row.get("frgn_pure_byqty", row.get("frgn_ntby_qty", 0))))
+                else:
+                    qty = float(row.get("orgn_fake_ntby_qty", row.get("organ_pure_byqty", row.get("orgn_ntby_qty", 0))))
+
+                amt_raw = qty * price
+                # 만약 기존 TR의 직접 금액 필드가 있다면 폴백 적용
                 if amt_raw == 0:
-                    if investor == "외국인":
-                        amt_raw = float(row.get("frgn_pure_bysum", row.get("frgn_ntby_tr_pbmn", 0)))
-                        if amt_raw == 0:
-                            amt_raw = float(row.get("frgn_pure_byqty", row.get("frgn_ntby_qty", 0))) * price
-                    else:
-                        amt_raw = float(row.get("organ_pure_bysum", row.get("orgn_ntby_tr_pbmn", 0)))
-                        if amt_raw == 0:
-                            amt_raw = float(row.get("organ_pure_byqty", row.get("orgn_ntby_qty", 0))) * price
+                    direct_amt = float(row.get("ntby_tr_pbmn", row.get("frgn_pure_bysum" if investor == "외국인" else "organ_pure_bysum", 0)))
+                    if direct_amt != 0:
+                        amt_raw = direct_amt
 
                 amt_eok = round(amt_raw / 100000000.0, 1) if abs(amt_raw) > 100000 else round(amt_raw, 1)
+
                 if trade_type == "순매도" and amt_eok > 0:
                     amt_eok = -amt_eok
 
