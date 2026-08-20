@@ -1,7 +1,7 @@
 """
 views/radar_view.py
 외국인/기관 수급 레이더 대시보드 뷰
-실시간 순매수/순매도 스캐닝, 개선된 트리맵 시각화 및 종목별 기준일 누적 수급 차트
+실시간 순매수/순매도 스캐닝, 트리맵 시각화(Plotly 호환성 패치) 및 종목별 기준일 누적 수급 차트
 """
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -111,11 +111,11 @@ def render_radar_view():
     # 4. 트리맵 및 수급 차트 시각화
     # --------------------------------------------------------------------------
     st.markdown(f"#### 📊 {market_sel} {investor_sel} {trade_type_sel} 상위 비중 시각화")
-    
+
     df_plot = df_radar.copy()
     df_plot["절대대금"] = df_plot["순매수대금(억)"].abs()
     df_plot["절대대금_표시용"] = df_plot["절대대금"].apply(lambda x: max(x, 1.0))
-    
+
     max_abs_pct = float(df_plot["등락률(%)"].abs().quantile(0.95)) if len(df_plot) > 0 else 8.0
     color_bound = max(max_abs_pct, 5.0)
 
@@ -131,8 +131,8 @@ def render_radar_view():
         title=f"{target_date} {market_sel} {investor_sel} {trade_type_sel} Top {len(df_plot)}"
     )
 
+    # Plotly Treemap 전용 속성 적용 (textposition 제거)
     fig_treemap.update_traces(
-        textposition="middle center",
         insidetextanchor="middle",
         textfont=dict(size=14, color="white"),
         hovertemplate="<b>%{label}</b><br>현재가: %{customdata[0]:,.0f}원<br>순매수대금: %{customdata[1]:+,.1f}억원<br>등락률: %{customdata[2]:+.2f}%<extra></extra>"
@@ -150,12 +150,12 @@ def render_radar_view():
     # 5. 수급 상위 종목 상세 테이블
     # --------------------------------------------------------------------------
     st.markdown(f"#### 📋 {market_sel} {investor_sel} {trade_type_sel} 상위 상세 리스트")
-    
+
     disp_cols = ["순위", "종목코드", "종목명", "현재가", "등락률(%)", "순매수대금(억)"]
     existing_cols = [c for c in disp_cols if c in df_radar.columns]
-    
+
     df_display = df_radar[existing_cols].copy()
-    
+
     st.dataframe(
         df_display.style.format({
             "현재가": "{:,.0f} 원",
@@ -173,7 +173,7 @@ def render_radar_view():
     st.markdown("#### 📈 종목별 주가 vs 기준일(0점) 누적 수급 흐름 분석")
 
     stock_options = [f"{r['종목명']} ({r['종목코드']})" for _, r in df_radar.iterrows()]
-    
+
     col_sel1, col_sel2 = st.columns([2, 2])
     with col_sel1:
         selected_stock_str = st.selectbox("분석 대상 종목 선택", options=stock_options, index=0, key="cum_stock_select")
