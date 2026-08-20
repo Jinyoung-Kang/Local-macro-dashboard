@@ -1,7 +1,7 @@
 """
 services/ai_service.py
 AI 모델 레지스트리 기반 엔진 (NVIDIA, Cloudflare, Cerebras 및 자동 Failover 파이프라인)
-신규 모델: meta/llama-3.3-70b-instruct, openai/gpt-oss-120b 지원
+신규 모델: meta/llama-3.3-70b-instruct, openai/gpt-oss-120b 지원 및 레거시 함수 하위 호환성 100% 보장
 """
 import logging
 import time
@@ -98,7 +98,15 @@ def format_ai_engine(engine_id: str) -> str:
 # ==============================================================================
 def _call_openai_format(engine_name: str, endpoint: str, api_key: str, model: str, prompt: str, system_prompt: str = None, timeout: int = 120) -> dict:
     if not api_key:
-        return {"response": "", "error": f"{engine_name} API Key 누락", "pipeline_step": f"{engine_name} 실패", "latency": 0.0}
+        return {
+            "status": False,
+            "response": "",
+            "error": f"{engine_name} API Key 누락",
+            "provider": engine_name,
+            "pipeline_step": f"{engine_name} 실패",
+            "latency_ms": 0,
+            "latency": 0.0
+        }
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -120,7 +128,9 @@ def _call_openai_format(engine_name: str, endpoint: str, api_key: str, model: st
     start_time = time.time()
     try:
         res = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
-        elapsed = round(time.time() - start_time, 2)
+        elapsed_sec = round(time.time() - start_time, 2)
+        elapsed_ms = int(elapsed_sec * 1000)
+        
         if res.status_code == 200:
             data = res.json()
             if "choices" in data and len(data["choices"]) > 0:
@@ -133,23 +143,59 @@ def _call_openai_format(engine_name: str, endpoint: str, api_key: str, model: st
 
                 if response_text.strip():
                     return {
+                        "status": True,
                         "response": response_text.strip(),
                         "error": None,
+                        "provider": engine_name,
                         "pipeline_step": f"{engine_name} 성공",
-                        "latency": elapsed,
+                        "latency_ms": elapsed_ms,
+                        "latency": elapsed_sec,
                         "model": model
                     }
-            return {"response": "", "error": "응답 텍스트 추출 실패", "pipeline_step": f"{engine_name} 실패", "latency": elapsed}
-        return {"response": "", "error": f"HTTP {res.status_code}: {res.text[:200]}", "pipeline_step": f"{engine_name} 실패", "latency": elapsed}
+            return {
+                "status": False,
+                "response": "",
+                "error": "응답 텍스트 추출 실패",
+                "provider": engine_name,
+                "pipeline_step": f"{engine_name} 실패",
+                "latency_ms": elapsed_ms,
+                "latency": elapsed_sec
+            }
+        return {
+            "status": False,
+            "response": "",
+            "error": f"HTTP {res.status_code}: {res.text[:200]}",
+            "provider": engine_name,
+            "pipeline_step": f"{engine_name} 실패",
+            "latency_ms": elapsed_ms,
+            "latency": elapsed_sec
+        }
     except Exception as e:
-        elapsed = round(time.time() - start_time, 2)
-        return {"response": "", "error": str(e), "pipeline_step": f"{engine_name} 에러", "latency": elapsed}
+        elapsed_sec = round(time.time() - start_time, 2)
+        elapsed_ms = int(elapsed_sec * 1000)
+        return {
+            "status": False,
+            "response": "",
+            "error": str(e),
+            "provider": engine_name,
+            "pipeline_step": f"{engine_name} 에러",
+            "latency_ms": elapsed_ms,
+            "latency": elapsed_sec
+        }
 
 
 def call_nvidia_model(engine_id: str, api_key: str, prompt: str, system_prompt: str = None) -> dict:
     config = AI_MODEL_REGISTRY.get(engine_id)
     if not config:
-        return {"response": "", "error": f"존재하지 않는 엔진 ID: {engine_id}", "pipeline_step": "설정 에러", "latency": 0.0}
+        return {
+            "status": False,
+            "response": "",
+            "error": f"존재하지 않는 엔진 ID: {engine_id}",
+            "provider": "NVIDIA",
+            "pipeline_step": "설정 에러",
+            "latency_ms": 0,
+            "latency": 0.0
+        }
     return _call_openai_format(
         engine_name=config["label"],
         endpoint=NVIDIA_CHAT_URL,
@@ -163,7 +209,15 @@ def call_nvidia_model(engine_id: str, api_key: str, prompt: str, system_prompt: 
 
 def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: str, system_prompt: str = None) -> dict:
     if not account_id or not api_token:
-        return {"response": "", "error": "Cloudflare 인증 정보 누락", "pipeline_step": "Cloudflare 실패", "latency": 0.0}
+        return {
+            "status": False,
+            "response": "",
+            "error": "Cloudflare 인증 정보 누락",
+            "provider": f"Cloudflare ({model})",
+            "pipeline_step": "Cloudflare 실패",
+            "latency_ms": 0,
+            "latency": 0.0
+        }
 
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
     headers = {
@@ -179,7 +233,9 @@ def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: s
     start_time = time.time()
     try:
         res = requests.post(url, headers=headers, json={"messages": messages}, timeout=60)
-        elapsed = round(time.time() - start_time, 2)
+        elapsed_sec = round(time.time() - start_time, 2)
+        elapsed_ms = int(elapsed_sec * 1000)
+        
         if res.status_code == 200:
             data = res.json()
             if data.get("success", False):
@@ -187,17 +243,45 @@ def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: s
                 text = result.get("response", "")
                 if text:
                     return {
+                        "status": True,
                         "response": text.strip(),
                         "error": None,
+                        "provider": f"Cloudflare ({model})",
                         "pipeline_step": f"Cloudflare ({model}) 성공",
-                        "latency": elapsed,
+                        "latency_ms": elapsed_ms,
+                        "latency": elapsed_sec,
                         "model": model
                     }
-            return {"response": "", "error": f"응답 실패: {data.get('errors')}", "pipeline_step": "Cloudflare 실패", "latency": elapsed}
-        return {"response": "", "error": f"HTTP {res.status_code}: {res.text[:200]}", "pipeline_step": "Cloudflare 실패", "latency": elapsed}
+            return {
+                "status": False,
+                "response": "",
+                "error": f"응답 실패: {data.get('errors')}",
+                "provider": f"Cloudflare ({model})",
+                "pipeline_step": "Cloudflare 실패",
+                "latency_ms": elapsed_ms,
+                "latency": elapsed_sec
+            }
+        return {
+            "status": False,
+            "response": "",
+            "error": f"HTTP {res.status_code}: {res.text[:200]}",
+            "provider": f"Cloudflare ({model})",
+            "pipeline_step": "Cloudflare 실패",
+            "latency_ms": elapsed_ms,
+            "latency": elapsed_sec
+        }
     except Exception as e:
-        elapsed = round(time.time() - start_time, 2)
-        return {"response": "", "error": str(e), "pipeline_step": "Cloudflare 에러", "latency": elapsed}
+        elapsed_sec = round(time.time() - start_time, 2)
+        elapsed_ms = int(elapsed_sec * 1000)
+        return {
+            "status": False,
+            "response": "",
+            "error": str(e),
+            "provider": f"Cloudflare ({model})",
+            "pipeline_step": "Cloudflare 에러",
+            "latency_ms": elapsed_ms,
+            "latency": elapsed_sec
+        }
 
 
 def call_cerebras_model(model: str, api_key: str, prompt: str, system_prompt: str = None) -> dict:
@@ -221,11 +305,14 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
     cloudflare_token = get_secret("ai.cloudflare_api_token", get_secret("CLOUDFLARE_API_TOKEN", ""))
     cerebras_key = get_secret("ai.cerebras_api_key", get_secret("CEREBRAS_API_KEY", ""))
 
-    if engine_name == "auto":
+    if engine_name == "auto" or "자동" in engine_name:
         return generate_ai_briefing_with_failover(prompt=prompt, system_prompt=system_prompt)
 
+    # 1. ID로 직접 검색
     config = AI_MODEL_REGISTRY.get(engine_name)
     engine_id = engine_name
+
+    # 2. 레이블 또는 구버전 문자열로 역방향 검색
     if not config:
         for k, v in AI_MODEL_REGISTRY.items():
             if v["label"] == engine_name or v["model"] == engine_name:
@@ -233,11 +320,35 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
                 engine_id = k
                 break
 
+    # 3. 구버전 키워드 매핑
+    if not config:
+        if "Nemotron" in engine_name:
+            config = AI_MODEL_REGISTRY["nvidia_nemotron"]
+            engine_id = "nvidia_nemotron"
+        elif "GPT-OSS-120B" in engine_name or "120b" in engine_name.lower():
+            config = AI_MODEL_REGISTRY["nvidia_gpt_oss_120b"]
+            engine_id = "nvidia_gpt_oss_120b"
+        elif "GPT-OSS" in engine_name:
+            config = AI_MODEL_REGISTRY["nvidia_gpt_oss_20b"]
+            engine_id = "nvidia_gpt_oss_20b"
+        elif "DeepSeek" in engine_name:
+            config = AI_MODEL_REGISTRY["cloudflare_deepseek"]
+            engine_id = "cloudflare_deepseek"
+        elif "Cerebras" in engine_name:
+            config = AI_MODEL_REGISTRY["cerebras_llama"]
+            engine_id = "cerebras_llama"
+        elif "Llama 3.3" in engine_name:
+            config = AI_MODEL_REGISTRY["nvidia_llama_33_70b"]
+            engine_id = "nvidia_llama_33_70b"
+
     if config is None:
         return {
+            "status": False,
             "response": "",
             "error": f"지원하지 않는 AI 엔진 ID/이름입니다: {engine_name}",
+            "provider": engine_name,
             "pipeline_step": "엔진 설정 오류",
+            "latency_ms": 0,
             "latency": 0.0
         }
 
@@ -245,7 +356,15 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
 
     if provider == "nvidia":
         if not nvidia_key:
-            return {"response": "", "error": "NVIDIA API Key가 설정되지 않았습니다.", "pipeline_step": "NVIDIA 인증 오류", "latency": 0.0}
+            return {
+                "status": False,
+                "response": "",
+                "error": "NVIDIA API Key가 설정되지 않았습니다.",
+                "provider": "NVIDIA",
+                "pipeline_step": "NVIDIA 인증 오류",
+                "latency_ms": 0,
+                "latency": 0.0
+            }
         return call_nvidia_model(engine_id=engine_id, api_key=nvidia_key, prompt=prompt, system_prompt=system_prompt)
 
     if provider == "cloudflare":
@@ -265,30 +384,52 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
             system_prompt=system_prompt
         )
 
-    return {"response": "", "error": f"처리되지 않은 provider: {provider}", "pipeline_step": "엔진 설정 오류", "latency": 0.0}
+    return {
+        "status": False,
+        "response": "",
+        "error": f"처리되지 않은 provider: {provider}",
+        "provider": provider,
+        "pipeline_step": "엔진 설정 오류",
+        "latency_ms": 0,
+        "latency": 0.0
+    }
 
 
 def generate_ai_briefing_with_failover(prompt: str, system_prompt: str = None) -> dict:
     """순차 Failover 파이프라인"""
     errors = []
+    start_time = time.time()
     for engine_id in AUTO_FAILOVER_ORDER:
         res = call_selected_ai_engine(engine_name=engine_id, prompt=prompt, system_prompt=system_prompt)
-        if res.get("response"):
+        if res.get("status") and res.get("response"):
             res["pipeline_step"] = f"자동 탐색 성공: {AI_MODEL_REGISTRY[engine_id]['label']}"
             return res
         errors.append(f"{AI_MODEL_REGISTRY[engine_id]['label']}: {res.get('error')}")
 
+    elapsed_sec = round(time.time() - start_time, 2)
     return {
+        "status": False,
         "response": "",
         "error": "모든 AI 엔진 호출 실패 -> " + " | ".join(errors),
+        "provider": "Failover",
         "pipeline_step": "Failover 전체 실패",
-        "latency": 0.0
+        "latency_ms": int(elapsed_sec * 1000),
+        "latency": elapsed_sec
     }
 
 
 # ==============================================================================
-# 3. 개별 테스트 헬퍼 함수
+# 3. 레거시 호환 헬퍼 함수
 # ==============================================================================
+def ask_krx_cot_agent(prompt: str, engine_name: str = "auto") -> dict:
+    """krx_cot_view 하위 호환용 헬퍼"""
+    return call_selected_ai_engine(
+        engine_name=engine_name,
+        prompt=prompt,
+        system_prompt="당신은 최고 파생상품 퀀트 전략가입니다. KRX 선물 시장의 베이시스, 미결제약정 변화 및 수급 주체별 포지션을 기반으로 단기 스퀴즈 가능성과 옵션 만기 대응 전략을 분석하십시오."
+    )
+
+
 def test_nvidia_nemotron(api_key: str, prompt: str, system_prompt: str = None) -> dict:
     return call_nvidia_model("nvidia_nemotron", api_key, prompt, system_prompt)
 
