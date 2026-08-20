@@ -14,7 +14,9 @@ from services.radar_service import (
     get_market_radar_scanner,
     get_stock_cumulative_flow_from_base,
     test_kis_connection,
-    test_ls_connection
+    test_ls_connection,
+    test_pykrx_connection,
+    PYKRX_AVAILABLE
 )
 
 
@@ -34,18 +36,20 @@ def render_radar_view():
     """, unsafe_allow_html=True)
 
     # --------------------------------------------------------------------------
-    # 0. 증권사 API 연결 상태 테스트 진단 구역
+    # 0. 증권사 및 데이터 API 연결 상태 테스트 진단 구역
     # --------------------------------------------------------------------------
-    with st.expander("🛠️ KIS / LS 증권사 API 연결 상태 테스트", expanded=False):
-        st.write("장중 실시간 수급을 제공하는 KIS(한국투자증권) API의 작동 및 인증 상태를 점검합니다.")
+    with st.expander("🛠️ KIS / LS / PyKrx API 연결 상태 테스트", expanded=False):
+        st.write("장중 실시간 수급을 제공하는 KIS(한국투자증권), LS증권 및 PyKrx의 작동 및 인증 상태를 점검합니다.")
         st.caption("ℹ️ LS증권 API는 참고용 연결 테스트만 제공하며, 시장 전체 순매수 랭킹 조회에는 사용되지 않습니다 (LS는 종목별 조회 전용 TR만 보유).")
-        if st.button("🔌 KIS / LS API 테스트 실행", key="btn_test_broker_apis"):
+        if st.button("🔌 KIS / LS / PyKrx API 테스트 실행", key="btn_test_broker_apis"):
             with st.spinner("KIS API 상태 점검 중..."):
                 k_ok, k_msg = test_kis_connection()
             with st.spinner("LS API 상태 점검 중 (참고용)..."):
                 l_ok, l_msg = test_ls_connection()
+            with st.spinner("PyKrx(KRX 웹) 상태 점검 중..."):
+                p_ok, p_msg = test_pykrx_connection()
 
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 if k_ok:
                     st.success(f"**KIS API (한국투자증권)**: {k_msg}")
@@ -56,6 +60,11 @@ def render_radar_view():
                     st.success(f"**LS API (LS증권 - 참고용)**: {l_msg}")
                 else:
                     st.warning(f"**LS API (LS증권 - 참고용)**: {l_msg}")
+            with c3:
+                if p_ok:
+                    st.success(f"**PyKrx (KRX 웹 데이터)**: {p_msg}")
+                else:
+                    st.error(f"**PyKrx (KRX 웹 데이터)**: {p_msg}")
 
     # --------------------------------------------------------------------------
     # 1. 수급 스캐너 검색 컨트롤러
