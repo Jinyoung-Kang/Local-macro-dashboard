@@ -1,7 +1,7 @@
 """
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
-[KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
+[KIS(FHPTJ04400000 - 외인/기관 FID 분리 적용) -> KRX -> Daum -> Naver -> PyKrx]
 (LS는 시장 전체 랭킹 TR 미보유로 당일 폴백에서 제외, 종목별 조회용 t1717은 추후 별도 기능으로 검토)
 """
 import logging
@@ -52,7 +52,6 @@ def test_kis_connection():
 
         # 2차: 시장구분코드 'J'로 전환 시도
         params["FID_COND_MRKT_DIV_CODE"] = "J"
-        params["FID_DIV_CLS_CODE"] = "1"
         res_j = call_kis_api(
             tr_id="FHPTJ04400000",
             endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total",
@@ -127,22 +126,22 @@ def test_ls_connection():
 
 
 # ==============================================================================
-# 2. KIS 증권사 API (FHPTJ04400000 / FHPST01740000)
+# 2. KIS 증권사 API (FHPTJ04400000: FID_DIV_CLS_CODE & FID_RANK_SORT_CLS_CODE 분리)
 # ==============================================================================
 def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     is_kospi = "KOSPI" in market.upper() or "코스피" in market
     fid_iscd = "0000" if is_kospi else "1001"
 
-    if investor == "외국인":
-        rank_sort = "0" if trade_type == "순매수" else "1"
-    else:
-        rank_sort = "2" if trade_type == "순매수" else "3"
+    # 투자자 구분: 외국인="0", 기관="1" (기타 세부기관은 1차로 기관("1") 매핑)
+    div_cls = "0" if investor == "외국인" else "1"
+    # 순매수="0", 순매도="1"
+    rank_sort = "0" if trade_type == "순매수" else "1"
 
     params = {
         "FID_COND_MRKT_DIV_CODE": "V",
         "FID_COND_SCR_DIV_CODE": "16449",
         "FID_INPUT_ISCD": fid_iscd,
-        "FID_DIV_CLS_CODE": "0",
+        "FID_DIV_CLS_CODE": div_cls,
         "FID_RANK_SORT_CLS_CODE": rank_sort,
         "FID_ETC_CLS_CODE": "0"
     }
@@ -159,7 +158,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
         # 2차 시도: FHPTJ04400000 (J 코드)
         if not output:
             params["FID_COND_MRKT_DIV_CODE"] = "J"
-            params["FID_DIV_CLS_CODE"] = "1"
             res_j = call_kis_api(
                 tr_id="FHPTJ04400000",
                 endpoint="/uapi/domestic-stock/v1/quotations/foreign-institution-total",
@@ -170,12 +168,15 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
 
         # 3차 시도: FHPST01740000 폴백
         if not output:
+            rank_sort_alt = "0" if (investor == "외국인" and trade_type == "순매수") else \
+                            "1" if (investor == "외국인" and trade_type == "순매도") else \
+                            "2" if (investor != "외국인" and trade_type == "순매수") else "3"
             params_alt = {
                 "FID_COND_MRKT_DIV_CODE": "J",
                 "FID_COND_SCR_DIV_CODE": "16449",
                 "FID_INPUT_ISCD": fid_iscd,
                 "FID_DIV_CLS_CODE": "0",
-                "FID_RANK_SORT_CLS_CODE": rank_sort,
+                "FID_RANK_SORT_CLS_CODE": rank_sort_alt,
                 "FID_BLNG_CLS_CODE": "0",
                 "FID_TRGT_CLS_CODE": "0",
                 "FID_TRGT_EXLS_CLS_CODE": "0",
@@ -231,7 +232,7 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
 
             if records:
                 df_result = pd.DataFrame(records)
-                # 재계산된 순매수대금(억) 기준으로 내림차순/오름차순 재정렬
+                # 재계산된 순매수대금(억) 기준으로 재정렬
                 df_result = df_result.sort_values(
                     "순매수대금(억)",
                     ascending=(trade_type == "순매도")
@@ -599,7 +600,7 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
         search_date_str = current_date_obj.strftime("%Y%m%d")
         is_today = (search_date_str == today_str)
 
-        # (1) 당일 조회 시 KIS 단독 호출
+        # (1) 당일 조회 시 KIS 호출 (외국인 및 기관)
         if is_today:
             try:
                 df_kis = fetch_kis_deal_ranking(search_date_str, market, investor, trade_type, top_n)
