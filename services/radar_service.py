@@ -2,7 +2,7 @@
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
 [KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
-투자주체별(개인/외국인/기관합계/금융투자/투신/연기금) 원본 거래대금 및 수량 필드 보존
+공식 지원 투자주체(외국인/기관/투신/은행/보험/종금/기금/기타기관/기타법인) 매핑 탑재
 """
 import logging
 import re
@@ -37,30 +37,45 @@ KIS_INVESTOR_FIELDS = {
         "amount": "frgn_ntby_tr_pbmn",
         "label": "외국인",
     },
-    "개인": {
-        "qty": "prsn_ntby_qty",
-        "amount": "prsn_ntby_tr_pbmn",
-        "label": "개인",
-    },
     "기관": {
         "qty": "orgn_ntby_qty",
         "amount": "orgn_ntby_tr_pbmn",
         "label": "기관합계",
-    },
-    "금융투자": {
-        "qty": "scrt_ntby_qty",
-        "amount": "scrt_ntby_tr_pbmn",
-        "label": "금융투자",
     },
     "투신": {
         "qty": "ivtr_ntby_qty",
         "amount": "ivtr_ntby_tr_pbmn",
         "label": "투신",
     },
-    "연기금": {
-        "qty": "pefund_ntby_vol",
-        "amount": "pefund_ntby_tr_pbmn",
-        "label": "연기금/사모",
+    "은행": {
+        "qty": "bank_ntby_qty",
+        "amount": "bank_ntby_tr_pbmn",
+        "label": "은행",
+    },
+    "보험": {
+        "qty": "insu_ntby_qty",
+        "amount": "insu_ntby_tr_pbmn",
+        "label": "보험",
+    },
+    "종금": {
+        "qty": "mrbn_ntby_qty",
+        "amount": "mrbn_ntby_tr_pbmn",
+        "label": "종금",
+    },
+    "기금": {
+        "qty": "fund_ntby_qty",
+        "amount": "fund_ntby_tr_pbmn",
+        "label": "기금",
+    },
+    "기타기관": {
+        "qty": "etcorgt_ntby_vol",
+        "amount": "etcorgt_ntby_tr_pbmn",
+        "label": "기타기관",
+    },
+    "기타법인": {
+        "qty": "etccorp_ntby_vol",
+        "amount": "etccorp_ntby_tr_pbmn",
+        "label": "기타법인",
     },
 }
 
@@ -188,7 +203,7 @@ def test_pykrx_connection():
 
 
 # ==============================================================================
-# 2. KIS 증권사 API (FHPTJ04400000: 투자주체별 정확한 필드 추출 및 부호 필터링)
+# 2. KIS 증권사 API (FHPTJ04400000: 지원 투자주체 매핑 및 부호 필터링)
 # ==============================================================================
 def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     is_kospi = "KOSPI" in market.upper() or "코스피" in market
@@ -269,7 +284,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                 qty = to_float(row.get(field_map["qty"], 0))
                 raw_amount = to_float(row.get(field_map["amount"], 0))
 
-                # KIS 원본 거래대금(백만원 단위) 우선 사용, 0일 때 수량x현재가 보조 추정
                 if raw_amount != 0:
                     amount_eok = raw_amount / 100.0
                     amount_basis = "KIS 원본 거래대금"
@@ -279,7 +293,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                 else:
                     continue
 
-                # 순매수/순매도 부호에 따른 엄격한 필터링
                 if trade_type == "순매수" and amount_eok <= 0:
                     continue
                 if trade_type == "순매도" and amount_eok >= 0:
@@ -302,7 +315,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
 
             if records:
                 df_result = pd.DataFrame(records)
-                # 순매수면 내림차순, 순매도면 오름차순 재정렬
                 df_result = df_result.sort_values(
                     "순매수대금(억)",
                     ascending=(trade_type == "순매도")
@@ -361,7 +373,7 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
     except Exception:
         pass
 
-    inv_map = {"외국인": "1", "기관": "2", "개인": "3", "투신": "4", "연기금": "7", "금융투자": "5"}
+    inv_map = {"외국인": "1", "기관": "2", "투신": "4", "기금": "7", "기타법인": "5"}
     body_params_1664 = {
         "t1664InBlock": {
             "gubun1": mkt_code, "gubun2": inv_map.get(investor, "1"), "gubun3": order_code, "cnt": top_n
@@ -484,7 +496,7 @@ def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, tr
 # ==============================================================================
 def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     market_param = "KOSPI" if "KOSPI" in market.upper() or "코스피" in market else "KOSDAQ"
-    inv_map = {"외국인": "FOREIGN", "기관": "INSTITUTION", "연기금": "PENSION", "금융투자": "FINANCIAL", "투신": "TRUST", "개인": "INDIVIDUAL"}
+    inv_map = {"외국인": "FOREIGN", "기관": "INSTITUTION", "투신": "TRUST", "기금": "PENSION"}
     inv_param = inv_map.get(investor, "FOREIGN")
 
     action = "top_net_buyers" if trade_type == "순매수" else "top_net_sellers"
@@ -534,7 +546,7 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
 # ==============================================================================
 def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     sosok = "01" if "KOSPI" in market.upper() or "코스피" in market else "02"
-    inv_map = {"외국인": "9000", "기관": "7000", "개인": "8000", "연기금": "6000", "금융투자": "2000", "투신": "3000"}
+    inv_map = {"외국인": "9000", "기관": "7000", "투신": "3000", "기금": "6000"}
     inv_code = inv_map.get(investor, "9000")
     dir_type = "1" if trade_type == "순매수" else "2"
 
@@ -602,7 +614,7 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
         return pd.DataFrame()
 
     mkt = "KOSPI" if "KOSPI" in market.upper() else "KOSDAQ"
-    inv_map = {"외국인": "외국인", "기관": "기관합계", "연기금": "연기금", "금융투자": "금융투자", "투신": "투신", "개인": "개인"}
+    inv_map = {"외국인": "외국인", "기관": "기관합계", "투신": "투신", "기금": "연기금", "기타법인": "기타법인"}
     inv = inv_map.get(investor, "외국인")
 
     try:
@@ -666,7 +678,6 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
         search_date_str = current_date_obj.strftime("%Y%m%d")
         is_today = (search_date_str == today_str)
 
-        # (1) 당일 조회 시 KIS 호출
         if is_today:
             try:
                 df_kis = fetch_kis_deal_ranking(search_date_str, market, investor, trade_type, top_n)
@@ -675,12 +686,10 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
             except Exception as e:
                 logger.warning(f"KIS 당일 조회 실패: {e}")
 
-        # (2) KRX 공식 OpenAPI 시도 (단축된 타임아웃 4초)
         df = fetch_krx_date_deal_ranking(search_date_str, market, investor, trade_type, top_n)
         if not df.empty and len(df) >= 1:
             return df
 
-        # (3) 실시간 Daum / Naver 크롤러 순차 시도 (단축된 타임아웃 3~4초)
         if is_today:
             df = fetch_daum_deal_ranking(search_date_str, market, investor, trade_type, top_n)
             if not df.empty and len(df) >= 1:
@@ -690,13 +699,11 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
             if not df.empty and len(df) >= 1:
                 return df
 
-        # (4) PyKrx 과거 확정 데이터 조회
         if PYKRX_AVAILABLE:
             df = fetch_pykrx_deal_ranking(search_date_str, market, investor, trade_type, top_n)
             if not df.empty and len(df) >= 1:
                 return df
 
-        # 당일 조회 실패 시 하루 전으로 롤백하여 재탐색
         current_date_obj -= timedelta(days=1)
 
     return pd.DataFrame()
