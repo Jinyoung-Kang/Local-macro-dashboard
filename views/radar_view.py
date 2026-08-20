@@ -1,7 +1,7 @@
 """
 views/radar_view.py
 외국인/기관 수급 레이더 대시보드 뷰
-실시간 순매수/순매도 스캐닝, 투자주체별 한계 고지 배너, 개발자 검증 Expander 및 누적 수급 차트
+장중 가집계 한계 고지, 0440 공식 지원 투자주체 셀렉터 및 개발자용 검증 Expander 탑재
 """
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -27,10 +27,10 @@ def render_radar_view():
     st.markdown("""
     <div style="padding: 4px 0 12px 0;">
         <h2 style="margin:0; font-weight: 700; color: #F0F6FC;">
-            🎯 외국인/기관 실시간 수급 레이더
+            🎯 외국인/기관 장중 수급 레이더
         </h2>
         <p style="margin: 4px 0 0 0; color: #8B949E; font-size: 0.92rem;">
-            장중 실시간 및 일자별 메이저 주체(외국인·기관·개인)의 순매수/순매도 자금 흐름을 스캐닝합니다.
+            KIS 외국인·기관 장중 가집계 기반 상위 종목 참고 정보입니다. 개인 및 세부 투자주체의 시장 전체 Top N은 제공하지 않습니다.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -67,13 +67,18 @@ def render_radar_view():
                     st.error(f"**PyKrx (KRX 웹 데이터)**: {p_msg}")
 
     # --------------------------------------------------------------------------
-    # 1. 수급 스캐너 검색 컨트롤러
+    # 1. 수급 스캐너 검색 컨트롤러 (0440 공식 지원 투자주체)
     # --------------------------------------------------------------------------
     c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.2, 1.4, 1.0])
     with c1:
         market_sel = st.selectbox("시장 선택", options=["KOSPI", "KOSDAQ"], index=0, key="radar_market")
     with c2:
-        investor_sel = st.selectbox("수급 주체", options=["외국인", "기관", "개인", "금융투자", "투신", "연기금"], index=0, key="radar_investor")
+        investor_sel = st.selectbox(
+            "수급 주체",
+            options=["외국인", "기관", "투신", "은행", "보험", "종금", "기금", "기타기관", "기타법인"],
+            index=0,
+            key="radar_investor"
+        )
     with c3:
         trade_type_sel = st.selectbox("매매 구분", options=["순매수", "순매도"], index=0, key="radar_tradetype")
     with c4:
@@ -119,7 +124,7 @@ def render_radar_view():
         "💡 *본 데이터는 KIS 장중 가집계 참고용입니다. KRX 장마감 확정 투자자별 거래실적과 차이가 날 수 있습니다.*"
     )
 
-    if investor_sel in ["개인", "금융투자", "투신", "연기금"]:
+    if investor_sel not in ["외국인", "기관"]:
         st.warning(
             f"⚠️ **'{investor_sel}' 수급 안내**: KIS 장중 가집계 응답에 포함된 후보 종목 내에서 "
             "재정렬한 참고치입니다. 시장 전체 기준의 확정 Top N 랭킹을 보장하지 않습니다."
