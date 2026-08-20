@@ -2,6 +2,7 @@
 views/sec_view.py
 📑 주요 기관들의 포트폴리오 (13F Holdings & QoQ Analysis)
 SEC EDGAR 공식 공시 데이터 기반 미국 주요 기관 투자자 포트폴리오 분석 & 기간별 비중 추적
+기존 UI(트리맵, 다분기 비교 막대/선형차트 등) 완벽 보존 및 중앙 AI 레지스트리 / 자동 번역 연동
 """
 from collections import Counter
 import pandas as pd
@@ -18,7 +19,6 @@ from services.macro_service import fetch_ticker_data
 from services.prompts import SEC_13F_CONSENSUS_PROMPT
 from services.sec_service import classify_qoq_action, fetch_sec_13f_multi_quarters
 
-
 def render_sec_view():
     st.title("📑 주요 기관들의 포트폴리오 (13F Holdings & QoQ Analysis)")
     st.caption("SEC EDGAR 공식 공시 데이터 기반 미국 주요 기관 투자자 포트폴리오 분석 & 기간별 비중 추적")
@@ -32,7 +32,7 @@ def render_sec_view():
         col_ai_sel, col_ai_btn = st.columns([2, 1])
         with col_ai_sel:
             ai_engine = st.selectbox(
-                "분석에 사용할 AI 엔진을 선택하세요",
+                "분석에 사용할 AI 엔진을 직접 선택하세요",
                 options=get_ai_engine_options(include_auto=True),
                 format_func=format_ai_engine,
                 index=0,
@@ -69,14 +69,17 @@ def render_sec_view():
                     )
                     
                     with st.spinner(f"'{format_ai_engine(ai_engine)}' 엔진으로 13F 스마트머니 내러티브를 분석 중..."):
-                        res = call_selected_ai_engine(
-                            engine_name=ai_engine,
-                            prompt=user_prompt,
-                            system_prompt=SEC_13F_CONSENSUS_PROMPT
-                        )
+                        res = call_selected_ai_engine(ai_engine, user_prompt, SEC_13F_CONSENSUS_PROMPT)
 
-                    if res.get("response"):
-                        st.success(f"✅ 분석 완료 (파이프라인: {res.get('pipeline_step')} | 소요시간: {res.get('latency', 0.0)}초)")
+                    if res.get("status"):
+                        st.success(f"✅ 분석 완료 (엔진: {res.get('provider', '')} | 지연시간: {res.get('latency_ms', 0)} ms)")
+                        
+                        if res.get("translation_info"):
+                            st.caption(f"🌐 {res['translation_info']}")
+                        if res.get("original_response"):
+                            with st.expander("🔍 번역 전 AI 원문 확인", expanded=False):
+                                st.markdown(res["original_response"])
+                                
                         st.markdown(f"<div style='padding:1rem; border-radius:0.5rem; background-color:rgba(0,100,255,0.1);'>{res['response']}</div>", unsafe_allow_html=True)
                     else:
                         st.error("🔴 분석 생성 실패")
