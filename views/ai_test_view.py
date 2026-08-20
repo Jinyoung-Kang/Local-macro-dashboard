@@ -1,25 +1,15 @@
 """
 views/ai_test_view.py
 AI 엔진 통합 진단 및 테스트 뷰
-공통 모델 레지스트리 기반 종합 테스트 및 개별 API Key 진단 지원
+공통 모델 레지스트리 기반 종합 테스트, 번역기 자동 후처리 기능 탑재
 """
 import streamlit as st
 from config import get_secret
 from services.ai_service import (
-    AI_MODEL_REGISTRY,
     call_selected_ai_engine,
-    format_ai_engine,
     get_ai_engine_options,
-    test_cerebras,
-    test_cerebras_llama,
-    test_cloudflare_ai,
-    test_cloudflare_deepseek,
-    test_cloudflare_llama,
-    test_nvidia_gpt_oss,
-    test_nvidia_gpt_oss_120b,
-    test_nvidia_gpt_oss_20b,
-    test_nvidia_llama_33_70b,
-    test_nvidia_nemotron
+    format_ai_engine,
+    AI_MODEL_REGISTRY
 )
 
 
@@ -52,8 +42,8 @@ def render_ai_test_view():
 
     # 2. 프롬프트 작성
     sample_prompts = [
+        "미국 장기금리 상승, 달러 강세, 외국인 순매도 확대가 동시 발생한 경우 한국 주식시장 단기 리스크를 세 문장으로 한국어로 분석하세요.",
         "글로벌 채권 금리 상승이 성장주 밸류에이션에 미치는 영향을 2문장으로 설명해줘.",
-        "10Y-2Y 장단기 금리차 역전 현상이 은행권 순이자마진(NIM)에 미치는 영향을 분석해줘.",
         "달러 인덱스 강세가 신흥국 증시 수급에 미치는 파급 경로를 요약해줘."
     ]
     selected_sample = st.selectbox("📝 추천 테스트 프롬프트 불러오기", options=sample_prompts, index=0)
@@ -64,19 +54,31 @@ def render_ai_test_view():
         height=100
     )
 
+    system_prompt = """
+    당신은 거시경제와 금융시장 전문 애널리스트입니다.
+    반드시 한국어로, 구조적으로, 과도한 확신 없이 분석하세요.
+    """
+
     # 3. 테스트 실행
     if st.button("🧪 AI 모델 호출 테스트 실행", type="primary", use_container_width=True):
         with st.spinner(f"'{format_ai_engine(selected_api)}' 엔진 추론 실행 중..."):
             res = call_selected_ai_engine(
                 engine_name=selected_api,
                 prompt=test_prompt,
-                system_prompt="당신은 금융 시장을 심층 분석하는 수석 AI 분석가입니다. 반드시 한국어로 명확하고 간결하게 답변하십시오."
+                system_prompt=system_prompt
             )
 
         st.markdown("---")
         if res.get("status") and res.get("response"):
             st.success(f"✅ 호출 성공 (소요 시간: `{res.get('latency', 0.0)}초` / `{res.get('latency_ms', 0)}ms`)")
             st.caption(f"⚡ 파이프라인 상태: `{res.get('pipeline_step')}` | 모델 ID: `{res.get('model', selected_api)}`")
+            
+            if res.get("translation_info"):
+                st.caption(f"🌐 {res['translation_info']}")
+            if res.get("original_response"):
+                with st.expander("🔍 번역 전 AI 원문 확인", expanded=False):
+                    st.markdown(res["original_response"])
+                    
             st.markdown(res["response"])
         else:
             st.error("❌ AI 호출 실패")
