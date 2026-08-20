@@ -55,7 +55,10 @@ def _is_valid_data(val) -> bool:
 # ==============================================================================
 # [신규] 8대 데이터 영역 병렬 통합 RAG Context 빌더
 # ==============================================================================
-def build_comprehensive_context(report_type: str = "종합 거시경제 & 수급 전략", include_full_cot_history: bool = False) -> str:
+def build_comprehensive_context(
+    report_type: str = "종합 거시경제 & 수급 전략",
+    include_recent_cot_history: bool = False,
+) -> str:
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -170,8 +173,12 @@ def build_comprehensive_context(report_type: str = "종합 거시경제 & 수급
         for asset_name, asset_info in cot_multi_res.items():
             if asset_info and asset_info.get("data") is not None and not asset_info["data"].empty:
                 context += summarize_cot_asset(asset_name, asset_info["data"]) + "\n\n"
-                if include_full_cot_history:
-                    context += cot_history_to_markdown(asset_info["data"], f"{asset_name} 최근 3년 상세") + "\n"
+                if include_recent_cot_history:
+                    context += cot_history_to_markdown(
+                        asset_info["data"], 
+                        f"{asset_name} 최근 3개월 상세",
+                        max_rows=13
+                    ) + "\n"
             else:
                 context += f"- {asset_name}: 수집 실패 ({asset_info.get('error', 'No data')})\n\n"
     else:
@@ -218,14 +225,15 @@ def render_ai_report_view():
             index=0,
             key="ai_view_type"
         )
-        include_full_cot_history = st.checkbox(
-            "CFTC COT 최근 3년 전체 주간 데이터 포함",
+        include_recent_cot_history = st.checkbox(
+            "CFTC COT 최근 3개월 주간 상세 데이터 포함",
             value=False,
             help=(
-                "6개 자산의 3년치 COT 원본 데이터를 AI Context에 포함합니다. "
-                "프롬프트가 매우 길어지고, 무료 API 한도·응답 시간이 크게 증가할 수 있습니다."
+                "6개 자산의 최근 약 13주 COT 원본 데이터를 AI Context에 추가합니다. "
+                "전체 3년 원본 대신 최근 포지션 변화에 집중해 "
+                "프롬프트 길이와 응답 시간을 크게 줄입니다."
             ),
-            key="include_full_cot_history",
+            key="include_recent_cot_history",
         )
     with c3:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
@@ -239,17 +247,18 @@ def render_ai_report_view():
         "cerebras_llama",
     }
     
-    if include_full_cot_history and ai_engine not in LONG_CONTEXT_MODELS and ai_engine != "auto":
-        st.warning(
-            "선택한 모델은 대형 COT Context 처리에 적합하지 않을 수 있습니다. "
-            "Nemotron, GPT-OSS 120B, Llama 3.3 70B 또는 Cerebras를 권장합니다."
+    if include_recent_cot_history and ai_engine not in LONG_CONTEXT_MODELS and ai_engine != "auto":
+        st.info(
+            "최근 3개월 COT 상세 표가 추가됩니다. "
+            "긴 분석에는 Nemotron, GPT-OSS 120B, "
+            "Cloudflare Llama 3.3 70B 또는 Cerebras를 권장합니다."
         )
 
     if generate_btn:
         with st.spinner("⚡ 8개 영역 시장 데이터 병렬 수집 및 AI 심층 추론 중..."):
             context = build_comprehensive_context(
                 report_type=report_type,
-                include_full_cot_history=include_full_cot_history
+                include_recent_cot_history=include_recent_cot_history
             )
 
             system_prompt = (
