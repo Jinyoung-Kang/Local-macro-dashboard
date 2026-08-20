@@ -1,8 +1,8 @@
 """
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
-[KIS(FHPTJ04400000 - 공식 외인/기관/투신/기금 필드 매핑) -> KRX -> Daum -> Naver -> PyKrx]
-(LS는 시장 전체 랭킹 TR 미보유로 당일 폴백에서 제외, 종목별 조회용 t1717은 추후 별도 기능으로 검토)
+[KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
+캐시 TTL 20초 최적화 및 증권사/데이터 API 진단 헬퍼 탑재
 """
 import logging
 import re
@@ -132,7 +132,6 @@ def test_pykrx_connection():
 
     try:
         now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
-        # 최근 5영업일 이내에서 확정 데이터가 있는 날짜를 역순으로 탐색
         for i in range(1, 6):
             check_date = (now_kst - timedelta(days=i)).strftime("%Y%m%d")
             df = stock.get_market_ohlcv(check_date, check_date, "KOSPI")
@@ -150,9 +149,7 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
     is_kospi = "KOSPI" in market.upper() or "코스피" in market
     fid_iscd = "0000" if is_kospi else "1001"
 
-    # 투자자 구분: 외국인="0", 기관="1"
     div_cls = "0" if investor == "외국인" else "1"
-    # 순매수="0", 순매도="1"
     rank_sort = "0" if trade_type == "순매수" else "1"
 
     params = {
@@ -212,7 +209,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                 output = res_alt.get("output", [])
 
         if output:
-            # 투자자 유형별 공식 필드 매핑 (금액 필드 우선, 수량 필드 보조)
             inv_field_map = {
                 "외국인": ("frgn_ntby_tr_pbmn", "frgn_ntby_qty"),
                 "기관": ("orgn_ntby_tr_pbmn", "orgn_ntby_qty"),
@@ -229,15 +225,12 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                 price = float(row.get("stck_prpr", 0) or 0)
                 change_pct = float(row.get("prdy_ctrt", 0) or 0)
 
-                # 1순위: 공식 금액 필드 조회
                 amt_raw = float(row.get(pbmn_col, 0) or 0)
 
-                # 2순위: 금액 필드가 0일 경우 공식 수량 필드 * 현재가로 산출
                 if amt_raw == 0:
                     qty = float(row.get(qty_col, 0) or 0)
                     amt_raw = qty * price
 
-                # 3순위: 기타 대체 필드 폴백
                 if amt_raw == 0:
                     alt_amt = float(row.get("ntby_tr_pbmn", row.get("frgn_pure_bysum" if investor == "외국인" else "organ_pure_bysum", 0)) or 0)
                     if alt_amt != 0:
@@ -261,13 +254,11 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
 
             if records:
                 df_result = pd.DataFrame(records)
-                # 재계산된 순매수대금(억) 기준으로 재정렬
                 df_result = df_result.sort_values(
                     "순매수대금(억)",
                     ascending=(trade_type == "순매도")
                 ).reset_index(drop=True)
 
-                # 상위 top_n개 추출 및 순위 재부여
                 df_result = df_result.head(top_n)
                 df_result["순위"] = range(1, len(df_result) + 1)
 
@@ -280,9 +271,6 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
 
 # ==============================================================================
 # 3. LS 증권사 API (t1452 / t1664) — 현재 미사용
-# LS는 "외인/기관" 카테고리가 종목별 조회(t1702/t1716/t1717) 전용이라
-# 시장 전체 순매수 랭킹을 제공하지 않음. get_market_radar_scanner()의
-# 당일 폴백에서 제외됨 (2026-08-20 기준).
 # ==============================================================================
 def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     mkt_code = "1" if "KOSPI" in market.upper() or "코스피" in market else "2"
@@ -615,9 +603,9 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
 
 
 # ==============================================================================
-# 8. 5단계 무중단 폴백 스캐너 엔진 (KIS 단독 1순위 -> KRX -> Daum -> Naver -> PyKrx)
+# 8. 5단계 무중단 폴백 스캐너 엔진 (캐시 TTL: 20초)
 # ==============================================================================
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: str = "외국인", trade_type: str = "순매수", top_n: int = 30) -> pd.DataFrame:
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     today_str = now_kst.strftime("%Y%m%d")
