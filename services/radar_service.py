@@ -1,11 +1,11 @@
 """
 services/radar_service.py
 6단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
-[KIS(FHPTJ04400000) & LS 병렬 레이스 -> KRX -> Daum -> Naver -> PyKrx]
+[KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
+(LS는 시장 전체 랭킹 TR 미보유로 당일 폴백에서 제외, 종목별 조회용 t1717은 추후 별도 기능으로 검토)
 """
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -234,7 +234,10 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
 
 
 # ==============================================================================
-# 3. LS 증권사 API (t1452 / t1664)
+# 3. LS 증권사 API (t1452 / t1664) — 현재 미사용
+# LS는 "외인/기관" 카테고리가 종목별 조회(t1702/t1716/t1717) 전용이라
+# 시장 전체 순매수 랭킹을 제공하지 않음. get_market_radar_scanner()의
+# 당일 폴백에서 제외됨 (2026-08-20 기준).
 # ==============================================================================
 def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     mkt_code = "1" if "KOSPI" in market.upper() or "코스피" in market else "2"
@@ -567,7 +570,7 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
 
 
 # ==============================================================================
-# 8. 6단계 폴백 및 KIS/LS 병렬 동시 레이스 (TimeoutError 방어 탑재)
+# 8. 5단계 무중단 폴백 스캐너 엔진 (KIS 단독 1순위 -> KRX -> Daum -> Naver -> PyKrx)
 # ==============================================================================
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: str = "외국인", trade_type: str = "순매수", top_n: int = 30) -> pd.DataFrame:
@@ -581,26 +584,14 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
         search_date_str = current_date_obj.strftime("%Y%m%d")
         is_today = (search_date_str == today_str)
 
-        # (1) 당일 조회 시 KIS(FHPTJ04400000)와 LS를 ThreadPoolExecutor(max_workers=2)로 동시 실행
+        # (1) 당일 조회 시 KIS 단독 호출
         if is_today:
-            def _try_kis():
-                return fetch_kis_deal_ranking(search_date_str, market, investor, trade_type, top_n)
-
-            def _try_ls():
-                return fetch_ls_deal_ranking(search_date_str, market, investor, trade_type, top_n)
-
             try:
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    futures = [executor.submit(_try_kis), executor.submit(_try_ls)]
-                    for fut in as_completed(futures, timeout=4):
-                        try:
-                            df_res = fut.result()
-                            if df_res is not None and not df_res.empty and len(df_res) >= 1:
-                                return df_res
-                        except Exception:
-                            pass
-            except (TimeoutError, Exception):
-                pass  # KIS/LS 4초 내 미응답 시 예외 전파 없이 KRX 폴백으로 진행
+                df_kis = fetch_kis_deal_ranking(search_date_str, market, investor, trade_type, top_n)
+                if df_kis is not None and not df_kis.empty and len(df_kis) >= 1:
+                    return df_kis
+            except Exception as e:
+                logger.warning(f"KIS 당일 조회 실패: {e}")
 
         # (2) KRX 공식 OpenAPI 시도 (단축된 타임아웃 4초)
         df = fetch_krx_date_deal_ranking(search_date_str, market, investor, trade_type, top_n)
