@@ -253,8 +253,46 @@ def get_collected_macro_data():
             else:
                 collected[cat_name].append({"name": name, "status": "fail"})
 
-    return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
+    # ==========================================================================
+    # [신규] KOSPI200 야간선물(KIS 웹소켓, CME 연계) 주입
+    # "아시아 주요 주가지수" 카테고리에 추가 (없으면 조용히 건너뜀)
+    # ==========================================================================
+    try:
+        from services.kis_websocket_service import get_night_futures_snapshot
 
+        night_snapshot = get_night_futures_snapshot()
+        target_cat = next(
+            (c for c in collected.keys() if "아시아" in c),
+            None,
+        )
+
+        if target_cat is not None:
+            price = night_snapshot.get("price")
+            prev = night_snapshot.get("prev_close")
+            is_connected = night_snapshot.get("is_connected", False)
+
+            if is_connected and price is not None and prev is not None:
+                delta = price - prev
+                pct = (delta / prev) * 100 if prev != 0 else 0.0
+                collected[target_cat].append({
+                    "name": "코스피200 야간선물 (CME 연계) :gray[[웹소켓 실시간]]",
+                    "price": price,
+                    "delta": delta,
+                    "pct": pct,
+                    "price_str": f"{price:,.2f}",
+                    "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
+                    "prev_str": f"{prev:,.2f}",
+                    "status": "ok",
+                })
+            else:
+                collected[target_cat].append({
+                    "name": "코스피200 야간선물 (CME 연계) :gray[[웹소켓 실시간]]",
+                    "status": "fail",
+                })
+    except Exception as e:
+        logger.warning(f"야간선물 웹소켓 데이터 주입 실패: {e}")
+
+    return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
 
 # ==============================================================================
 # 4. 리스크 지표 요약 헬퍼 및 전체 매크로 원본 텍스트 생성기
