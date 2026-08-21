@@ -7,3 +7,4 @@ plotly
 streamlit-autorefresh
 urllib3
 pykrx==1.2.8
+websocket-client
