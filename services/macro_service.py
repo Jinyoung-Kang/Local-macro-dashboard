@@ -1,7 +1,7 @@
 """
 services/macro_service.py
 거시경제 지표, 금리, 환율, 원자재 데이터 수집 엔진
-가짜 Fallback 데이터 생성 로직 원천 차단 및 빈 데이터프레임 반환 적용
+ThreadPoolExecutor 기반 I/O 병렬 처리, 원본 로직 완벽 보존 및 전 지표 출력 포맷터 탑재
 """
 import io
 import logging
@@ -17,6 +17,7 @@ import yfinance as yf
 from config import MACRO_CATEGORIES, FRED_BASE_URL
 
 logger = logging.getLogger(__name__)
+
 
 # ==============================================================================
 # 0. FRED API Key 안전 로더
@@ -146,8 +147,6 @@ def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = Non
     except Exception as e:
         logger.warning(f"FRED CSV 다운로드 실패 ({series_id}): {e}")
 
-    # 가짜 데이터 생성 블록 완전 제거
-    logger.error(f"{series_id}: FRED API 및 CSV 모두 실패. 가짜 데이터를 생성하지 않고 빈 데이터를 반환합니다.")
     return pd.DataFrame()
 
 
@@ -165,8 +164,6 @@ def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
         combined["CP_SPREAD"] = (combined["CP"] - combined["TB"]).round(2)
         if not combined.empty and len(combined) >= 2:
             return combined[["CP_SPREAD"]]
-            
-    logger.error("CP Spread 데이터 합산 실패. 빈 데이터를 반환합니다.")
     return pd.DataFrame()
 
 
@@ -175,6 +172,7 @@ def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
 # ==============================================================================
 @st.cache_data(ttl=30, show_spinner=False)
 def get_collected_macro_data():
+    """모든 거시경제 티커를 ThreadPoolExecutor로 병렬 수집한 후 카테고리별 리스트 구조로 반환"""
     collected = {}
     rate_10y_curr, rate_10y_prev = None, None
     rate_2y_curr, rate_2y_prev = None, None
@@ -203,27 +201,42 @@ def get_collected_macro_data():
         for name, ticker in items.items():
             _, df = raw.get(cat_name, {}).get(name, (ticker, None))
             if df is not None and isinstance(df, pd.DataFrame) and len(df) >= 2:
-                curr, prev = float(df['Close'].iloc[-1]), float(df['Close'].iloc[-2])
+                curr = float(df['Close'].iloc[-1])
+                prev = float(df['Close'].iloc[-2])
                 delta = curr - prev
                 pct = (delta / prev) * 100 if prev != 0 else 0.0
                 if "JPY/KRW" in name and curr < 50:
                     curr, prev, delta = curr * 100, prev * 100, delta * 100
                 collected[cat_name].append({
-                    "name": name, "price": curr, "delta": delta, "pct": pct,
-                    "price_str": f"{curr:,.2f}", "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
-                    "prev_str": f"{prev:,.2f}", "status": "ok"
+                    "name": name,
+                    "price": curr,
+                    "delta": delta,
+                    "pct": pct,
+                    "price_str": f"{curr:,.2f}",
+                    "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
+                    "prev_str": f"{prev:,.2f}",
+                    "status": "ok"
                 })
-                if ticker == "^TNX": rate_10y_curr, rate_10y_prev = curr, prev
-                elif ticker in ["2YY=F", "^IRX", "ZT=F"]: rate_2y_curr, rate_2y_prev = curr, prev
+                if ticker == "^TNX":
+                    rate_10y_curr, rate_10y_prev = curr, prev
+                elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
+                    rate_2y_curr, rate_2y_prev = curr, prev
             elif df is not None and isinstance(df, pd.DataFrame) and len(df) == 1:
                 curr = float(df['Close'].iloc[-1])
                 collected[cat_name].append({
-                    "name": name, "price": curr, "delta": 0.0, "pct": 0.0,
-                    "price_str": f"{curr:,.2f}", "delta_str": "0.00 (0.00%)",
-                    "prev_str": f"{curr:,.2f}", "status": "single"
+                    "name": name,
+                    "price": curr,
+                    "delta": 0.0,
+                    "pct": 0.0,
+                    "price_str": f"{curr:,.2f}",
+                    "delta_str": "0.00 (0.00%)",
+                    "prev_str": f"{curr:,.2f}",
+                    "status": "single"
                 })
-                if ticker == "^TNX": rate_10y_curr, rate_10y_prev = curr, curr
-                elif ticker in ["2YY=F", "^IRX", "ZT=F"]: rate_2y_curr, rate_2y_prev = curr, curr
+                if ticker == "^TNX":
+                    rate_10y_curr, rate_10y_prev = curr, curr
+                elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
+                    rate_2y_curr, rate_2y_prev = curr, curr
             else:
                 collected[cat_name].append({"name": name, "status": "fail"})
 
@@ -231,25 +244,39 @@ def get_collected_macro_data():
 
 
 # ==============================================================================
-# 4. 리스크 지표 요약 및 텍스트 포맷터
+# 4. 리스크 지표 요약 헬퍼 및 전체 매크로 원본 텍스트 생성기
 # ==============================================================================
 def summarize_series_for_ai(df: pd.DataFrame, value_col: str = None, label: str = "") -> str:
+    """시계열을 AI Context용 최신값·직전 변화·백분위 문장으로 요약."""
     if df is None or df.empty:
         return f"- {label}: 데이터 수집 실패"
+
     try:
-        series = df[value_col].dropna() if value_col and value_col in df.columns else df.iloc[:, 0].dropna()
+        if value_col and value_col in df.columns:
+            series = df[value_col].dropna()
+        else:
+            series = df.iloc[:, 0].dropna()
+
         if len(series) < 2:
             return f"- {label}: 데이터 부족"
-        curr, prev = float(series.iloc[-1]), float(series.iloc[-2])
-        change = curr - prev
+
+        current = float(series.iloc[-1])
+        previous = float(series.iloc[-2])
+        change = current - previous
         percentile = float(series.rank(pct=True).iloc[-1] * 100)
-        return f"- {label}: {curr:,.2f} (직전 대비 {change:+,.2f}, 최근 표본 내 백분위 {percentile:.1f}%)"
+
+        return (
+            f"- {label}: {current:,.2f} "
+            f"(직전 대비 {change:+,.2f}, "
+            f"최근 표본 내 백분위 {percentile:.1f}%)"
+        )
     except Exception as e:
         return f"- {label}: 요약 실패 ({str(e)})"
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_macro_risk_indicators_for_ai() -> dict:
+    """AI Context용 금융 리스크·변동성 지표 수집."""
     return {
         "VIX": fetch_ticker_data("^VIX", period="3mo"),
         "MOVE": fetch_ticker_data("^MOVE", period="3mo"),
@@ -261,8 +288,10 @@ def get_macro_risk_indicators_for_ai() -> dict:
 
 def _append_macro_risk_section(lines: list[str], risk_data: dict | None) -> None:
     lines.append("## 금융 리스크·은행권·시장 변동성")
+
     if not isinstance(risk_data, dict):
-        lines.append("- 금융 리스크 데이터 수집 실패\n")
+        lines.append("- 금융 리스크 데이터 수집 실패")
+        lines.append("")
         return
 
     indicators = [
@@ -278,60 +307,90 @@ def _append_macro_risk_section(lines: list[str], risk_data: dict | None) -> None
         if series_or_df is None:
             lines.append(f"- {label}: 데이터 수집 실패")
             continue
-        lines.append(summarize_series_for_ai(series_or_df, value_col, label))
+        lines.append(
+            summarize_series_for_ai(
+                series_or_df,
+                value_col,
+                label,
+            )
+        )
     lines.append("")
 
 
 def generate_full_macro_text(
-    collected_data: dict, 
-    rate_10y_curr=None, 
-    rate_10y_prev=None, 
-    rate_2y_curr=None, 
-    rate_2y_prev=None, 
-    risk_data: dict | None = None
+    collected_data: dict,
+    rate_10y_curr=None,
+    rate_10y_prev=None,
+    rate_2y_curr=None,
+    rate_2y_prev=None,
+    risk_data: dict | None = None,
 ) -> str:
+    """
+    거시경제 매크로 메뉴에 표시된 모든 지표의 최신 원본값을
+    카테고리 단위로 복사용 텍스트로 변환합니다.
+    """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S KST")
+
     lines = [
         "📋 [거시경제 매크로 지표 원본 브리핑]",
         f"수집 시각: {now_kst}",
         "표기: 최신값 | 전일/직전 대비 | 직전값",
-        "=" * 72, 
-        ""
+        "=" * 72,
+        "",
     ]
 
     if not isinstance(collected_data, dict):
         lines.append("- 매크로 데이터 수집에 실패했습니다.")
         return "\n".join(lines)
 
-    for cat_name, items in collected_data.items():
-        lines.append(f"## {_clean_macro_label(cat_name)}")
-        if not items:
-            lines.append("- 수집된 지표가 없습니다.\n")
+    for category_name, items in collected_data.items():
+        lines.append(f"## {_clean_macro_label(category_name)}")
+
+        if not isinstance(items, list) or not items:
+            lines.append("- 수집된 지표가 없습니다.")
+            lines.append("")
             continue
+
         for item in items:
             if not isinstance(item, dict):
                 continue
+
             name = _clean_macro_label(item.get("name", "이름 없음"))
-            if item.get("status") in ("ok", "single"):
-                lines.append(f"- {name}: {item.get('price_str', 'N/A')} | {item.get('delta_str', 'N/A')} | 직전: {item.get('prev_str', 'N/A')}")
+            status = item.get("status")
+
+            if status in ("ok", "single"):
+                lines.append(
+                    f"- {name}: "
+                    f"{item.get('price_str', 'N/A')} | "
+                    f"{item.get('delta_str', 'N/A')} | "
+                    f"직전: {item.get('prev_str', 'N/A')}"
+                )
             else:
                 lines.append(f"- {name}: 데이터 수집 실패")
         lines.append("")
 
     lines.append("## 장단기 금리차")
+
     if rate_10y_curr is not None and rate_2y_curr is not None:
         spread_curr = rate_10y_curr - rate_2y_curr
+
         lines.extend([
-            f"- 미국채 10년물: {rate_10y_curr:.2f}%", 
-            f"- 미국채 2년물: {rate_2y_curr:.2f}%", 
+            f"- 미국채 10년물: {rate_10y_curr:.2f}%",
+            f"- 미국채 2년물: {rate_2y_curr:.2f}%",
             f"- 10Y-2Y 스프레드: {spread_curr:+.3f}%p",
         ])
+
         if rate_10y_prev is not None and rate_2y_prev is not None:
             spread_prev = rate_10y_prev - rate_2y_prev
-            lines.append(f"- 스프레드 직전 대비: {spread_curr - spread_prev:+.3f}%p")
+            lines.append(
+                f"- 스프레드 직전 대비: "
+                f"{spread_curr - spread_prev:+.3f}%p"
+            )
     else:
         lines.append("- 장단기 금리차 데이터 수집 실패")
+
     lines.append("")
 
     _append_macro_risk_section(lines, risk_data)
+
     return "\n".join(lines)
