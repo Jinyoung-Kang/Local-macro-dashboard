@@ -254,8 +254,9 @@ def get_collected_macro_data():
                 collected[cat_name].append({"name": name, "status": "fail"})
 
     # ==========================================================================
-    # [신규] KOSPI200 야간선물(CME 연계) — 비공식 스크래핑 (TradingView -> Investing.com -> 추정)
-    # "아시아 주요 주가지수" 카테고리에 추가
+    # [신규] KOSPI200 야간선물(CME 연계) — 비공식 스크래핑
+    # (TradingView -> Investing.com -> KODEX 200 프록시 추정)
+    # 몇 월물인지(contract_month)와 데이터 출처(source)를 라벨에 함께 표시
     # ==========================================================================
     try:
         from services.night_futures_scraper_service import get_kospi_night_futures
@@ -271,9 +272,14 @@ def get_collected_macro_data():
             prev = night_data.get("prev_close")
             is_estimated = night_data.get("is_estimated", True)
             source = night_data.get("source", "알수없음")
+            contract_month = night_data.get("contract_month")
 
             estimate_tag = " (추정)" if is_estimated else ""
-            label = f"코스피200 야간선물 (CME 연계){estimate_tag} :gray[[{source}]]"
+            month_tag = f" [{contract_month}]" if contract_month else " [월물 정보 없음]"
+            label = (
+                f"코스피200 야간선물 (CME 연계){estimate_tag}{month_tag} "
+                f":gray[[출처: {source}]]"
+            )
 
             if price is not None and prev is not None:
                 delta = price - prev
@@ -288,6 +294,8 @@ def get_collected_macro_data():
                     "prev_str": f"{prev:,.2f}",
                     "status": "ok",
                     "is_estimated": is_estimated,
+                    "contract_month": contract_month,
+                    "source": source,
                 })
             else:
                 collected[target_cat].append({
