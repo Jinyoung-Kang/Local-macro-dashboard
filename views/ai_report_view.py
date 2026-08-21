@@ -1,196 +1,59 @@
 """
 views/ai_report_view.py
 AI 매크로 & 멀티에셋 종합 리포트 뷰
-거시경제, 13F, KRX파생, 거시리스크, 다중자산 COT, 섹터로테이션의 8개 데이터를 병렬 수집하여 RAG Context로 조립
+대시보드 원본 스냅샷을 수집하여 AI 분석 프롬프트 주입용 Context를 조립합니다.
 """
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import pandas as pd
+
 import streamlit as st
+
 from services.ai_service import (
     call_selected_ai_engine,
     get_ai_engine_options,
     format_ai_engine
 )
-from services.cot_service import (
-    fetch_cot_multi_asset_history,
-    summarize_cot_asset,
-    cot_history_to_markdown
-)
-from services.krx_service import get_krx_futures_history, get_krx_investor_derivatives_summary
-from services.macro_service import (
-    get_collected_macro_data,
-    get_macro_risk_indicators_for_ai,
-    summarize_series_for_ai
-)
-from services.sec_service import load_all_institutions_data
-from services.sector_service import (
-    get_rotation_momentum_for_ai,
-    rotation_dataframe_to_context
+from services.cot_service import cot_history_to_markdown
+from services.dashboard_snapshot_service import (
+    collect_dashboard_snapshot,
+    format_dashboard_snapshot_text,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _safe_call(fn, *args, **kwargs):
-    try:
-        return fn(*args, **kwargs)
-    except Exception as e:
-        logger.warning(f"AI 컨텍스트 데이터 수집 중 예외 ({fn.__name__}): {e}")
-        return None
+def _format_recent_cot_history(cot_res: dict) -> str:
+    """COT 데이터 딕셔너리에서 각 자산의 최근 3개월 Markdown 표본을 생성하여 병합"""
+    if not cot_res:
+        return ""
+    res = ""
+    for asset_name, asset_info in cot_res.items():
+        if asset_info and asset_info.get("data") is not None and not asset_info["data"].empty:
+            res += cot_history_to_markdown(
+                asset_info["data"],
+                f"{asset_name} 최근 3개월 상세",
+                max_rows=13
+            ) + "\n"
+    return res
 
 
-def _is_valid_data(val) -> bool:
-    if val is None:
-        return False
-    if isinstance(val, pd.DataFrame):
-        return not val.empty
-    if isinstance(val, (list, dict, tuple, set)):
-        return len(val) > 0
-    return bool(val)
-
-
-# ==============================================================================
-# [신규] 8대 데이터 영역 병렬 통합 RAG Context 빌더
-# ==============================================================================
 def build_comprehensive_context(
     report_type: str = "종합 거시경제 & 수급 전략",
     include_recent_cot_history: bool = False,
 ) -> str:
-    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
-    
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        fut_macro = executor.submit(_safe_call, get_collected_macro_data)
-        fut_risk = executor.submit(_safe_call, get_macro_risk_indicators_for_ai)
-        fut_sec = executor.submit(_safe_call, load_all_institutions_data)
-        fut_krx = executor.submit(_safe_call, get_krx_futures_history, 40)
-        fut_krx_inv = executor.submit(_safe_call, get_krx_investor_derivatives_summary)
-        fut_cot_multi = executor.submit(_safe_call, fetch_cot_multi_asset_history, 3)
-        fut_rotation = executor.submit(_safe_call, get_rotation_momentum_for_ai)
+    """
+    AI 리포트를 생성하기 위해 최신 대시보드 스냅샷을 수집하고
+    AI 지시사항 및 추가 COT 테이블이 병합된 최종 Context를 생성합니다.
+    """
+    snapshot = collect_dashboard_snapshot()
+    context = format_dashboard_snapshot_text(snapshot)
 
-        macro_res = fut_macro.result()
-        risk_res = fut_risk.result()
-        sec_res = fut_sec.result()
-        krx_res = fut_krx.result()
-        krx_inv_res = fut_krx_inv.result()
-        cot_multi_res = fut_cot_multi.result()
-        rotation_res = fut_rotation.result()
+    context += "\n"
+    context += f"[AI 분석 요청 유형] {report_type}\n"
 
-    context = f"""[AI 분석 기준]
-- Context 수집 시각: {now_kst.strftime("%Y-%m-%d %H:%M:%S KST")}
-- 주의: 장중 데이터는 실시간 또는 가집계이며, 종가 확정치와 차이가 날 수 있습니다.
-[분석 요청 유형] {report_type}
-
-"""
-
-    # 1. 거시경제 및 채권/금리 지표
-    context += "#### 1. 거시경제 및 채권/금리 지표\n"
-    if macro_res and isinstance(macro_res, tuple) and len(macro_res) >= 5:
-        collected_macro, r10_curr, r10_prev, r2_curr, r2_prev = macro_res
-        if r10_curr is not None and r2_curr is not None:
-            spread_curr = round(r10_curr - r2_curr, 3)
-            context += f"- 미국채 10년물 금리: {r10_curr:.2f}% (전일: {r10_prev:.2f}%)\n"
-            context += f"- 미국채 2년물 금리: {r2_curr:.2f}% (전일: {r2_prev:.2f}%)\n"
-            context += f"- 10Y-2Y 장단기 금리차: {spread_curr:+.3f}%p\n"
-
-        if isinstance(collected_macro, dict):
-            for cat_name, items in collected_macro.items():
-                if isinstance(items, list) and items:
-                    ok_items = [it for it in items if isinstance(it, dict) and it.get("status") in ["ok", "single"]]
-                    if ok_items:
-                        context += f"\n**{cat_name}**\n"
-                        for item in ok_items:
-                            context += f"- {item.get('name','')}: {item.get('price_str','')} ({item.get('delta_str','')})\n"
-    else:
-        context += "- 거시경제 데이터 수집 실패 또는 지연\n"
-    
-    # 1-1. 금융 리스크 지표
-    context += "\n#### 1-1. 금융 리스크 및 변동성 지표\n"
-    if risk_res:
-        context += summarize_series_for_ai(risk_res.get("VIX"), "Close", "CBOE VIX (주식 변동성)") + "\n"
-        context += summarize_series_for_ai(risk_res.get("MOVE"), "Close", "ICE BofA MOVE (채권 변동성)") + "\n"
-        context += summarize_series_for_ai(risk_res.get("HY_OAS"), "BAMLH0A0HYM2", "미국 하이일드 OAS") + "\n"
-        context += summarize_series_for_ai(risk_res.get("CP_SPREAD"), "CP_SPREAD", "3M 금융 CP 스프레드") + "\n"
-        context += summarize_series_for_ai(risk_res.get("STLFSI4"), "STLFSI4", "세인트루이스 연준 금융스트레스(STLFSI4)") + "\n"
-    else:
-        context += "- 금융 리스크 데이터 수집 실패\n"
-
-    # 2. 글로벌 기관투자가 (13F) 포트폴리오
-    context += "\n#### 2. 글로벌 기관투자가 (13F) 포트폴리오 동향\n"
-    if _is_valid_data(sec_res):
-        if isinstance(sec_res, dict):
-            context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
-            for inst_name, payload in list(sec_res.items())[:5]:
-                if isinstance(payload, dict) and isinstance(payload.get("df"), pd.DataFrame) and not payload["df"].empty:
-                    df_inst = payload["df"]
-                    if "weight" in df_inst.columns:
-                        top_row = df_inst.sort_values("weight", ascending=False).iloc[0]
-                    else:
-                        top_row = df_inst.iloc[0]
-                    top_name = top_row.get("name", "N/A")
-                    try:
-                        top_weight = float(top_row.get("weight", 0))
-                        context += f"  * {inst_name}: 최대 비중 종목 {top_name} (비중 {top_weight:.2f}%)\n"
-                    except Exception:
-                        context += f"  * {inst_name}: 최대 비중 종목 {top_name}\n"
-                else:
-                    context += f"  * {inst_name}: 보유 데이터 없음\n"
-        elif isinstance(sec_res, pd.DataFrame):
-            context += f"- 모니터링 기관 수: {len(sec_res)}개 기관\n"
-            top_inst = sec_res.head(5)
-            for _, r in top_inst.iterrows():
-                inst_nm = r.get("institution", r.get("name", "N/A"))
-                top_hold = r.get("top_holding", "N/A")
-                val_b = r.get("total_value_bil", r.get("value_bil", 0))
-                context += f"  * {inst_nm}: 총자산 ${val_b}B | 최대 비중 종목: {top_hold}\n"
-    else:
-        context += "- SEC 13F 데이터 수집 대기 상태\n"
-
-    # 3. KRX 외국인/기관 선물 누적 수급 동향
-    context += "\n#### 3. KRX 외국인/기관 선물 누적 수급 동향\n"
-    if _is_valid_data(krx_res) and isinstance(krx_res, pd.DataFrame):
-        latest_krx = krx_res.iloc[-1]
-        context += f"- 선물 종가: {latest_krx.get('Futures_Close', 0)} pt\n"
-        context += f"- 시장 베이시스: {latest_krx.get('Market_Basis', 0):+.2f} pt\n"
-        context += f"- 미결제약정: {int(latest_krx.get('Open_Interest', 0)):,} 계약\n"
-        context += f"- 파생 수급 국면: {latest_krx.get('Market_Phase', '알수없음')}\n"
-        context += f"- 한국판 COT Index: {float(latest_krx.get('COT_OI_Index', 0)):.1f}%\n"
-    else:
-        context += "- KRX 선물 시계열 데이터 수집 대기 상태\n"
-
-    if _is_valid_data(krx_inv_res) and isinstance(krx_inv_res, pd.DataFrame):
-        context += "- 주요 투자자 20일 누적 순매수:\n"
-        for _, r in krx_inv_res.iterrows():
-            subj = r.get("투자 주체", r.get("주체", "Unknown"))
-            amt = r.get("20일 누적", r.get("20일 누적 순매수 (계약)", 0))
-            context += f"  * {subj}: {amt:+,} 계약\n"
-
-    # 4. 다중 자산 COT
-    context += "\n#### 4. CFTC COT: 글로벌 투기적 포지션\n"
-    if cot_multi_res:
-        for asset_name, asset_info in cot_multi_res.items():
-            if asset_info and asset_info.get("data") is not None and not asset_info["data"].empty:
-                context += summarize_cot_asset(asset_name, asset_info["data"]) + "\n\n"
-                if include_recent_cot_history:
-                    context += cot_history_to_markdown(
-                        asset_info["data"], 
-                        f"{asset_name} 최근 3개월 상세",
-                        max_rows=13
-                    ) + "\n"
-            else:
-                context += f"- {asset_name}: 수집 실패 ({asset_info.get('error', 'No data')})\n\n"
-    else:
-        context += "- CFTC COT 포지션 데이터 수집 실패\n"
-
-    # 5. 섹터 및 자산군 로테이션
-    context += "\n#### 5. 글로벌 섹터 및 자산군 로테이션 모멘텀\n"
-    if rotation_res:
-        context += rotation_dataframe_to_context(rotation_res.get("sector"), "섹터 로테이션: S&P 500 11개 섹터") + "\n"
-        context += rotation_dataframe_to_context(rotation_res.get("asset_class"), "자산군 로테이션: 주식·채권·원자재·달러") + "\n"
-    else:
-        context += "- 섹터/자산군 로테이션 데이터 수집 실패\n"
+    if include_recent_cot_history:
+        context += _format_recent_cot_history(snapshot.get("cot"))
 
     return context
 
