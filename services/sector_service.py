@@ -2,7 +2,6 @@
 services/sector_service.py
 섹터 및 자산군 시계열/로테이션 수집 엔진
 기존 ETF 수집 헬퍼 및 calculate_returns_matrix 복원 완료, AI Context용 모멘텀 변환 포함
-(sector_view.py 호환을 위한 딕셔너리 구조 및 Close Series 반환 버그 수정 반영)
 """
 import logging
 from datetime import datetime
@@ -14,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 로테이션 ETF 자산군 매핑
+# 0. 로테이션 ETF 자산군 매핑
 # ==============================================================================
 ROTATION_SECTORS = {
     "정보기술": "XLK",
@@ -63,7 +62,7 @@ def fetch_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
 
 
 # ==============================================================================
-# [수정 완료] 기존 sector_view.py 호환용 calculate_returns_matrix
+# 1. [복구됨] 기존 sector_view.py 호환용 calculate_returns_matrix
 # ==============================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def calculate_returns_matrix(
@@ -81,37 +80,33 @@ def calculate_returns_matrix(
 
     반환:
     - DataFrame: 기존 sector_view.py 호환 컬럼
-    - dict: 티커별 yfinance 시계열 (Close Series만 포함)
+    - dict: 티커별 yfinance 시계열
     """
     tickers = list(etf_dict.keys())
 
     if benchmark_ticker not in tickers:
         tickers.append(benchmark_ticker)
 
-    raw_hist_map = fetch_etf_history_map(
+    hist_map = fetch_etf_history_map(
         tuple(tickers),
         period="2y",
     )
-
-    history_map = {}
-
-    # 이전 요청사항 적용: Close Series만 추출하여 history_map 구성
-    for ticker, df in raw_hist_map.items():
-        if df is None or df.empty or "Close" not in df.columns:
-            continue
-
-        close = df["Close"].dropna()
-
-        if not close.empty:
-            history_map[ticker] = close
 
     current_year = datetime.now().year
     records = []
 
     for ticker, info in etf_dict.items():
-        close = history_map.get(ticker)
+        df = hist_map.get(ticker)
 
-        if close is None or len(close) < 20:
+        if df is None or df.empty:
+            continue
+
+        if "Close" not in df.columns:
+            continue
+
+        close = df["Close"].dropna()
+
+        if len(close) < 20:
             continue
 
         current_price = float(close.iloc[-1])
@@ -134,7 +129,6 @@ def calculate_returns_matrix(
                 ytd_return = 0.0
             else:
                 ytd_price = float(ytd_series.iloc[0])
-
                 ytd_return = (
                     (current_price / ytd_price - 1) * 100
                     if ytd_price != 0
@@ -158,9 +152,9 @@ def calculate_returns_matrix(
         })
 
     if not records:
-        return pd.DataFrame(), history_map
+        return pd.DataFrame(), hist_map
 
-    return pd.DataFrame(records), history_map
+    return pd.DataFrame(records), hist_map
 
 
 # ==============================================================================
@@ -218,21 +212,34 @@ def get_rotation_momentum_for_ai() -> dict:
 
     df_result = pd.DataFrame(records)
 
-    if not df_result.empty:
+    if df_result.empty:
+        return {
+            "sector": pd.DataFrame(),
+            "asset_class": pd.DataFrame(),
+        }
+
+    # 섹터와 자산군을 분리하여 각각 그룹 내에서 랭크 계산 적용
+    sector_df = df_result[
+        df_result["자산"].isin(ROTATION_SECTORS.keys())
+    ].copy()
+    
+    asset_class_df = df_result[
+        df_result["자산"].isin(ROTATION_ASSET_CLASSES.keys())
+    ].copy()
+
+    for target_df in [sector_df, asset_class_df]:
+        if target_df.empty:
+            continue
         for period_name in windows:
-            df_result[f"{period_name}_순위"] = (
-                df_result[period_name]
+            target_df[f"{period_name}_순위"] = (
+                target_df[period_name]
                 .rank(ascending=False, method="min")
                 .astype(int)
             )
 
     return {
-        "sector": df_result[
-            df_result["자산"].isin(ROTATION_SECTORS.keys())
-        ].copy() if not df_result.empty else pd.DataFrame(),
-        "asset_class": df_result[
-            df_result["자산"].isin(ROTATION_ASSET_CLASSES.keys())
-        ].copy() if not df_result.empty else pd.DataFrame(),
+        "sector": sector_df,
+        "asset_class": asset_class_df,
     }
 
 
