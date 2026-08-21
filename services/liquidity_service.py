@@ -3,11 +3,6 @@ services/liquidity_service.py
 연준 순유동성(Fed Net Liquidity) 지표 수집 및 분석 서비스 모듈
 (WALCL, WTREGEN, RRPONTSYD 수집, 단위 정규화 및 무중단 Fallback 탑재 + 병렬 수집 최적화)
 
-[수정 사항]
-- fetch_fred_series_raw()가 (DataFrame, is_estimated) 튜플을 반환하도록 변경.
-- 3단계 비상 Fallback(사인파 기반 추정 시계열)을 사용한 경우 is_estimated=True로 명시.
-- get_fed_liquidity_data()의 반환 DataFrame에 'is_estimated' 컬럼을 추가하여
-  화면(liquidity_view.py)에서 실제/추정 데이터를 구분해 경고를 표시할 수 있도록 함.
 """
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +51,37 @@ def get_fred_session() -> requests.Session:
     )
     session.mount("https://", HTTPAdapter(max_retries=retries))
     return session
+
+
+def _parse_fred_csv(csv_text: str, series_id: str) -> pd.DataFrame:
+    """
+    FRED 웹 CSV 응답을 안전하게 파싱합니다.
+    FRED가 날짜 컬럼명을 'DATE'에서 'observation_date'로 변경한 이력이 있으므로,
+    실제 컬럼명을 자동으로 탐색하여 향후 변경에도 유연하게 대응합니다.
+    """
+    raw_df = pd.read_csv(io.StringIO(csv_text))
+
+    date_col = None
+    for candidate in ["observation_date", "DATE", "date"]:
+        if candidate in raw_df.columns:
+            date_col = candidate
+            break
+
+    if date_col is None:
+        raise ValueError(
+            f"CSV에서 날짜 컬럼을 찾을 수 없습니다. 실제 컬럼: {list(raw_df.columns)}"
+        )
+
+    raw_df[date_col] = pd.to_datetime(raw_df[date_col])
+    df = raw_df.set_index(date_col)
+    df = df.replace(".", pd.NA)
+
+    # 첫 번째 값 컬럼을 series_id로 통일 (컬럼명이 series_id와 다를 수 있음)
+    value_col = [c for c in df.columns if c != date_col][0]
+    df = df[[value_col]].rename(columns={value_col: series_id})
+    df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
+
+    return df.dropna()
 
 
 def _build_emergency_fallback_series(series_id: str, period_years: int) -> pd.DataFrame:
@@ -110,19 +136,23 @@ def fetch_fred_series_raw(series_id: str, period_years: int = 10) -> tuple[pd.Da
                     df = df.dropna().rename(columns={"value": series_id}).set_index("date")
                     if not df.empty and len(df) >= 2:
                         return df, False
+            else:
+                logger.warning(f"FRED API 응답 실패 ({series_id}): HTTP {res.status_code}")
         except Exception as e:
             logger.warning(f"FRED API 실패 ({series_id}): {e}")
+    else:
+        logger.info(f"{series_id}: FRED_API_KEY 미등록, 웹 CSV 경로로 진행합니다.")
 
-    # 2. Web CSV 직접 다운로드 (403 방어 헤더 탑재, timeout 단축으로 빠른 Fallback 유도)
+    # 2. Web CSV 직접 다운로드 (403 방어 헤더 탑재, 컬럼명 자동 탐색 적용)
     try:
         csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        res = session.get(csv_url, timeout=6)
+        res = session.get(csv_url, timeout=10)
         if res.status_code == 200 and len(res.text) > 30:
-            df = pd.read_csv(io.StringIO(res.text), parse_dates=["DATE"], index_col="DATE", na_values=".")
-            df = df.dropna()
-            df.columns = [series_id]
+            df = _parse_fred_csv(res.text, series_id)
             if not df.empty and len(df) >= 2:
                 return df, False
+        else:
+            logger.warning(f"FRED CSV 응답 비정상 ({series_id}): HTTP {res.status_code}")
     except Exception as e:
         logger.warning(f"FRED CSV 다운로드 실패 ({series_id}): {e}")
 
