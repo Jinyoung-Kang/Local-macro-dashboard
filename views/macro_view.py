@@ -16,7 +16,9 @@ from services.macro_service import (
     fetch_fred_series,
     fetch_ticker_data,
     generate_briefing_text,
+    generate_full_macro_text,
     get_collected_macro_data,
+    get_macro_risk_indicators_for_ai,
 )
 from services.dashboard_snapshot_service import (
     collect_dashboard_snapshot,
@@ -84,15 +86,24 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         st.error(f"데이터 수집 중 오류가 발생했습니다: {e}")
         return
 
+    # 거시 변동성 데이터 수집
     vix_hist = fetch_ticker_data("^VIX", period="1mo")
     move_hist = fetch_ticker_data("^MOVE", period="1mo")
     hy_df = fetch_fred_series("BAMLH0A0HYM2")
     stlfsi_df = fetch_fred_series("STLFSI4")
     cp_spread_df = fetch_fred_cp_spread()
+    
+    # 텍스트 출력용 리스크 지표
+    risk_data = get_macro_risk_indicators_for_ai()
 
-    report_text = generate_briefing_text(
-        collected_data, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev,
-        vix_hist, move_hist, hy_df, cp_spread_df, stlfsi_df, now_str_kst
+    # AI용 스냅샷 요약 (모든 자산 전체 출력)
+    report_text = generate_full_macro_text(
+        collected_data=collected_data,
+        rate_10y_curr=rate_10y_curr,
+        rate_10y_prev=rate_10y_prev,
+        rate_2y_curr=rate_2y_curr,
+        rate_2y_prev=rate_2y_prev,
+        risk_data=risk_data,
     )
 
     header_left, header_right = st.columns([2.7, 1.3])
@@ -100,12 +111,15 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         st.title("📊 Global Macro Dashboard")
         st.caption(f"최근 데이터 갱신 시각: {now_str_kst} (KST) | 갱신 주기: {refresh_interval}초")
 
-    # 우측 상단 팝오버 메뉴 2개 (AI 호출 제거 및 원본 데이터 스냅샷으로 교체)
+    # 우측 상단 팝오버 메뉴 2개
     with header_right:
         st.write("")
         with st.popover("📋 매크로 텍스트 브리핑 보기 / 복사", use_container_width=True):
-            st.markdown("**거시경제 매크로 지표 원본 브리핑**")
-            st.caption("현재 매크로 화면의 환율·국채·원자재·지수·선물·스프레드·리스크 지표를 복사합니다.")
+            st.markdown("**거시경제 매크로 지표 전체 원본 데이터**")
+            st.caption(
+                "환율·국채·원자재·미국/아시아 지수·선물·장단기 금리차·"
+                "신용 리스크·은행권·시장 변동성의 최신값을 모두 표시합니다."
+            )
             st.code(report_text, language="text")
 
         st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
