@@ -111,9 +111,10 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
                             "Contract_Name": str(row.get(name_col, "KOSPI 200 선물"))
                         })
 
-    # KRX 응답 부재 시 Fallback (KODEX 200 및 코스피 200 지수 프록시)
+    # KRX 응답 부재 시 Fallback (KODEX 200 및 코스피 200 지수 프록시 가짜 데이터 생성 제거)
     if len(records) < 5:
-        return _generate_fallback_derivatives_data(days)
+        logger.error("KRX OpenAPI 파생상품 시계열 데이터 수집 실패. 가짜 데이터를 생성하지 않고 빈 데이터를 반환합니다.")
+        return pd.DataFrame()
 
     df_hist = pd.DataFrame(records).sort_values("Date").reset_index(drop=True)
     
@@ -146,95 +147,6 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
     df_hist["COT_OI_Index"] = ((df_hist["Open_Interest"] - min_oi) / denom * 100).round(1)
 
     return df_hist.tail(days).reset_index(drop=True)
-
-
-def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
-    """KRX API 연결 전 또는 장마감 후 결측치를 방어하는 안전 시뮬레이션 파이프라인"""
-    try:
-        # 코스피 200 프록시 수집 (069500.KS 및 ^KS200)
-        hist = None
-        for sym in ["069500.KS", "^KS200"]:
-            try:
-                tk = yf.Ticker(sym)
-                h = tk.history(period=f"{days + 30}d")
-                if h is not None and not h.empty and len(h) >= 5:
-                    hist = h
-                    break
-            except:
-                pass
-
-        if hist is not None and not hist.empty:
-            # 1. NaN이거나 0 이하인 최근 미확정 캔들 완전 제거
-            hist = hist.dropna(subset=["Close"])
-            hist = hist[hist["Close"] > 0]
-            hist["Close"] = hist["Close"].ffill().bfill()
-            
-            df = hist.tail(days).reset_index()
-            df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
-            
-            # KODEX 200(원화 가격 약 36,000원) vs 코스피 200 지수(포인트 약 360pt) 스케일링
-            last_close = df["Close"].iloc[-1]
-            scale_factor = 0.01 if last_close > 1000 else 1.0
-                
-            df["Futures_Close"] = (df["Close"] * scale_factor).round(2)
-            df["Change_Pct"] = df["Futures_Close"].pct_change().fillna(0.0).round(2) * 100.0
-            
-            # 거래량 및 미결제약정 결측 방어
-            vol = df["Volume"] if "Volume" in df.columns else 150000
-            df["Volume"] = pd.to_numeric(vol, errors='coerce').fillna(150000).replace(0, 150000).astype(int)
-            
-            # 안정적인 베이시스 및 미결제약정 모델링 (NaN 완전 배제)
-            rolling_std = df["Futures_Close"].rolling(5, min_periods=1).std().fillna(1.0)
-            df["Open_Interest"] = (280000 + (rolling_std * 4500) + np.linspace(500, 5000, len(df))).astype(int)
-            df["OI_Change"] = df["Open_Interest"].diff().fillna(0).astype(int)
-            
-            df["Theory_Price"] = (df["Futures_Close"] * 1.0015).round(2)
-            # 베이시스: 양수(콘탱고) 중심의 현실적 스프레드 생성 (+0.5 ~ +2.5pt)
-            df["Market_Basis"] = (0.85 + np.sin(np.linspace(0, 6, len(df))) * 0.65).round(2)
-            df["Contract_Name"] = "KOSPI 200 최근월물 (프록시 모드)"
-            
-            def diagnose_phase(row):
-                p_up = row["Change_Pct"] >= 0
-                oi_up = row["OI_Change"] >= 0
-                if p_up and oi_up:
-                    return "신규 롱 (Long Accumulation)"
-                elif p_up and not oi_up:
-                    return "숏 커버링 (Short Covering)"
-                elif not p_up and oi_up:
-                    return "신규 숏 (Short Accumulation)"
-                else:
-                    return "롱 청산 (Long Liquidation)"
-
-            df["Market_Phase"] = df.apply(diagnose_phase, axis=1)
-            min_oi = df["Open_Interest"].min()
-            max_oi = df["Open_Interest"].max()
-            denom = (max_oi - min_oi) if max_oi != min_oi else 1
-            df["COT_OI_Index"] = (((df["Open_Interest"] - min_oi) / denom) * 100.0).round(1)
-            
-            # 최종 NaN 방어 검증
-            if pd.isna(df["Futures_Close"].iloc[-1]) or df["Futures_Close"].iloc[-1] == 0:
-                df["Futures_Close"].iloc[-1] = df["Futures_Close"].iloc[-2] if len(df) > 1 else 365.50
-                
-            return df[["Date", "Futures_Close", "Change_Pct", "Volume", "Open_Interest", "OI_Change", "Theory_Price", "Market_Basis", "Contract_Name", "Market_Phase", "COT_OI_Index"]]
-    except Exception as e:
-        logger.error(f"Fallback generation error: {e}")
-
-    # 비상 더미 데이터 (주말/서버 점검 시에도 절대 NaN 미발생)
-    today = datetime.now(ZoneInfo("Asia/Seoul"))
-    dates = [today - timedelta(days=i) for i in range(days, 0, -1)]
-    return pd.DataFrame({
-        "Date": dates,
-        "Futures_Close": [365.0 + (i * 0.2) for i in range(days)],
-        "Change_Pct": [0.20] * days,
-        "Volume": [150000] * days,
-        "Open_Interest": [280000 + (i * 150) for i in range(days)],
-        "OI_Change": [150] * days,
-        "Theory_Price": [365.5 + (i * 0.2) for i in range(days)],
-        "Market_Basis": [0.75] * days,
-        "Contract_Name": "KOSPI 200 최근월물 (프록시 모드)",
-        "Market_Phase": ["신규 롱 (Long Accumulation)"] * days,
-        "COT_OI_Index": [55.0] * days
-    })
 
 
 # ==============================================
