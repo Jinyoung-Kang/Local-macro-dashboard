@@ -1,10 +1,13 @@
 """
 services/cot_service.py
 CFTC COT(Commitments of Traders) 데이터 수집 엔진
-S&P 500 외 6대 주요 자산(주식, 채권, 환율, 원자재) 3년 시계열 병렬 수집 및 AI 요약기 추가
+S&P 500 외 6대 주요 자산(주식, 채권, 환율, 원자재) 3년 시계열 병렬 수집, 재시도(Retry) 적용 및 AI 요약
 """
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import streamlit as st
@@ -41,6 +44,31 @@ COT_ASSETS = {
     },
 }
 
+def _cftc_get_with_retry(url: str, params: dict, max_attempts: int = 3):
+    """일시적인 Connection Reset 방어를 위한 재시도 래퍼"""
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=(5, 30),
+                headers={
+                    "User-Agent": (
+                        "macro-dashboard-v2/1.0 "
+                        "(data research contact: admin@example.com)"
+                    )
+                },
+            )
+            response.raise_for_status()
+            return response, None
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)
+    return None, str(last_error)
+
+
 @st.cache_data(ttl=3600*12, show_spinner=False)
 def fetch_cftc_cot_legacy(contract_code: str, limit: int = 300) -> tuple:
     url = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
@@ -49,39 +77,41 @@ def fetch_cftc_cot_legacy(contract_code: str, limit: int = 300) -> tuple:
         "$limit": limit,
         "$order": "report_date_as_yyyy_mm_dd DESC"
     }
+    
+    res, error = _cftc_get_with_retry(url, params)
+    
+    if error:
+        return pd.DataFrame(), f"CFTC 재시도 후 실패: {error}"
+    
     try:
-        res = requests.get(url, params=params, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if not data:
-                return pd.DataFrame(), "결과 없음"
-            
-            records = []
-            for row in data:
-                try:
-                    records.append({
-                        "date": pd.to_datetime(row.get("report_date_as_yyyy_mm_dd")),
-                        "nc_long": float(row.get("noncomm_positions_long_all", 0)),
-                        "nc_short": float(row.get("noncomm_positions_short_all", 0)),
-                        "comm_long": float(row.get("comm_positions_long_all", 0)),
-                        "comm_short": float(row.get("comm_positions_short_all", 0)),
-                        "nr_long": float(row.get("nonrept_positions_long_all", 0)),
-                        "nr_short": float(row.get("nonrept_positions_short_all", 0)),
-                    })
-                except Exception:
-                    continue
-                    
-            df = pd.DataFrame(records)
-            if df.empty:
-                return df, "파싱 오류"
-            
-            df["nc_net"] = df["nc_long"] - df["nc_short"]
-            df["comm_net"] = df["comm_long"] - df["comm_short"]
-            df["nr_net"] = df["nr_long"] - df["nr_short"]
-            
-            return df, None
-        else:
-            return pd.DataFrame(), f"HTTP {res.status_code}"
+        data = res.json()
+        if not data:
+            return pd.DataFrame(), "결과 없음"
+        
+        records = []
+        for row in data:
+            try:
+                records.append({
+                    "date": pd.to_datetime(row.get("report_date_as_yyyy_mm_dd")),
+                    "nc_long": float(row.get("noncomm_positions_long_all", 0)),
+                    "nc_short": float(row.get("noncomm_positions_short_all", 0)),
+                    "comm_long": float(row.get("comm_positions_long_all", 0)),
+                    "comm_short": float(row.get("comm_positions_short_all", 0)),
+                    "nr_long": float(row.get("nonrept_positions_long_all", 0)),
+                    "nr_short": float(row.get("nonrept_positions_short_all", 0)),
+                })
+            except Exception:
+                continue
+                
+        df = pd.DataFrame(records)
+        if df.empty:
+            return df, "파싱 오류"
+        
+        df["nc_net"] = df["nc_long"] - df["nc_short"]
+        df["comm_net"] = df["comm_long"] - df["comm_short"]
+        df["nr_net"] = df["nr_long"] - df["nr_short"]
+        
+        return df, None
     except Exception as e:
         return pd.DataFrame(), str(e)
 
@@ -124,7 +154,7 @@ def fetch_cot_multi_asset_history(years: int = 3, max_workers: int = 4) -> dict:
 
 
 def summarize_cot_asset(asset_name: str, df: pd.DataFrame) -> str:
-    """기본 리포트 모드용 1/4/13주 변화 및 백분위 요약"""
+    """기본 리포트 모드용 1/4/13주 변화 및 백분위 요약 + 신선도(age_days) 표시 반영"""
     if df is None or df.empty:
         return f"- {asset_name}: COT 데이터 없음"
 
@@ -144,10 +174,17 @@ def summarize_cot_asset(asset_name: str, df: pd.DataFrame) -> str:
     nc_13w = nc_net - float(prev_13w["nc_net"])
 
     nc_pctile = float(df["nc_net"].rank(pct=True).iloc[-1] * 100)
-    date_text = latest["date"].strftime("%Y-%m-%d")
+    
+    # COT 데이터 기준일 및 수집 시점 대비 지연 일수 계산
+    date_val = latest["date"]
+    cot_date = date_val.date() if hasattr(date_val, "date") else pd.to_datetime(date_val).date()
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    age_days = (today - cot_date).days
+
+    date_text = cot_date.strftime("%Y-%m-%d")
 
     return (
-        f"- {asset_name} (기준일 {date_text})\n"
+        f"- {asset_name} (기준일 {date_text}, 수집 시점 대비 {age_days}일 전 주간 공시)\n"
         f"  - 비상업/스마트머니 순포지션: {nc_net:+,.0f}계약\n"
         f"  - 상업/헤저 순포지션: {comm_net:+,.0f}계약\n"
         f"  - 소액/비보고 순포지션: {nr_net:+,.0f}계약\n"
