@@ -1,7 +1,7 @@
 """
 views/macro_view.py
 거시경제 매크로 지표 대시보드 뷰
-기존 UI(인터랙티브 차트, 탭 등) 완벽 보존 및 중앙 AI 레지스트리 / 자동 번역 연동
+장단기 금리차, 하이일드 OAS, 3M CP 스프레드, STLFSI4, 개장 상태 표시 및 데이터 스냅샷 추출 연동
 """
 from datetime import datetime
 import pandas as pd
@@ -18,10 +18,9 @@ from services.macro_service import (
     generate_briefing_text,
     get_collected_macro_data,
 )
-from services.ai_service import (
-    call_selected_ai_engine,
-    get_ai_engine_options,
-    format_ai_engine
+from services.dashboard_snapshot_service import (
+    collect_dashboard_snapshot,
+    format_dashboard_snapshot_text,
 )
 
 
@@ -40,27 +39,35 @@ def inject_market_status(name: str) -> str:
     now = datetime.now(pytz.timezone('Asia/Seoul'))
     wd = now.weekday()
     hm = now.hour * 100 + now.minute
-    is_weekend = wd >= 5 
-    
+    is_weekend = wd >= 5
+
     status = "마감"
-    
+
     if "비트코인" in name or "이더리움" in name or "암호화폐" in name:
-        status = "개장" 
+        status = "개장"
     elif "코스피" in name or "코스닥" in name:
-        if not is_weekend and 900 <= hm < 1530: status = "개장"
+        if not is_weekend and 900 <= hm < 1530:
+            status = "개장"
     elif "닛케이" in name or "일본" in name:
-        if not is_weekend and 900 <= hm < 1500: status = "개장"
+        if not is_weekend and 900 <= hm < 1500:
+            status = "개장"
     elif "상하이" in name or "중국" in name:
-        if not is_weekend and 1030 <= hm < 1600: status = "개장"
+        if not is_weekend and 1030 <= hm < 1600:
+            status = "개장"
     elif "항셍" in name or "홍콩" in name:
-        if not is_weekend and 1030 <= hm < 1700: status = "개장"
+        if not is_weekend and 1030 <= hm < 1700:
+            status = "개장"
     elif any(k in name for k in ["S&P", "NASDAQ", "나스닥", "다우", "러셀"]):
         status = get_us_market_status()
     else:
-        if wd == 5 and hm >= 600: status = "마감"
-        elif wd == 6: status = "마감"
-        elif wd == 0 and hm < 600: status = "마감"
-        else: status = "개장"
+        if wd == 5 and hm >= 600:
+            status = "마감"
+        elif wd == 6:
+            status = "마감"
+        elif wd == 0 and hm < 600:
+            status = "마감"
+        else:
+            status = "개장"
 
     if "]]" in name:
         return name.replace("]]", f" / {status}]]")
@@ -93,55 +100,47 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         st.title("📊 Global Macro Dashboard")
         st.caption(f"최근 데이터 갱신 시각: {now_str_kst} (KST) | 갱신 주기: {refresh_interval}초")
 
-    # 우측 상단 브리핑 팝오버 버튼 2개
+    # 우측 상단 팝오버 메뉴 2개 (AI 호출 제거 및 원본 데이터 스냅샷으로 교체)
     with header_right:
         st.write("")
-        with st.popover("📋 텍스트 브리핑 보기 / 복사", use_container_width=True):
-            st.markdown("**현재 시세 텍스트 종합 브리핑**")
-            st.caption("우측 상단 복사 아이콘(📋)을 눌러 즉시 복사하세요.")
+        with st.popover("📋 매크로 텍스트 브리핑 보기 / 복사", use_container_width=True):
+            st.markdown("**거시경제 매크로 지표 원본 브리핑**")
+            st.caption("현재 매크로 화면의 환율·국채·원자재·지수·선물·스프레드·리스크 지표를 복사합니다.")
             st.code(report_text, language="text")
-            
-        st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-            
-        with st.popover("🤖 AI로 텍스트 브리핑 보기 / 복사", use_container_width=True):
-            st.markdown("**🤖 AI 기반 통합 데이터 브리핑**")
-            st.caption(f"대시보드 전역의 최신 데이터를 취합하여 즉시 분석합니다.\n(기준 시각: {now_str_kst})")
-            
-            macro_ai_engine = st.selectbox(
-                "AI 분석 엔진 직접 선택",
-                options=get_ai_engine_options(include_auto=True),
-                format_func=format_ai_engine,
-                index=0,
-                key="popover_ai_engine"
-            )
-            
-            if st.button("🧠 AI 브리핑 생성", key="btn_macro_ai_popover", use_container_width=True):
-                with st.spinner(f"[{format_ai_engine(macro_ai_engine)}] 5대 핵심 지표 데이터를 수집 및 분석 중입니다..."):
-                    try:
-                        from views.ai_report_view import build_comprehensive_context
-                        context_data = build_comprehensive_context()
-                        
-                        res = call_selected_ai_engine(
-                            engine_name=macro_ai_engine, 
-                            prompt=context_data, 
-                            system_prompt="글로벌 매크로 전략가 관점에서 주요 금리, 유동성, 원자재 지표의 변동 원인과 자산배분 시사점을 3문단으로 요약하십시오."
-                        )
-                        
-                        ai_text = f"**[📅 데이터 수집 및 분석 기준 시각: {now_str_kst}]**\n\n" + res.get("response", "데이터 처리에 실패했습니다.")
-                        
-                        if res.get("translation_info"):
-                            st.caption(f"🌐 {res['translation_info']}")
-                        if res.get("original_response"):
-                            with st.expander("🔍 번역 전 AI 원문 확인", expanded=False):
-                                st.markdown(res["original_response"])
 
-                        st.markdown(ai_text)
-                        
-                        st.divider()
-                        st.markdown("**📋 전체 복사용 텍스트**")
-                        st.code(ai_text, language="markdown")
-                    except Exception as e:
-                        st.error(f"AI 브리핑 생성 실패: {e}")
+        st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
+
+        with st.popover(
+            "📚 전체 대시보드 원본 데이터 보기 / 복사",
+            use_container_width=True,
+        ):
+            st.markdown("**AI 분석 없이 수집한 전체 대시보드 최신 원본 데이터**")
+            st.caption(
+                "거시·리스크·유동성·섹터·자산군·COT·KRX·SEC 13F 데이터를 "
+                "수집 시각 및 데이터 출처 성격과 함께 표시합니다."
+            )
+
+            if "dashboard_raw_snapshot_text" not in st.session_state:
+                st.session_state.dashboard_raw_snapshot_text = ""
+
+            if st.button(
+                "🔄 전체 데이터 수집 및 텍스트 생성",
+                key="collect_dashboard_raw_snapshot",
+                use_container_width=True,
+            ):
+                with st.spinner("전체 대시보드 원본 데이터를 병렬 수집 중입니다..."):
+                    snapshot = collect_dashboard_snapshot()
+
+                    st.session_state.dashboard_raw_snapshot_text = (
+                        format_dashboard_snapshot_text(snapshot)
+                    )
+
+            raw_text = st.session_state.dashboard_raw_snapshot_text
+
+            if raw_text:
+                st.code(raw_text, language="text")
+            else:
+                st.info("버튼을 눌러 최신 전체 원본 데이터를 수집하세요.")
 
     st.divider()
 
@@ -154,7 +153,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         cols = st.columns(len(items))
         for idx, item in enumerate(items):
             display_name = inject_market_status(item["name"])
-            
+
             if item["status"] == "ok":
                 cols[idx].metric(
                     label=display_name,
@@ -180,7 +179,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         curr_spread = rate_10y_curr - rate_2y_curr
         prev_spread = rate_10y_prev - rate_2y_prev
         spread_delta = curr_spread - prev_spread
-        
+
         if curr_spread < 0:
             status_title = "🚨 역전 (Inversion)"
             status_color = "red"
