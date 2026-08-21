@@ -1,7 +1,7 @@
 """
 services/liquidity_service.py
 연준 순유동성(Fed Net Liquidity) 지표 수집 및 분석 서비스 모듈
-(WALCL, WTREGEN, RRPONTSYD 수집, 단위 정규화 및 무중단 Fallback 탑재)
+(WALCL, WTREGEN, RRPONTSYD 수집, 단위 정규화 및 무중단 Fallback 탑재 + 병렬 수집 최적화)
 """
 from datetime import datetime, timedelta
 import io
@@ -12,6 +12,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +76,10 @@ def fetch_fred_series_raw(series_id: str, period_years: int = 10) -> pd.DataFram
         except Exception as e:
             logger.warning(f"FRED API 실패 ({series_id}): {e}")
 
-    # 2. Web CSV 직접 다운로드 (403 방어 헤더 탑재)
+    # 2. Web CSV 직접 다운로드 (403 방어 헤더 탑재, timeout 단축으로 빠른 Fallback 유도)
     try:
         csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        res = session.get(csv_url, timeout=15)
+        res = session.get(csv_url, timeout=6)
         if res.status_code == 200 and len(res.text) > 30:
             df = pd.read_csv(io.StringIO(res.text), parse_dates=["DATE"], index_col="DATE", na_values=".")
             df = df.dropna()
@@ -109,10 +110,16 @@ def get_fed_liquidity_data(period_years: int = 10) -> pd.DataFrame:
     """
     연준 순유동성(Net Liquidity = WALCL - WTREGEN - ON_RRP) 시계열 데이터프레임 생성
     단위: WALCL($M), WTREGEN($M), ON_RRP($B -> $M 변환 후 차감)
+    3개 시계열을 ThreadPoolExecutor를 통해 병렬로 수집하여 로딩 속도를 최적화합니다.
     """
-    df_walcl = fetch_fred_series_raw("WALCL", period_years=period_years)
-    df_wtre = fetch_fred_series_raw("WTREGEN", period_years=period_years)
-    df_rrp = fetch_fred_series_raw("RRPONTSYD", period_years=period_years)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        fut_walcl = executor.submit(fetch_fred_series_raw, "WALCL", period_years)
+        fut_wtre = executor.submit(fetch_fred_series_raw, "WTREGEN", period_years)
+        fut_rrp = executor.submit(fetch_fred_series_raw, "RRPONTSYD", period_years)
+
+        df_walcl = fut_walcl.result()
+        df_wtre = fut_wtre.result()
+        df_rrp = fut_rrp.result()
 
     if df_walcl is None or df_wtre is None or df_rrp is None:
         return pd.DataFrame()
