@@ -223,7 +223,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     st.dataframe(pd.DataFrame(SPREAD_TABLE_DATA), use_container_width=True, hide_index=True)
 
-    spread_period = st.selectbox("금리차 추이 기간 선택", ["6mo", "1y", "2y", "5y", "max"], index=2, key="spread_period_select")
+    spread_period = st.selectbox("금리차 추이 기간 선택", ["6mo", "1y", "2y", "5y", "max"], index=1, key="spread_period_select")
     df_10y = fetch_ticker_data("^TNX", period=spread_period)
     df_2y = fetch_ticker_data("2YY=F", period=spread_period)
 
