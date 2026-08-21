@@ -331,9 +331,6 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 
 # ==============================================================================
 # 4. KRX 공식 OpenAPI
-# [중요 수정] 투자자별(외국인/기관) 실제 컬럼을 찾지 못하면 절대 대체값을
-# 만들지 않고 즉시 실패를 반환합니다. (기존에는 전체 거래대금이나
-# price×거래량×0.1 이라는 조작된 값을 "KRX 공식 데이터"로 잘못 표시했음)
 # ==============================================================================
 def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     auth_key = get_krx_key()
@@ -380,7 +377,7 @@ def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, tr
         price_col = cols.get("TDD_CLSPRC", cols.get("CLSPRC", ""))
         fluc_col = cols.get("FLUC_RT", "")
 
-        # [핵심 수정] 이 엔드포인트(/sto/stk_bydd_trd)는 유가증권 일별매매정보(OHLCV)이며
+        # 이 엔드포인트(/sto/stk_bydd_trd)는 유가증권 일별매매정보(OHLCV)이며
         # 투자자별(외국인/기관) 순매수 컬럼을 제공하지 않을 가능성이 높습니다.
         # TRD_VAL(전체 거래대금) 등으로 대체하지 않고, 실제 투자자별 컬럼이
         # 없으면 명확히 실패로 처리합니다.
@@ -451,7 +448,7 @@ def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, tr
 
 
 # ==============================================================================
-# 5. Daum 실시간 API
+# 5. Daum 실시간 API (시장 전체 랭킹)
 # ==============================================================================
 def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     market_param = "KOSPI" if "KOSPI" in market.upper() or "코스피" in market else "KOSDAQ"
@@ -695,147 +692,184 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
 
 
 # ==============================================================================
-# 9. 네이버 금융 종목별 실제 투자자 순매매 데이터
-# [중요 수정] 컬럼 정합성 검증 추가. 종가가 비합리적이거나 필수 컬럼이 숫자로
-# 변환되지 않으면(페이지 구조 변경 의심) 조용히 잘못된 값을 넘기지 않고 실패 처리.
+# 9. [신규] Daum 종목 페이지 실제 투자자 순매매 데이터 (pykrx 교차 검증용 독립 소스)
 # ==============================================================================
-def fetch_naver_investor_daily_history(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
+def fetch_daum_investor_daily_history(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
     """
-    네이버 금융의 종목별 외국인/기관 순매매 상세 페이지(item/frgn.naver)를 스크래핑하여
-    실제 일별 외국인·기관 순매매 '수량(주식 수)'을 가져오고, 종가를 곱해 대략적인
-    순매매 금액(원)으로 환산합니다.
+    Daum 금융의 종목 상세 페이지(quotes/A{코드})에서 "외국인·기관" 테이블을
+    스크래핑합니다. pykrx와 완전히 독립된 소스이므로 교차 검증에 사용합니다.
 
-    ⚠️ 비공식 스크래핑이므로 네이버 페이지 구조가 바뀌면 깨질 수 있습니다.
+    ⚠️ 비공식 스크래핑이며, Daum이 페이지에 노출하는 기간은 보통 최근 며칠~1개월
+    수준으로 제한적입니다.
     """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Referer": "https://finance.naver.com/item/main.naver",
+        "Referer": "https://finance.daum.net/",
     }
 
-    days_needed = (end_date_obj - start_date_obj).days + 5
-    max_pages = max(3, (days_needed // 5) + 3)
-
-    all_rows = []
+    ticker_code = stock_code.replace(".KS", "").replace(".KQ", "")
+    url = f"https://finance.daum.net/quotes/A{ticker_code}"
 
     try:
-        for page in range(1, max_pages + 1):
-            url = f"https://finance.naver.com/item/frgn.naver?code={stock_code}&page={page}"
-            res = requests.get(url, headers=headers, timeout=8)
-            if res.status_code != 200:
-                break
-
-            try:
-                tables = pd.read_html(io.StringIO(res.text), header=0, thousands=",")
-            except Exception:
-                break
-
-            target_table = None
-            for t in tables:
-                if t.shape[1] >= 8:
-                    target_table = t
-                    break
-
-            if target_table is None:
-                break
-
-            target_table = target_table.dropna(how="all")
-            if target_table.empty:
-                break
-
-            all_rows.append(target_table)
-
-            oldest_date_str = str(target_table.iloc[-1, 0]).strip()
-            try:
-                oldest_date = datetime.strptime(oldest_date_str, "%Y.%m.%d").date()
-                if oldest_date <= start_date_obj:
-                    break
-            except Exception:
-                pass
-
-        if not all_rows:
-            logger.warning(f"Naver 종목별 투자자 데이터 없음 (종목={stock_code})")
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code != 200:
+            logger.warning(f"Daum 종목 페이지 실패 (종목={stock_code}): HTTP {res.status_code}")
             return pd.DataFrame()
 
-        combined = pd.concat(all_rows, ignore_index=True)
-        combined = combined.iloc[:, :9]
-        combined.columns = [
-            "Date", "Close", "PrevDiff", "PctChange", "Volume",
-            "Institution_Shares", "Foreigner_Shares", "Foreigner_HoldShares", "Foreigner_Ratio"
-        ]
+        soup = BeautifulSoup(res.text, "html.parser")
 
-        combined["Date"] = pd.to_datetime(combined["Date"], format="%Y.%m.%d", errors="coerce")
-        combined = combined.dropna(subset=["Date"])
+        target_table = None
+        for table in soup.find_all("table"):
+            header_text = table.get_text()
+            if "외국인" in header_text and "기관" in header_text and "일자" in header_text:
+                target_table = table
+                break
 
-        for col in ["Close", "Institution_Shares", "Foreigner_Shares", "Volume"]:
-            combined[col] = (
-                combined[col].astype(str)
-                .str.replace(",", "", regex=False)
-                .str.replace("+", "", regex=False)
-                .str.strip()
+        if target_table is None:
+            logger.warning(f"Daum 종목 페이지: 외국인·기관 테이블을 찾지 못했습니다 (종목={stock_code}).")
+            return pd.DataFrame()
+
+        rows = target_table.find_all("tr")
+        if len(rows) < 2:
+            return pd.DataFrame()
+
+        def parse_signed_number(cell) -> float:
+            text = cell.get_text().strip()
+            is_negative = (
+                "down" in " ".join(cell.get("class", [])).lower()
+                or bool(cell.find(class_=re.compile("down", re.I)))
+                or text.startswith("-")
+                or text.startswith("▼")
             )
-            combined[col] = pd.to_numeric(combined[col], errors="coerce")
+            cleaned = re.sub(r"[^\d.]", "", text)
+            if not cleaned:
+                return 0.0
+            val = float(cleaned)
+            return -val if is_negative else val
 
-        combined = combined.dropna(subset=["Close", "Institution_Shares", "Foreigner_Shares"])
+        records = []
+        for row in rows[1:]:
+            cols = row.find_all("td")
+            if len(cols) < 6:
+                continue
 
-        if combined.empty:
-            logger.warning(f"Naver 종목별 투자자 데이터: 숫자 변환 후 유효한 행이 없습니다 (종목={stock_code}).")
+            date_text = cols[0].get_text().strip()
+            try:
+                month, day = date_text.split(".")
+                ref_year = datetime.now(ZoneInfo("Asia/Seoul")).year
+                row_date = datetime(ref_year, int(month), int(day)).date()
+                if row_date > datetime.now(ZoneInfo("Asia/Seoul")).date():
+                    row_date = row_date.replace(year=ref_year - 1)
+            except Exception:
+                continue
+
+            foreigner_shares = parse_signed_number(cols[1])
+            institution_shares = parse_signed_number(cols[3])
+
+            close_text = re.sub(r"[^\d.]", "", cols[4].get_text().strip())
+            close_price = float(close_text) if close_text else 0.0
+
+            if close_price <= 0:
+                continue
+
+            records.append({
+                "Date": pd.Timestamp(row_date),
+                "Close": close_price,
+                "Foreigner_Shares": foreigner_shares,
+                "Institution_Shares": institution_shares,
+            })
+
+        if not records:
             return pd.DataFrame()
 
-        # [신규] 정합성 검증: 종가가 비정상적으로 작거나(0 이하) 크면(1000억 이상)
-        # 컬럼이 잘못 매핑됐을 가능성이 높으므로 실패 처리합니다.
-        invalid_close_ratio = ((combined["Close"] <= 0) | (combined["Close"] > 1e11)).mean()
-        if invalid_close_ratio > 0.1:
-            logger.warning(
-                f"Naver 종목별 투자자 데이터: 종가 컬럼이 비정상적입니다 "
-                f"(비정상 비율 {invalid_close_ratio:.0%}, 종목={stock_code}). "
-                f"페이지 구조 변경이 의심되어 이 데이터를 사용하지 않습니다."
-            )
-            return pd.DataFrame()
-
-        # [신규] 거래량 대비 순매매 수량이 비정상적으로 크면(거래량의 2배 초과)
-        # 컬럼이 밀렸을 가능성이 높으므로 의심스러운 행은 제외합니다.
-        valid_mask = (
-            (combined["Foreigner_Shares"].abs() <= combined["Volume"] * 2 + 1)
-            & (combined["Institution_Shares"].abs() <= combined["Volume"] * 2 + 1)
-        )
-        combined = combined.loc[valid_mask].reset_index(drop=True)
-
-        if combined.empty:
-            logger.warning(f"Naver 종목별 투자자 데이터: 정합성 검증 후 남은 데이터가 없습니다 (종목={stock_code}).")
-            return pd.DataFrame()
-
-        combined["Foreigner_Daily"] = combined["Foreigner_Shares"] * combined["Close"]
-        combined["Institution_Daily"] = combined["Institution_Shares"] * combined["Close"]
-
-        combined = combined.sort_values("Date").reset_index(drop=True)
+        df = pd.DataFrame(records).sort_values("Date").reset_index(drop=True)
+        df["Foreigner_Daily"] = df["Foreigner_Shares"] * df["Close"]
+        df["Institution_Daily"] = df["Institution_Shares"] * df["Close"]
 
         mask = (
-            (combined["Date"].dt.date >= start_date_obj)
-            & (combined["Date"].dt.date <= end_date_obj)
+            (df["Date"].dt.date >= start_date_obj)
+            & (df["Date"].dt.date <= end_date_obj)
         )
-        combined = combined.loc[mask].reset_index(drop=True)
+        df = df.loc[mask].reset_index(drop=True)
 
-        if combined.empty:
-            return pd.DataFrame()
-
-        return combined[["Date", "Close", "Foreigner_Daily", "Institution_Daily"]]
+        return df[["Date", "Close", "Foreigner_Daily", "Institution_Daily"]]
 
     except Exception as e:
-        logger.warning(f"Naver 종목별 투자자 데이터 스크래핑 실패 (종목={stock_code}): {e}")
+        logger.warning(f"Daum 종목 페이지 스크래핑 실패 (종목={stock_code}): {e}")
         return pd.DataFrame()
 
 
+def _fetch_pykrx_investor_history(ticker_code: str, start_str: str, end_str: str) -> pd.DataFrame:
+    if not PYKRX_AVAILABLE:
+        return pd.DataFrame()
+
+    try:
+        df = stock.get_market_trading_value_by_date(start_str, end_str, ticker_code)
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.reset_index().rename(columns={"날짜": "Date"})
+        df["Date"] = pd.to_datetime(df["Date"])
+
+        col_map = {"외국인합계": "Foreigner_Daily", "기관합계": "Institution_Daily"}
+        for src_col, new_col in col_map.items():
+            df[new_col] = df[src_col] if src_col in df.columns else 0.0
+
+        price_df = stock.get_market_ohlcv_by_date(start_str, end_str, ticker_code)
+        if price_df is not None and not price_df.empty:
+            price_df = price_df.reset_index().rename(columns={"날짜": "Date", "종가": "Close"})
+            price_df["Date"] = pd.to_datetime(price_df["Date"])
+            df = df.merge(price_df[["Date", "Close"]], on="Date", how="left")
+        else:
+            df["Close"] = None
+
+        return df[["Date", "Close", "Foreigner_Daily", "Institution_Daily"]]
+    except Exception as e:
+        logger.warning(f"pykrx 수집 실패 (종목={ticker_code}): {e}")
+        return pd.DataFrame()
+
+
+def _cross_validate_investor_data(pykrx_df: pd.DataFrame, daum_df: pd.DataFrame) -> tuple[bool, float]:
+    """
+    두 독립 소스(pykrx, Daum)의 외국인 순매매 방향(+/-)이 겹치는 날짜에서
+    얼마나 일치하는지 계산합니다.
+    반환: (is_validated, agreement_ratio)
+    """
+    if pykrx_df.empty or daum_df.empty:
+        return False, 0.0
+
+    merged = pd.merge(
+        pykrx_df[["Date", "Foreigner_Daily"]].rename(columns={"Foreigner_Daily": "F_pykrx"}),
+        daum_df[["Date", "Foreigner_Daily"]].rename(columns={"Foreigner_Daily": "F_daum"}),
+        on="Date",
+        how="inner",
+    )
+
+    if merged.empty or len(merged) < 2:
+        return False, 0.0
+
+    same_sign = (
+        (merged["F_pykrx"] > 0) & (merged["F_daum"] > 0)
+    ) | (
+        (merged["F_pykrx"] < 0) & (merged["F_daum"] < 0)
+    )
+
+    agreement_ratio = same_sign.mean()
+    is_validated = agreement_ratio >= 0.7
+
+    return is_validated, float(agreement_ratio)
+
+
 # ==============================================================================
-# 10. 기준일(0점) 누적 수급 데이터 로더
-# 수집 순서: pykrx 실제 데이터 -> Naver 종목별 실제 데이터 -> 가격/거래량 추정치
+# 10. 기준일(0점) 누적 수급 데이터 로더 (pykrx ↔ Daum 실제 교차 검증)
 # ==============================================================================
 def estimate_flow_by_price_volume_heuristic(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
     """
     ⚠️ 주의: 이 함수는 실제 투자자별 데이터가 아닙니다.
-    pykrx와 네이버 스크래핑이 모두 실패했을 때만 호출되는, 가격 변동률과
+    pykrx와 Daum 교차 검증이 모두 실패했을 때만 호출되는, 가격 변동률과
     거래량만으로 만든 통계적 추정치이며, 실제 KRX 공시 수급과 다를 수 있습니다.
     """
     ticker_str = f"{stock_code}.KS" if not stock_code.endswith((".KS", ".KQ")) else stock_code
@@ -866,10 +900,13 @@ def estimate_flow_by_price_volume_heuristic(stock_code: str, start_date_obj, end
             df["Retail_Cum"] = df["Retail_Daily"].cumsum().round(1)
 
             df["is_estimated"] = True
+            df["source"] = "가격/거래량 기반 통계적 추정치"
+            df["cross_validated"] = False
 
             return df[[
                 "Date", "Close", "Foreigner_Daily", "Institution_Daily", "Retail_Daily",
-                "Foreigner_Cum", "Institution_Cum", "Retail_Cum", "is_estimated"
+                "Foreigner_Cum", "Institution_Cum", "Retail_Cum", "is_estimated",
+                "source", "cross_validated"
             ]]
     except Exception as e:
         logger.error(f"Fallback 수급 추정치 생성 실패: {e}")
@@ -880,78 +917,70 @@ def estimate_flow_by_price_volume_heuristic(stock_code: str, start_date_obj, end
 def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
     """
     외국인/기관/개인 누적 수급 시계열을 생성합니다.
-    수집 순서: 1순위 pykrx 실제 데이터 -> 2순위 네이버 종목별 실제 데이터 -> 3순위 추정치
+
+    [교차 검증 방식]
+    1. pykrx(1차)와 Daum 종목 페이지 스크래핑(2차, 완전 독립 소스)을 모두 수집합니다.
+    2. 두 소스가 겹치는 날짜의 외국인 순매매 방향(+/-) 일치율을 계산합니다.
+       - 일치율 70% 이상: cross_validated=True
+       - 일치율 70% 미만/데이터 부족: cross_validated=False (경고와 함께 pykrx 값 사용)
+    3. pykrx 자체가 실패하면 Daum 단독 데이터를 사용(단일 소스로 명시)
+    4. 둘 다 실패하면 가격/거래량 기반 추정치(is_estimated=True)로 대체
     """
     ticker_code = stock_code.replace('.KS', '').replace('.KQ', '')
     start_str = start_date_obj.strftime("%Y%m%d")
     end_str = end_date_obj.strftime("%Y%m%d")
 
-    if PYKRX_AVAILABLE:
-        try:
-            df = stock.get_market_trading_value_by_date(start_str, end_str, ticker_code)
+    pykrx_raw = _fetch_pykrx_investor_history(ticker_code, start_str, end_str)
+    daum_raw = fetch_daum_investor_daily_history(stock_code, start_date_obj, end_date_obj)
 
-            if df is not None and not df.empty:
-                df = df.reset_index().rename(columns={"날짜": "Date"})
-                df["Date"] = pd.to_datetime(df["Date"])
+    if not pykrx_raw.empty:
+        is_validated, agreement_ratio = _cross_validate_investor_data(pykrx_raw, daum_raw)
 
-                col_map = {
-                    "외국인합계": "Foreigner_Daily",
-                    "기관합계": "Institution_Daily",
-                    "개인": "Retail_Daily",
-                }
-                for src_col, new_col in col_map.items():
-                    df[new_col] = df[src_col] if src_col in df.columns else 0.0
+        df = pykrx_raw.copy()
+        df["Retail_Daily"] = -(df["Foreigner_Daily"] + df["Institution_Daily"])
+        df["Foreigner_Cum"] = df["Foreigner_Daily"].cumsum()
+        df["Institution_Cum"] = df["Institution_Daily"].cumsum()
+        df["Retail_Cum"] = df["Retail_Daily"].cumsum()
 
-                df["Foreigner_Cum"] = df["Foreigner_Daily"].cumsum()
-                df["Institution_Cum"] = df["Institution_Daily"].cumsum()
-                df["Retail_Cum"] = df["Retail_Daily"].cumsum()
+        df["is_estimated"] = False
+        df["cross_validated"] = is_validated
 
-                price_df = stock.get_market_ohlcv_by_date(start_str, end_str, ticker_code)
-                if price_df is not None and not price_df.empty:
-                    price_df = price_df.reset_index().rename(columns={"날짜": "Date", "종가": "Close"})
-                    price_df["Date"] = pd.to_datetime(price_df["Date"])
-                    df = df.merge(price_df[["Date", "Close"]], on="Date", how="left")
-                else:
-                    df["Close"] = None
+        if is_validated:
+            df["source"] = f"pykrx (실제 데이터, Daum 교차검증 일치율 {agreement_ratio:.0%})"
+            logger.info(f"교차 검증 성공 (종목={stock_code}, 일치율={agreement_ratio:.0%})")
+        elif not daum_raw.empty:
+            df["source"] = f"pykrx (실제 데이터, ⚠️ Daum 교차검증 불일치율 높음: 일치율 {agreement_ratio:.0%})"
+            logger.warning(f"교차 검증 불일치 (종목={stock_code}, 일치율={agreement_ratio:.0%})")
+        else:
+            df["source"] = "pykrx (실제 데이터, 단일 소스·교차검증 불가)"
+            logger.info(f"Daum 데이터 부족으로 교차 검증 불가 (종목={stock_code})")
 
-                df["is_estimated"] = False
-                df["source"] = "pykrx (실제 데이터)"
-
-                return df[[
-                    "Date", "Close",
-                    "Foreigner_Daily", "Institution_Daily", "Retail_Daily",
-                    "Foreigner_Cum", "Institution_Cum", "Retail_Cum",
-                    "is_estimated", "source",
-                ]]
-        except Exception as e:
-            logger.warning(f"pykrx 실제 수급 데이터 수집 실패, 네이버 대안 시도 (종목={stock_code}): {e}")
-    else:
-        logger.warning("pykrx 미설치: 네이버 실제 데이터 대안을 시도합니다.")
-
-    naver_df = fetch_naver_investor_daily_history(stock_code, start_date_obj, end_date_obj)
-    if naver_df is not None and not naver_df.empty and len(naver_df) >= 2:
-        naver_df = naver_df.copy()
-        naver_df["Retail_Daily"] = -(naver_df["Foreigner_Daily"] + naver_df["Institution_Daily"])
-
-        naver_df["Foreigner_Cum"] = naver_df["Foreigner_Daily"].cumsum()
-        naver_df["Institution_Cum"] = naver_df["Institution_Daily"].cumsum()
-        naver_df["Retail_Cum"] = naver_df["Retail_Daily"].cumsum()
-
-        naver_df["is_estimated"] = False
-        naver_df["source"] = "Naver 금융 (실제 데이터, 순매매수량×종가 환산)"
-
-        logger.info(f"pykrx 실패, Naver 실제 데이터로 대체 성공 (종목={stock_code})")
-
-        return naver_df[[
+        return df[[
             "Date", "Close",
             "Foreigner_Daily", "Institution_Daily", "Retail_Daily",
             "Foreigner_Cum", "Institution_Cum", "Retail_Cum",
-            "is_estimated", "source",
+            "is_estimated", "source", "cross_validated",
         ]]
 
-    logger.error(f"pykrx, Naver 모두 실패. 가격/거래량 기반 추정치로 대체합니다 (종목={stock_code}).")
-    fallback_df = estimate_flow_by_price_volume_heuristic(stock_code, start_date_obj, end_date_obj)
-    if fallback_df is not None and not fallback_df.empty:
-        fallback_df = fallback_df.copy()
-        fallback_df["source"] = "가격/거래량 기반 통계적 추정치"
-    return fallback_df
+    if not daum_raw.empty and len(daum_raw) >= 2:
+        df = daum_raw.copy()
+        df["Retail_Daily"] = -(df["Foreigner_Daily"] + df["Institution_Daily"])
+        df["Foreigner_Cum"] = df["Foreigner_Daily"].cumsum()
+        df["Institution_Cum"] = df["Institution_Daily"].cumsum()
+        df["Retail_Cum"] = df["Retail_Daily"].cumsum()
+
+        df["is_estimated"] = False
+        df["cross_validated"] = False
+        df["source"] = "Daum 금융 (실제 데이터, pykrx 실패로 단일 소스 사용·교차검증 불가)"
+
+        logger.warning(f"pykrx 실패, Daum 단독 데이터로 대체 (종목={stock_code})")
+
+        return df[[
+            "Date", "Close",
+            "Foreigner_Daily", "Institution_Daily", "Retail_Daily",
+            "Foreigner_Cum", "Institution_Cum", "Retail_Cum",
+            "is_estimated", "source", "cross_validated",
+        ]]
+
+    logger.error(f"pykrx, Daum 모두 실패. 가격/거래량 기반 추정치로 대체합니다 (종목={stock_code}).")
+    return estimate_flow_by_price_volume_heuristic(stock_code, start_date_obj, end_date_obj)
