@@ -253,57 +253,68 @@ def get_collected_macro_data():
             else:
                 collected[cat_name].append({"name": name, "status": "fail"})
 
+    target_cat = next((c for c in collected.keys() if "아시아" in c), None)
+
+    def _inject_scraped_item(label_prefix: str, data: dict):
+        """스크래핑 결과를 collected[target_cat]에 표준 포맷으로 추가하는 헬퍼"""
+        if target_cat is None or data is None:
+            return
+
+        price = data.get("price")
+        prev = data.get("prev_close")
+        is_estimated = data.get("is_estimated", True)
+        source = data.get("source", "알수없음")
+        contract_month = data.get("contract_month")
+
+        estimate_tag = " (추정)" if is_estimated else ""
+        month_tag = f" [{contract_month}]" if contract_month else " [월물 정보 없음]"
+        label = f"{label_prefix}{estimate_tag}{month_tag} :gray[[출처: {source}]]"
+
+        if price is not None and prev is not None:
+            delta = price - prev
+            pct = (delta / prev) * 100 if prev != 0 else 0.0
+            collected[target_cat].append({
+                "name": label,
+                "price": price,
+                "delta": delta,
+                "pct": pct,
+                "price_str": f"{price:,.2f}",
+                "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
+                "prev_str": f"{prev:,.2f}",
+                "status": "ok",
+                "is_estimated": is_estimated,
+                "contract_month": contract_month,
+                "source": source,
+            })
+        else:
+            collected[target_cat].append({"name": label, "status": "fail"})
+
     # ==========================================================================
-    # [신규] KOSPI200 야간선물(CME 연계) — 비공식 스크래핑
-    # (TradingView -> Investing.com -> KODEX 200 프록시 추정)
-    # 몇 월물인지(contract_month)와 데이터 출처(source)를 라벨에 함께 표시
+    # [신규] KOSPI200 야간선물 (CME 연계) — 비공식 스크래핑
     # ==========================================================================
     try:
         from services.night_futures_scraper_service import get_kospi_night_futures
-
-        night_data = get_kospi_night_futures()
-        target_cat = next(
-            (c for c in collected.keys() if "아시아" in c),
-            None,
-        )
-
-        if target_cat is not None:
-            price = night_data.get("price")
-            prev = night_data.get("prev_close")
-            is_estimated = night_data.get("is_estimated", True)
-            source = night_data.get("source", "알수없음")
-            contract_month = night_data.get("contract_month")
-
-            estimate_tag = " (추정)" if is_estimated else ""
-            month_tag = f" [{contract_month}]" if contract_month else " [월물 정보 없음]"
-            label = (
-                f"코스피200 야간선물 (CME 연계){estimate_tag}{month_tag} "
-                f":gray[[출처: {source}]]"
-            )
-
-            if price is not None and prev is not None:
-                delta = price - prev
-                pct = (delta / prev) * 100 if prev != 0 else 0.0
-                collected[target_cat].append({
-                    "name": label,
-                    "price": price,
-                    "delta": delta,
-                    "pct": pct,
-                    "price_str": f"{price:,.2f}",
-                    "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
-                    "prev_str": f"{prev:,.2f}",
-                    "status": "ok",
-                    "is_estimated": is_estimated,
-                    "contract_month": contract_month,
-                    "source": source,
-                })
-            else:
-                collected[target_cat].append({
-                    "name": label,
-                    "status": "fail",
-                })
+        _inject_scraped_item("코스피200 야간선물 (CME 연계)", get_kospi_night_futures())
     except Exception as e:
         logger.warning(f"KOSPI200 야간선물 스크래핑 주입 실패: {e}")
+
+    # ==========================================================================
+    # [신규] 닛케이225 선물 — 비공식 스크래핑
+    # ==========================================================================
+    try:
+        from services.foreign_index_futures_scraper_service import get_nikkei225_futures
+        _inject_scraped_item("닛케이225 선물", get_nikkei225_futures())
+    except Exception as e:
+        logger.warning(f"닛케이225 선물 스크래핑 주입 실패: {e}")
+
+    # ==========================================================================
+    # [신규] 항셍 선물 — 비공식 스크래핑
+    # ==========================================================================
+    try:
+        from services.foreign_index_futures_scraper_service import get_hangseng_futures
+        _inject_scraped_item("항셍 선물", get_hangseng_futures())
+    except Exception as e:
+        logger.warning(f"항셍 선물 스크래핑 주입 실패: {e}")
 
     return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
     
