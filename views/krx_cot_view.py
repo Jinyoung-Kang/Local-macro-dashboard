@@ -1,7 +1,13 @@
 """
 views/krx_cot_view.py
 🇰🇷 국내 파생상품 수급 & COT 한국판 대시보드 뷰
-기존 UI(미결제약정 4대 국면, 베이시스 차트 등) 완벽 보존 및 중앙 AI 레지스트리 / 자동 번역 연동
+KOSPI 200 선물, 미결제약정(OI), 베이시스, 투자자별 포지션 분석
+
+[수정 사항]
+- get_krx_futures_history()가 반환하는 'is_estimated' 컬럼을 확인하여
+  KRX 실제 데이터가 아닌 KODEX 200 프록시 추정치일 경우 명확한 경고 표시.
+- get_krx_investor_derivatives_summary()가 반환하는 'is_placeholder' 컬럼을 확인하여
+  투자자별 수급표가 실제 데이터가 아닌 예시(placeholder)임을 항상 경고.
 """
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -11,12 +17,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 from config import get_krx_key
+from services.ai_service import ask_krx_cot_agent
 from services.krx_service import get_krx_futures_history, get_krx_investor_derivatives_summary
-from services.ai_service import (
-    call_selected_ai_engine,
-    get_ai_engine_options,
-    format_ai_engine
-)
+
 
 def render_krx_cot_view():
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
@@ -36,7 +39,7 @@ def render_krx_cot_view():
 
     auth_key = get_krx_key()
     if not auth_key:
-        st.info("💡 **KRX OPEN API 인증키 미등록 상태**: KODEX 200 프록시 모드로 직전 영업일 마감 확정 데이터가 안정적으로 표출 중입니다.")
+        st.info("💡 **KRX OPEN API 인증키 미등록 상태**: 실제 KRX 확정 데이터를 가져올 수 없어 KODEX 200 프록시 추정 모드로 동작합니다. 아래 배너에서 실제/추정 여부를 반드시 확인하세요.")
 
     # 컨트롤 패널
     c1, c2, c3 = st.columns([1.5, 2, 1])
@@ -63,6 +66,21 @@ def render_krx_cot_view():
         st.warning("⚠️ 파생상품 시계열 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
         return
 
+    # ==========================================================================
+    # [신규] 선물 시계열 실제/추정 여부 경고 배너
+    # ==========================================================================
+    hist_is_estimated = bool(df_hist["is_estimated"].iloc[-1]) if "is_estimated" in df_hist.columns else True
+
+    if hist_is_estimated:
+        st.error(
+            "🔴 **KRX 실제 데이터 수집 실패**\n\n"
+            "KRX OpenAPI 응답이 없어, 아래 선물 종가·미결제약정·베이시스는 "
+            "KODEX 200(069500.KS) 가격 기반 **통계적 추정치**입니다. "
+            "실제 KOSPI 200 선물 시세와 다를 수 있으니 투자 판단에 사용하지 마십시오."
+        )
+    else:
+        st.caption("✅ KRX OpenAPI 공식 확정 데이터 기준입니다.")
+
     latest = df_hist.iloc[-1]
     prev = df_hist.iloc[-2] if len(df_hist) > 1 else latest
     data_date_str = latest["Date"].strftime("%Y-%m-%d") if hasattr(latest["Date"], "strftime") else str(latest["Date"])[:10]
@@ -81,7 +99,7 @@ def render_krx_cot_view():
     fut_close = safe_val(latest.get("Futures_Close"), safe_val(prev.get("Futures_Close"), 365.20))
     chg_pct = safe_val(latest.get("Change_Pct"), 0.0)
     m_basis = safe_val(latest.get("Market_Basis"), safe_val(prev.get("Market_Basis"), 0.75))
-    
+
     oi_val = int(safe_val(latest.get("Open_Interest"), safe_val(prev.get("Open_Interest"), 285000)))
     oi_prev_val = int(safe_val(prev.get("Open_Interest"), oi_val))
     oi_delta = int(safe_val(latest.get("OI_Change"), oi_val - oi_prev_val))
@@ -89,10 +107,12 @@ def render_krx_cot_view():
     m_phase = str(latest.get("Market_Phase", "신규 롱 (Long Accumulation)"))
     cot_oi_idx = safe_val(latest.get("COT_OI_Index"), 50.0)
 
+    estimate_suffix = " (추정)" if hist_is_estimated else ""
+
     # 데이터 기준일자 배너 (직전 영업일 확정치 안내)
     st.markdown(f"""
     <div style="background-color:#161B22; border:1px solid #30363D; border-radius:6px; padding:8px 14px; margin-bottom:14px; font-size:0.88rem; color:#8B949E; display:flex; justify-content:space-between; align-items:center;">
-        <span>📅 <strong>데이터 확정 기준일</strong>: <span style="color:#58A6FF;">{data_date_str} (직전 영업일 장마감 확정 데이터)</span></span>
+        <span>📅 <strong>데이터 확정 기준일</strong>: <span style="color:#58A6FF;">{data_date_str}{estimate_suffix}</span></span>
         <span>🏷️ 대상 상품: <strong>{latest.get('Contract_Name', 'KOSPI 200 선물')}</strong></span>
     </div>
     """, unsafe_allow_html=True)
@@ -103,14 +123,14 @@ def render_krx_cot_view():
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric(
-            label="KOSPI 200 선물 종가",
+            label=f"KOSPI 200 선물 종가{estimate_suffix}",
             value=f"{fut_close:,.2f} pt",
             delta=f"{chg_pct:+.2f}%"
         )
         st.caption(f"💡 기준: {data_date_str} 종가 확정치")
     with m2:
         st.metric(
-            label="미결제약정 (Open Interest)",
+            label=f"미결제약정 (Open Interest){estimate_suffix}",
             value=f"{oi_val:,} 계약",
             delta=f"{oi_delta:+,} 계약"
         )
@@ -118,7 +138,7 @@ def render_krx_cot_view():
     with m3:
         basis_state = "콘탱고 (정배열)" if m_basis >= 0 else "백워데이션 (역배열)"
         st.metric(
-            label="시장 베이시스 (Basis)",
+            label=f"시장 베이시스 (Basis){estimate_suffix}",
             value=f"{m_basis:+.2f} pt",
             delta=basis_state,
             delta_color="normal" if m_basis >= 0 else "inverse"
@@ -138,8 +158,8 @@ def render_krx_cot_view():
     # ==========================================================================
     # 2. 메인 복합 차트
     # ==========================================================================
-    st.markdown("#### 📈 KOSPI 200 선물 가격 & 미결제약정(OI) 추이")
-    
+    st.markdown(f"#### 📈 KOSPI 200 선물 가격 & 미결제약정(OI) 추이{estimate_suffix}")
+
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
@@ -204,7 +224,7 @@ def render_krx_cot_view():
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hovermode="x unified"
     )
-    
+
     fig.update_yaxes(title_text="선물 지수 (pt)", row=1, col=1, gridcolor="#21262D")
     fig.update_yaxes(title_text="베이시스", row=2, col=1, gridcolor="#21262D")
     fig.update_yaxes(title_text="계약 수", row=3, col=1, gridcolor="#21262D")
@@ -275,9 +295,26 @@ def render_krx_cot_view():
         """, unsafe_allow_html=True)
 
     with col_right:
-        st.markdown("#### 🏛️ 투자 주체별 선물 누적 수급 (추정)")
+        st.markdown("#### 🏛️ 투자 주체별 선물 누적 수급")
+
+        # ======================================================================
+        # [신규] 투자자별 수급표 placeholder 경고 (필수)
+        # ======================================================================
+        inv_is_placeholder = bool(
+            df_investors["is_placeholder"].iloc[0]
+        ) if "is_placeholder" in df_investors.columns and not df_investors.empty else True
+
+        if inv_is_placeholder:
+            st.warning(
+                "⚠️ **예시 데이터 안내**\n\n"
+                "아래 투자 주체별 누적 수급표는 실제 KRX 투자자별 선물 거래 데이터가 "
+                "아직 연동되지 않아 표시된 **고정 예시(placeholder) 수치**입니다. "
+                "날짜가 바뀌어도 값이 변하지 않으며, 실제 투자 판단에 사용해서는 안 됩니다."
+            )
+
+        display_cols = [c for c in df_investors.columns if c != "is_placeholder"]
         st.dataframe(
-            df_investors,
+            df_investors[display_cols],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -294,49 +331,48 @@ def render_krx_cot_view():
     # ==========================================================================
     st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
     st.markdown("#### 🤖 AI 파생 수급 & 스마트머니 종합 진단")
-    
-    col_ai1, col_ai2 = st.columns([1, 2])
-    with col_ai1:
-        selected_engine = st.selectbox(
-            "실행할 AI 분석 엔진 직접 선택",
-            options=get_ai_engine_options(include_auto=True),
-            format_func=format_ai_engine,
-            index=0,
-            key="krx_cot_ai_engine"
+
+    if hist_is_estimated or inv_is_placeholder:
+        st.info(
+            "ℹ️ 현재 입력 데이터 중 일부가 추정치/예시 데이터이므로, "
+            "아래 AI 분석 결과도 참고용으로만 활용하시기 바랍니다."
         )
 
+    engine_options = [
+        "자동 탐색 (Failover 무중단)",
+        "NVIDIA NIM (Nemotron-3-Super)",
+        "Cloudflare (DeepSeek-R1 번역)",
+        "NVIDIA NIM (GPT-OSS-20B)",
+        "Cerebras Cloud (Llama-3.3)"
+    ]
+
+    col_ai1, col_ai2 = st.columns([1, 2])
+    with col_ai1:
+        selected_engine = st.selectbox("실행할 AI 분석 엔진 직접 선택", options=engine_options, index=0)
+
     if st.button("🧠 현재 파생 수급 기반 투자 가설 & 심층 결론 리포트 생성", use_container_width=True):
-        with st.spinner(f"[{format_ai_engine(selected_engine)}] 파이프라인을 통해 정밀 마크다운 리포트를 렌더링하고 있습니다..."):
+        with st.spinner(f"[{selected_engine}] 파이프라인을 통해 정밀 마크다운 리포트를 렌더링하고 있습니다..."):
             prompt = f"""
             [KOSPI 200 Derivatives Market Data]
             - Date: {data_date_str} (Analysis Time: {now_str})
+            - Data Quality: {"ESTIMATED/PROXY (not official KRX data)" if hist_is_estimated else "OFFICIAL KRX DATA"}
             - Target: {latest.get('Contract_Name', 'KOSPI 200 선물')}
             - Futures Close: {fut_close:,.2f} pt ({chg_pct:+.2f}%)
             - Market Basis: {m_basis:+.2f} pt ({basis_state})
             - Open Interest (OI): {oi_val:,} contracts (Daily Change: {oi_delta:+,} contracts)
             - Market Phase: {m_phase}
             - COT OI Index: {cot_oi_idx:.1f}% (0%=Extreme Oversold, 100%=Extreme Overbought)
-            - 20-Day Cumulative Net Position: Foreigners +38,500 contracts (Long), Financial Investment (Arbitrage Hedge) -24,100 contracts (Short), Retail -7,600 contracts (Short).
+            - Investor Data Quality: {"PLACEHOLDER EXAMPLE DATA, not real" if inv_is_placeholder else "REAL"}
 
             Analyze the above data according to the KRX_DERIVATIVES_PROMPT rules and output the full 4-part structured report with Markdown tables and action playbook.
+            If Data Quality is ESTIMATED or PLACEHOLDER, explicitly warn the reader in the conclusion section.
             """
-            
-            ai_res = call_selected_ai_engine(
-                engine_name=selected_engine,
-                prompt=prompt,
-                system_prompt="당신은 최고 파생상품 퀀트 전략가입니다. KRX 선물 시장의 베이시스, 미결제약정 변화 및 수급 주체별 포지션을 기반으로 단기 스퀴즈 가능성과 옵션 만기 대응 전략을 분석하십시오."
-            )
-            
+
+            ai_res = ask_krx_cot_agent(prompt, selected_engine)
+
             st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
             with st.container(border=True):
                 step_info = ai_res.get("pipeline_step", "AI 응답 완료")
                 st.caption(f"⚡ **실행 엔진 파이프라인**: `{step_info}`")
-                
-                if ai_res.get("translation_info"):
-                    st.caption(f"🌐 {ai_res['translation_info']}")
-                if ai_res.get("original_response"):
-                    with st.expander("🔍 번역 전 AI 원문 확인", expanded=False):
-                        st.markdown(ai_res["original_response"])
-                        
                 st.divider()
                 st.markdown(ai_res.get("response", ""))
