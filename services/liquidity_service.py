@@ -3,6 +3,7 @@ services/liquidity_service.py
 연준 순유동성(Fed Net Liquidity) 지표 수집 및 분석 서비스 모듈
 (WALCL, WTREGEN, RRPONTSYD 수집, 단위 정규화 및 무중단 Fallback 탑재 + 병렬 수집 최적화)
 
+
 """
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -19,19 +20,34 @@ logger = logging.getLogger(__name__)
 
 
 def get_fred_key() -> str:
-    """Streamlit Secrets에서 FRED API 키 추출"""
+    """
+    Streamlit Secrets에서 FRED API 키를 안전하게 추출.
+    dict, AttrDict, Mapping 등 어떤 타입으로 반환되든 .get()으로 시도하며,
+    isinstance(val, dict) 검사에 의존하지 않음.
+    """
     try:
         if hasattr(st, "secrets") and st.secrets:
             if "fred" in st.secrets:
-                val = st.secrets["fred"]
-                if isinstance(val, dict) and "api_key" in val:
-                    return str(val["api_key"]).strip()
-                return str(val).strip()
+                section = st.secrets["fred"]
+
+                key = None
+                try:
+                    key = section.get("api_key")
+                except AttributeError:
+                    pass
+
+                if key:
+                    return str(key).strip()
+
+                # section 자체가 문자열 하나로 등록된 경우 (예: fred = "xxxx")
+                if isinstance(section, str):
+                    return section.strip()
+
             for k in ["FRED_API_KEY", "fred_api_key", "FRED_KEY", "fred_key"]:
                 if k in st.secrets:
                     return str(st.secrets[k]).strip()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"FRED 키 로드 중 예외: {e}")
     return ""
 
 
@@ -76,7 +92,6 @@ def _parse_fred_csv(csv_text: str, series_id: str) -> pd.DataFrame:
     df = raw_df.set_index(date_col)
     df = df.replace(".", pd.NA)
 
-    # 첫 번째 값 컬럼을 series_id로 통일 (컬럼명이 series_id와 다를 수 있음)
     value_col = [c for c in df.columns if c != date_col][0]
     df = df[[value_col]].rename(columns={value_col: series_id})
     df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
@@ -111,8 +126,6 @@ def fetch_fred_series_raw(series_id: str, period_years: int = 10) -> tuple[pd.Da
     """
     개별 FRED 시계열 수집 (API -> Web CSV -> 비상 Fallback)
     반환: (DataFrame, is_estimated)
-        - is_estimated=False: FRED API 또는 공식 웹 CSV에서 수집한 실제 데이터
-        - is_estimated=True : 두 경로 모두 실패하여 통계적 추정치를 사용한 경우
     """
     fred_key = get_fred_key()
     start_date = (datetime.now() - timedelta(days=period_years * 365 + 90)).strftime("%Y-%m-%d")
@@ -137,7 +150,10 @@ def fetch_fred_series_raw(series_id: str, period_years: int = 10) -> tuple[pd.Da
                     if not df.empty and len(df) >= 2:
                         return df, False
             else:
-                logger.warning(f"FRED API 응답 실패 ({series_id}): HTTP {res.status_code}")
+                logger.warning(
+                    f"FRED API 응답 실패 ({series_id}): "
+                    f"HTTP {res.status_code} - {res.text[:300]}"
+                )
         except Exception as e:
             logger.warning(f"FRED API 실패 ({series_id}): {e}")
     else:
@@ -177,8 +193,6 @@ def get_fed_liquidity_data(period_years: int = 10) -> pd.DataFrame:
     3개 시계열을 ThreadPoolExecutor를 통해 병렬로 수집하여 로딩 속도를 최적화합니다.
 
     반환 DataFrame에는 'is_estimated' 컬럼이 포함됩니다.
-    - False: 3개 시계열 모두 FRED 실제 데이터
-    - True : 3개 시계열 중 하나 이상이 통계적 추정 Fallback으로 대체됨
     """
     with ThreadPoolExecutor(max_workers=3) as executor:
         fut_walcl = executor.submit(fetch_fred_series_raw, "WALCL", period_years)
@@ -194,13 +208,11 @@ def get_fed_liquidity_data(period_years: int = 10) -> pd.DataFrame:
 
     any_estimated = bool(est_walcl or est_wtre or est_rrp)
 
-    # 인덱스 표준화 (날짜 시간대 제거)
     for df in [df_walcl, df_wtre, df_rrp]:
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
         df.index = df.index.normalize()
 
-    # 병합 및 결측치 전방 채우기(Forward Fill)
     combined = pd.DataFrame(
         index=df_walcl.index.union(df_wtre.index).union(df_rrp.index)
     ).sort_index()
@@ -213,7 +225,6 @@ def get_fed_liquidity_data(period_years: int = 10) -> pd.DataFrame:
     if combined.empty:
         return pd.DataFrame()
 
-    # RRP 단위 정규화: RRPONTSYD가 $B(십억 달러) 단위인 경우 $M(백만 달러)로 환산
     rrp_max = combined['RRPONTSYD'].max()
     if rrp_max < 10000:
         combined['RRP_M'] = combined['RRPONTSYD'] * 1000.0
@@ -222,20 +233,16 @@ def get_fed_liquidity_data(period_years: int = 10) -> pd.DataFrame:
         combined['RRP_M'] = combined['RRPONTSYD']
         combined['RRP_B'] = combined['RRPONTSYD'] / 1000.0
 
-    # 순유동성 계산 (단위: $M)
     combined['Net_Liquidity_M'] = combined['WALCL'] - combined['WTREGEN'] - combined['RRP_M']
 
-    # 조 단위($T) 및 십억 단위($B) 파생 컬럼 생성
     combined['Net_Liquidity_T'] = combined['Net_Liquidity_M'] / 1e6
     combined['WALCL_T'] = combined['WALCL'] / 1e6
     combined['WTREGEN_B'] = combined['WTREGEN'] / 1e3
     combined['WTREGEN_T'] = combined['WTREGEN'] / 1e6
 
-    # 호환성 컬럼
     combined['Net_Liquidity'] = combined['Net_Liquidity_T']
     combined['Date'] = combined.index
 
-    # 실제/추정 여부 플래그 (모든 행에 동일하게 부여)
     combined['is_estimated'] = any_estimated
 
     return combined
