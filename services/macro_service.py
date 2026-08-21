@@ -254,28 +254,32 @@ def get_collected_macro_data():
                 collected[cat_name].append({"name": name, "status": "fail"})
 
     # ==========================================================================
-    # [신규] KOSPI200 야간선물(KIS 웹소켓, CME 연계) 주입
-    # "아시아 주요 주가지수" 카테고리에 추가 (없으면 조용히 건너뜀)
+    # [신규] KOSPI200 야간선물(CME 연계) — 비공식 스크래핑 (TradingView -> Investing.com -> 추정)
+    # "아시아 주요 주가지수" 카테고리에 추가
     # ==========================================================================
     try:
-        from services.kis_websocket_service import get_night_futures_snapshot
+        from services.night_futures_scraper_service import get_kospi_night_futures
 
-        night_snapshot = get_night_futures_snapshot()
+        night_data = get_kospi_night_futures()
         target_cat = next(
             (c for c in collected.keys() if "아시아" in c),
             None,
         )
 
         if target_cat is not None:
-            price = night_snapshot.get("price")
-            prev = night_snapshot.get("prev_close")
-            is_connected = night_snapshot.get("is_connected", False)
+            price = night_data.get("price")
+            prev = night_data.get("prev_close")
+            is_estimated = night_data.get("is_estimated", True)
+            source = night_data.get("source", "알수없음")
 
-            if is_connected and price is not None and prev is not None:
+            estimate_tag = " (추정)" if is_estimated else ""
+            label = f"코스피200 야간선물 (CME 연계){estimate_tag} :gray[[{source}]]"
+
+            if price is not None and prev is not None:
                 delta = price - prev
                 pct = (delta / prev) * 100 if prev != 0 else 0.0
                 collected[target_cat].append({
-                    "name": "코스피200 야간선물 (CME 연계) :gray[[웹소켓 실시간]]",
+                    "name": label,
                     "price": price,
                     "delta": delta,
                     "pct": pct,
@@ -283,17 +287,18 @@ def get_collected_macro_data():
                     "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
                     "prev_str": f"{prev:,.2f}",
                     "status": "ok",
+                    "is_estimated": is_estimated,
                 })
             else:
                 collected[target_cat].append({
-                    "name": "코스피200 야간선물 (CME 연계) :gray[[웹소켓 실시간]]",
+                    "name": label,
                     "status": "fail",
                 })
     except Exception as e:
-        logger.warning(f"야간선물 웹소켓 데이터 주입 실패: {e}")
+        logger.warning(f"KOSPI200 야간선물 스크래핑 주입 실패: {e}")
 
     return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
-
+    
 # ==============================================================================
 # 4. 리스크 지표 요약 헬퍼 및 전체 매크로 원본 텍스트 생성기
 # ==============================================================================
