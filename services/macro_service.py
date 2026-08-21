@@ -9,7 +9,6 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import streamlit as st
@@ -47,7 +46,7 @@ def get_fred_key() -> str:
 
 
 # ==============================================================================
-# 1. UI 헬퍼 및 브리핑 생성기
+# 1. UI 헬퍼 및 텍스트 레이블 정제기
 # ==============================================================================
 def clean_tag_ui(tag_str: str) -> str:
     """UI 상에 지표 이름의 마크다운 스타일 태그(:gray[...], [[...]] 등)를 정제"""
@@ -59,79 +58,12 @@ def clean_tag_ui(tag_str: str) -> str:
     return clean.strip()
 
 
-def generate_briefing_text(
-    collected_data,
-    rate_10y_curr=None,
-    rate_10y_prev=None,
-    rate_2y_curr=None,
-    rate_2y_prev=None,
-    vix_hist=None,
-    move_hist=None,
-    hy_df=None,
-    cp_spread_df=None,
-    stlfsi_df=None,
-    now_str_kst=None,
-    *args,
-    **kwargs
-) -> str:
-    """수집된 매크로 데이터를 바탕으로 시장 국면 자동 브리핑 요약문 생성"""
-    lines = []
-    ts = now_str_kst or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines.append(f"📌 **[{ts} KST] 글로벌 매크로 및 금융시장 동향 브리핑**\n")
-
-    # 1. 금리 및 장단기 스프레드
-    if rate_10y_curr is not None and rate_2y_curr is not None:
-        spread = rate_10y_curr - rate_2y_curr
-        spread_status = "정상화(확대)" if spread > 0 else "역전(경기침체 경고)"
-        lines.append(
-            f"- **미국 국채 금리**: 10Y `{rate_10y_curr:.2f}%`, 2Y `{rate_2y_curr:.2f}%` "
-            f"(10Y-2Y 스프레드: `{spread:+.3f}%p` - **{spread_status}**)"
-        )
-
-    # 2. 시장 리스크 및 변동성 지표
-    risk_items = []
-    if vix_hist is not None and isinstance(vix_hist, pd.DataFrame) and not vix_hist.empty:
-        vix_val = vix_hist.iloc[:, 0].iloc[-1] if "Close" not in vix_hist.columns else vix_hist["Close"].iloc[-1]
-        risk_items.append(f"VIX `{vix_val:.2f}`")
-    if move_hist is not None and isinstance(move_hist, pd.DataFrame) and not move_hist.empty:
-        move_val = move_hist.iloc[:, 0].iloc[-1] if "Close" not in move_hist.columns else move_hist["Close"].iloc[-1]
-        risk_items.append(f"MOVE `{move_val:.2f}`")
-    if hy_df is not None and isinstance(hy_df, pd.DataFrame) and not hy_df.empty:
-        hy_val = hy_df.iloc[:, 0].iloc[-1]
-        risk_items.append(f"HY 스프레드 `{hy_val:.2f}%`")
-    if cp_spread_df is not None and isinstance(cp_spread_df, pd.DataFrame) and not cp_spread_df.empty:
-        cp_val = cp_spread_df.iloc[:, 0].iloc[-1]
-        risk_items.append(f"3M CP 스프레드 `{cp_val:.2f}%p`")
-    if stlfsi_df is not None and isinstance(stlfsi_df, pd.DataFrame) and not stlfsi_df.empty:
-        stlfsi_val = stlfsi_df.iloc[:, 0].iloc[-1]
-        risk_items.append(f"STLFSI4 `{stlfsi_val:.3f}`")
-
-    if risk_items:
-        lines.append(f"- **금융 스트레스 & 변동성**: {', '.join(risk_items)}")
-
-    # 3. 주요 자산 변동 하이라이트 (±1.0% 이상)
-    movers = []
-    if isinstance(collected_data, dict):
-        for cat_name, items in collected_data.items():
-            if isinstance(items, list):
-                for it in items:
-                    if isinstance(it, dict) and it.get("status") == "ok":
-                        pct = abs(it.get("pct", 0))
-                        if pct >= 1.0:
-                            movers.append(f"{it.get('name', '')} ({it.get('delta_str', '')})")
-
-    if movers:
-        lines.append(f"- **주요 시장 변동 자산(±1% 이상)**: {', '.join(movers[:6])}")
-
-    lines.append("\n💡 *본 데이터는 FRED 및 실시간 시장 지표를 기반으로 자동 집계된 브리핑입니다.*")
-    return "\n".join(lines)
-
-
 # ==============================================================================
-# 2. yfinance / FRED 데이터 수집 엔진
+# 2. yfinance / FRED 데이터 수집 엔진 (DatetimeIndex 보존)
 # ==============================================================================
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_ticker_data(symbol: str, period: str = "1mo", interval: str = "1d") -> pd.DataFrame:
+    """단일 티커 yfinance 데이터 수집 (DatetimeIndex 보존 및 ^MOVE 특수 처리)"""
     if not symbol:
         return pd.DataFrame()
 
@@ -163,6 +95,7 @@ def fetch_ticker_data(symbol: str, period: str = "1mo", interval: str = "1d") ->
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = None) -> pd.DataFrame:
+    """FRED 시계열 수집 (DatetimeIndex 인덱스 및 series_id 컬럼명 매핑)"""
     key = api_key or get_fred_key()
     start_date = (datetime.now() - timedelta(days=period_years * 365 + 60)).strftime("%Y-%m-%d")
 
@@ -209,6 +142,7 @@ def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = Non
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
+    """FRED Commercial Paper Spread (30일물 CP vs 3개월 국채, 컬럼명: CP_SPREAD)"""
     key = api_key or get_fred_key()
     df_cp = fetch_fred_series("CPF3M", api_key=key)
     df_tb = fetch_fred_series("DGS3MO", api_key=key)
@@ -224,10 +158,14 @@ def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 3. 매크로 데이터 병렬 수집
+# 3. 매크로 데이터 병렬 수집 (views/macro_view.py 원본 계약 완전 준수)
 # ==============================================================================
 @st.cache_data(ttl=30, show_spinner=False)
 def get_collected_macro_data():
+    """
+    모든 거시경제 티커를 ThreadPoolExecutor로 병렬 수집한 후
+    views/macro_view.py가 요구하는 카테고리별 리스트 구조로 반환
+    """
     collected = {}
     rate_10y_curr, rate_10y_prev = None, None
     rate_2y_curr, rate_2y_prev = None, None
@@ -299,10 +237,29 @@ def get_collected_macro_data():
 
 
 # ==============================================================================
-# 4. AI Context 주입용 금융 리스크 요약 및 전체 매크로 텍스트 생성기
+# 4. AI Context 주입용 금융 리스크 요약 및 수집
 # ==============================================================================
-def summarize_series_for_ai(df: pd.DataFrame, value_col: str = None, label: str = "") -> str:
-    """시계열을 AI Context용 최신값·직전 변화·백분위 문장으로 요약."""
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_macro_risk_indicators_for_ai() -> dict:
+    """
+    AI Context용 금융 리스크·변동성 지표 수집.
+    """
+    return {
+        "VIX": fetch_ticker_data("^VIX", period="3mo"),
+        "MOVE": fetch_ticker_data("^MOVE", period="3mo"),
+        "HY_OAS": fetch_fred_series("BAMLH0A0HYM2", period_years=3),
+        "CP_SPREAD": fetch_fred_cp_spread(),
+        "STLFSI4": fetch_fred_series("STLFSI4", period_years=3),
+    }
+
+def summarize_series_for_ai(
+    df: pd.DataFrame,
+    value_col: str = None,
+    label: str = "",
+) -> str:
+    """
+    시계열을 AI Context용 최신값·직전 변화·백분위 문장으로 요약.
+    """
     if df is None or df.empty:
         return f"- {label}: 데이터 수집 실패"
 
@@ -325,138 +282,6 @@ def summarize_series_for_ai(df: pd.DataFrame, value_col: str = None, label: str 
             f"(직전 대비 {change:+,.2f}, "
             f"최근 표본 내 백분위 {percentile:.1f}%)"
         )
+
     except Exception as e:
         return f"- {label}: 요약 실패 ({str(e)})"
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_macro_risk_indicators_for_ai() -> dict:
-    """AI Context용 금융 리스크·변동성 지표 수집."""
-    return {
-        "VIX": fetch_ticker_data("^VIX", period="3mo"),
-        "MOVE": fetch_ticker_data("^MOVE", period="3mo"),
-        "HY_OAS": fetch_fred_series("BAMLH0A0HYM2", period_years=3),
-        "CP_SPREAD": fetch_fred_cp_spread(),
-        "STLFSI4": fetch_fred_series("STLFSI4", period_years=3),
-    }
-
-
-def _clean_macro_label(text: str) -> str:
-    if not isinstance(text, str):
-        return str(text)
-
-    text = re.sub(r":gray\[\[.*?\]\]", "", text)
-    text = re.sub(r":gray\[.*?\]", "", text)
-    text = re.sub(r"\[\[.*?\]\]", "", text)
-
-    return re.sub(r"\s{2,}", " ", text).strip()
-
-
-def _append_macro_risk_section(lines: list[str], risk_data: dict | None) -> None:
-    lines.append("## 금융 리스크·은행권·시장 변동성")
-
-    if not isinstance(risk_data, dict):
-        lines.append("- 금융 리스크 데이터 수집 실패")
-        lines.append("")
-        return
-
-    indicators = [
-        ("VIX", "Close", "CBOE VIX (주식 변동성)"),
-        ("MOVE", "Close", "ICE BofA MOVE (채권 변동성)"),
-        ("HY_OAS", "BAMLH0A0HYM2", "미국 하이일드 스프레드 (HY OAS)"),
-        ("CP_SPREAD", "CP_SPREAD", "3M 금융 CP 스프레드"),
-        ("STLFSI4", "STLFSI4", "세인트루이스 연준 금융스트레스"),
-    ]
-
-    for key, value_col, label in indicators:
-        series_or_df = risk_data.get(key)
-        if series_or_df is None:
-            lines.append(f"- {label}: 데이터 수집 실패")
-            continue
-        lines.append(
-            summarize_series_for_ai(
-                series_or_df,
-                value_col,
-                label,
-            )
-        )
-    lines.append("")
-
-
-def generate_full_macro_text(
-    collected_data: dict,
-    rate_10y_curr=None,
-    rate_10y_prev=None,
-    rate_2y_curr=None,
-    rate_2y_prev=None,
-    risk_data: dict | None = None,
-) -> str:
-    """
-    거시경제 매크로 메뉴에 표시된 모든 지표의 최신 원본값을
-    카테고리 단위로 복사용 텍스트로 변환합니다.
-    """
-    now_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S KST")
-
-    lines = [
-        "📋 [거시경제 매크로 지표 원본 브리핑]",
-        f"수집 시각: {now_kst}",
-        "표기: 최신값 | 전일/직전 대비 | 직전값",
-        "=" * 72,
-        "",
-    ]
-
-    if not isinstance(collected_data, dict):
-        lines.append("- 매크로 데이터 수집에 실패했습니다.")
-        return "\n".join(lines)
-
-    for category_name, items in collected_data.items():
-        lines.append(f"## {_clean_macro_label(category_name)}")
-
-        if not isinstance(items, list) or not items:
-            lines.append("- 수집된 지표가 없습니다.")
-            lines.append("")
-            continue
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            name = _clean_macro_label(item.get("name", "이름 없음"))
-            status = item.get("status")
-
-            if status in ("ok", "single"):
-                lines.append(
-                    f"- {name}: "
-                    f"{item.get('price_str', 'N/A')} | "
-                    f"{item.get('delta_str', 'N/A')} | "
-                    f"직전: {item.get('prev_str', 'N/A')}"
-                )
-            else:
-                lines.append(f"- {name}: 데이터 수집 실패")
-        lines.append("")
-
-    lines.append("## 장단기 금리차")
-
-    if rate_10y_curr is not None and rate_2y_curr is not None:
-        spread_curr = rate_10y_curr - rate_2y_curr
-
-        lines.extend([
-            f"- 미국채 10년물: {rate_10y_curr:.2f}%",
-            f"- 미국채 2년물: {rate_2y_curr:.2f}%",
-            f"- 10Y-2Y 스프레드: {spread_curr:+.3f}%p",
-        ])
-
-        if rate_10y_prev is not None and rate_2y_prev is not None:
-            spread_prev = rate_10y_prev - rate_2y_prev
-            lines.append(
-                f"- 스프레드 직전 대비: "
-                f"{spread_curr - spread_prev:+.3f}%p"
-            )
-    else:
-        lines.append("- 장단기 금리차 데이터 수집 실패")
-
-    lines.append("")
-
-    _append_macro_risk_section(lines, risk_data)
-
-    return "\n".join(lines)
