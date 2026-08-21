@@ -394,4 +394,4 @@ LIVE_CLOCK_HTML = """
 # ⚠️ NIGHT_FUTURES_TICKER는 분기별 최근월물 만기에 맞춰 반드시 갱신해야 합니다.
 # (KIS Developers 포털의 국내선물옵션 마스터파일 또는 HTS에서 확인)
 # ==============================================================================
-NIGHT_FUTURES_TICKER = "CKFA020"  # 예시값, 실제 최근월물 코드로 교체 필요
+NIGHT_FUTURES_TICKER = "K2FA001.N"  # 예시값, 실제 최근월물 코드로 교체 필요
