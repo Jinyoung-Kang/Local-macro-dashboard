@@ -5,6 +5,7 @@ services/radar_service.py
 공식 지원 투자주체(외국인/기관/투신/은행/보험/종금/기금/기타기관/기타법인) 매핑 탑재
 
 """
+import io
 import logging
 import re
 from datetime import datetime, timedelta
@@ -110,7 +111,7 @@ def test_ls_connection():
 
 def test_pykrx_connection():
     """
-    [신규] PyKrx(KRX 웹 스크래핑 기반) 연결 상태를 점검합니다.
+    PyKrx(KRX 웹 스크래핑 기반) 연결 상태를 점검합니다.
     최근 영업일 KOSPI 종목 리스트 조회를 시도하여 정상 통신 여부를 확인합니다.
     """
     if not PYKRX_AVAILABLE:
@@ -120,7 +121,6 @@ def test_pykrx_connection():
         now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
         check_date = now_kst
 
-        # 최근 영업일까지 최대 7일 역방향 탐색 (주말/공휴일 방어)
         for _ in range(7):
             date_str = check_date.strftime("%Y%m%d")
             tickers = stock.get_market_ticker_list(date_str, market="KOSPI")
@@ -474,7 +474,7 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
 
 
 # ==============================================================================
-# 6. Naver 실시간 API
+# 6. Naver 실시간 API (시장 전체 랭킹)
 # ==============================================================================
 def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     sosok = "01" if "KOSPI" in market.upper() or "코스피" in market else "02"
@@ -550,7 +550,7 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
 
 
 # ==============================================================================
-# 7. PyKrx 엔진
+# 7. PyKrx 엔진 (시장 전체 랭킹)
 # ==============================================================================
 def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     if not PYKRX_AVAILABLE:
@@ -610,7 +610,7 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
 
 
 # ==============================================================================
-# 8. 5단계 무중단 파이프라인 마스터 함수 (Smart Fallback)
+# 8. 5단계 무중단 파이프라인 마스터 함수 (Smart Fallback, 시장 전체 랭킹)
 # ==============================================================================
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: str = "외국인", trade_type: str = "순매수", top_n: int = 30) -> pd.DataFrame:
@@ -665,13 +665,126 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
 
 
 # ==============================================================================
-# 9. 기준일(0점) 누적 수급 실제 데이터 로더 (pykrx 기반)
+# 9. [신규] 네이버 금융 종목별 실제 투자자 순매매 데이터 (pykrx 실패 시 2순위 실제 데이터)
+# ==============================================================================
+def fetch_naver_investor_daily_history(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
+    """
+    네이버 금융의 종목별 외국인/기관 순매매 상세 페이지(item/frgn.naver)를 스크래핑하여
+    실제 일별 외국인·기관 순매매 '수량(주식 수)'을 가져오고, 종가를 곱해 대략적인
+    순매매 금액(원)으로 환산합니다.
+
+    ⚠️ 비공식 스크래핑이므로 네이버 페이지 구조가 바뀌면 깨질 수 있습니다.
+    ⚠️ 순매매량(주식 수) × 종가로 환산한 근사값이며, 실제 체결가 기준 정확한
+       거래대금과는 소폭 차이가 있을 수 있습니다. 다만 통계적 추정치와 달리
+       "실제 순매수 방향과 수량"은 KRX 원본 그대로입니다.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://finance.naver.com/item/main.naver",
+    }
+
+    days_needed = (end_date_obj - start_date_obj).days + 5
+    max_pages = max(3, (days_needed // 5) + 3)
+
+    all_rows = []
+
+    try:
+        for page in range(1, max_pages + 1):
+            url = f"https://finance.naver.com/item/frgn.naver?code={stock_code}&page={page}"
+            res = requests.get(url, headers=headers, timeout=8)
+            if res.status_code != 200:
+                break
+
+            try:
+                tables = pd.read_html(io.StringIO(res.text), header=0, thousands=",")
+            except Exception:
+                break
+
+            target_table = None
+            for t in tables:
+                if t.shape[1] >= 8:
+                    target_table = t
+                    break
+
+            if target_table is None:
+                break
+
+            target_table = target_table.dropna(how="all")
+            if target_table.empty:
+                break
+
+            all_rows.append(target_table)
+
+            oldest_date_str = str(target_table.iloc[-1, 0]).strip()
+            try:
+                oldest_date = datetime.strptime(oldest_date_str, "%Y.%m.%d").date()
+                if oldest_date <= start_date_obj:
+                    break
+            except Exception:
+                pass
+
+        if not all_rows:
+            logger.warning(f"Naver 종목별 투자자 데이터 없음 (종목={stock_code})")
+            return pd.DataFrame()
+
+        combined = pd.concat(all_rows, ignore_index=True)
+        combined = combined.iloc[:, :9]
+        combined.columns = [
+            "Date", "Close", "PrevDiff", "PctChange", "Volume",
+            "Institution_Shares", "Foreigner_Shares", "Foreigner_HoldShares", "Foreigner_Ratio"
+        ]
+
+        combined["Date"] = pd.to_datetime(combined["Date"], format="%Y.%m.%d", errors="coerce")
+        combined = combined.dropna(subset=["Date"])
+
+        for col in ["Close", "Institution_Shares", "Foreigner_Shares", "Volume"]:
+            combined[col] = (
+                combined[col].astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace("+", "", regex=False)
+                .str.strip()
+            )
+            combined[col] = pd.to_numeric(combined[col], errors="coerce")
+
+        combined = combined.dropna(subset=["Close", "Institution_Shares", "Foreigner_Shares"])
+
+        if combined.empty:
+            return pd.DataFrame()
+
+        # 순매매 수량(주식 수) × 종가 = 대략적인 순매매 금액(원) 환산
+        combined["Foreigner_Daily"] = combined["Foreigner_Shares"] * combined["Close"]
+        combined["Institution_Daily"] = combined["Institution_Shares"] * combined["Close"]
+
+        combined = combined.sort_values("Date").reset_index(drop=True)
+
+        mask = (
+            (combined["Date"].dt.date >= start_date_obj)
+            & (combined["Date"].dt.date <= end_date_obj)
+        )
+        combined = combined.loc[mask].reset_index(drop=True)
+
+        if combined.empty:
+            return pd.DataFrame()
+
+        return combined[["Date", "Close", "Foreigner_Daily", "Institution_Daily"]]
+
+    except Exception as e:
+        logger.warning(f"Naver 종목별 투자자 데이터 스크래핑 실패 (종목={stock_code}): {e}")
+        return pd.DataFrame()
+
+
+# ==============================================================================
+# 10. 기준일(0점) 누적 수급 데이터 로더
+# 수집 순서: pykrx 실제 데이터 -> Naver 종목별 실제 데이터 -> 가격/거래량 추정치
 # ==============================================================================
 def estimate_flow_by_price_volume_heuristic(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
     """
     ⚠️ 주의: 이 함수는 실제 투자자별 데이터가 아닙니다.
-    pykrx 오류 또는 접근 불가 시 가격 변동률과 거래량만으로 만든 통계적 추정치이며,
-    실제 KRX 공시 수급과 다를 수 있습니다.
+    pykrx와 네이버 스크래핑이 모두 실패했을 때만 호출되는, 가격 변동률과
+    거래량만으로 만든 통계적 추정치이며, 실제 KRX 공시 수급과 다를 수 있습니다.
     """
     ticker_str = f"{stock_code}.KS" if not stock_code.endswith((".KS", ".KQ")) else stock_code
 
@@ -714,72 +827,82 @@ def estimate_flow_by_price_volume_heuristic(stock_code: str, start_date_obj, end
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
     """
-    pykrx의 실제 투자자별 순매수 데이터를 기반으로
     외국인/기관/개인 누적 수급 시계열을 생성합니다.
+    수집 순서: 1순위 pykrx 실제 데이터 -> 2순위 네이버 종목별 실제 데이터 -> 3순위 추정치
     """
-    if not PYKRX_AVAILABLE:
-        logger.warning("pykrx 미설치: 실제 투자자별 데이터를 가져올 수 없으므로 추정치 헬퍼를 호출합니다.")
-        return estimate_flow_by_price_volume_heuristic(stock_code, start_date_obj, end_date_obj)
-
+    ticker_code = stock_code.replace('.KS', '').replace('.KQ', '')
     start_str = start_date_obj.strftime("%Y%m%d")
     end_str = end_date_obj.strftime("%Y%m%d")
 
-    try:
-        ticker_code = stock_code.replace('.KS', '').replace('.KQ', '')
+    # 1순위: pykrx 실제 데이터
+    if PYKRX_AVAILABLE:
+        try:
+            df = stock.get_market_trading_value_by_date(start_str, end_str, ticker_code)
 
-        df = stock.get_market_trading_value_by_date(
-            start_str,
-            end_str,
-            ticker_code,
-        )
+            if df is not None and not df.empty:
+                df = df.reset_index().rename(columns={"날짜": "Date"})
+                df["Date"] = pd.to_datetime(df["Date"])
 
-        if df is None or df.empty:
-            return estimate_flow_by_price_volume_heuristic(
-                stock_code, start_date_obj, end_date_obj
-            )
+                col_map = {
+                    "외국인합계": "Foreigner_Daily",
+                    "기관합계": "Institution_Daily",
+                    "개인": "Retail_Daily",
+                }
+                for src_col, new_col in col_map.items():
+                    df[new_col] = df[src_col] if src_col in df.columns else 0.0
 
-        df = df.reset_index().rename(columns={"날짜": "Date"})
-        df["Date"] = pd.to_datetime(df["Date"])
+                df["Foreigner_Cum"] = df["Foreigner_Daily"].cumsum()
+                df["Institution_Cum"] = df["Institution_Daily"].cumsum()
+                df["Retail_Cum"] = df["Retail_Daily"].cumsum()
 
-        col_map = {
-            "외국인합계": "Foreigner_Daily",
-            "기관합계": "Institution_Daily",
-            "개인": "Retail_Daily",
-        }
+                price_df = stock.get_market_ohlcv_by_date(start_str, end_str, ticker_code)
+                if price_df is not None and not price_df.empty:
+                    price_df = price_df.reset_index().rename(columns={"날짜": "Date", "종가": "Close"})
+                    price_df["Date"] = pd.to_datetime(price_df["Date"])
+                    df = df.merge(price_df[["Date", "Close"]], on="Date", how="left")
+                else:
+                    df["Close"] = None
 
-        for src_col, new_col in col_map.items():
-            if src_col in df.columns:
-                df[new_col] = df[src_col]
-            else:
-                df[new_col] = 0.0
+                df["is_estimated"] = False
+                df["source"] = "pykrx (실제 데이터)"
 
-        df["Foreigner_Cum"] = df["Foreigner_Daily"].cumsum()
-        df["Institution_Cum"] = df["Institution_Daily"].cumsum()
-        df["Retail_Cum"] = df["Retail_Daily"].cumsum()
+                return df[[
+                    "Date", "Close",
+                    "Foreigner_Daily", "Institution_Daily", "Retail_Daily",
+                    "Foreigner_Cum", "Institution_Cum", "Retail_Cum",
+                    "is_estimated", "source",
+                ]]
+        except Exception as e:
+            logger.warning(f"pykrx 실제 수급 데이터 수집 실패, 네이버 대안 시도 (종목={stock_code}): {e}")
+    else:
+        logger.warning("pykrx 미설치: 네이버 실제 데이터 대안을 시도합니다.")
 
-        price_df = stock.get_market_ohlcv_by_date(
-            start_str, end_str, ticker_code
-        )
+    # 2순위: [신규] 네이버 금융 종목별 실제 투자자 데이터
+    naver_df = fetch_naver_investor_daily_history(stock_code, start_date_obj, end_date_obj)
+    if naver_df is not None and not naver_df.empty and len(naver_df) >= 2:
+        naver_df = naver_df.copy()
+        naver_df["Retail_Daily"] = -(naver_df["Foreigner_Daily"] + naver_df["Institution_Daily"])
 
-        if price_df is not None and not price_df.empty:
-            price_df = price_df.reset_index().rename(
-                columns={"날짜": "Date", "종가": "Close"}
-            )
-            price_df["Date"] = pd.to_datetime(price_df["Date"])
-            df = df.merge(price_df[["Date", "Close"]], on="Date", how="left")
-        else:
-            df["Close"] = None
+        naver_df["Foreigner_Cum"] = naver_df["Foreigner_Daily"].cumsum()
+        naver_df["Institution_Cum"] = naver_df["Institution_Daily"].cumsum()
+        naver_df["Retail_Cum"] = naver_df["Retail_Daily"].cumsum()
 
-        df["is_estimated"] = False
+        naver_df["is_estimated"] = False
+        naver_df["source"] = "Naver 금융 (실제 데이터, 순매매수량×종가 환산)"
 
-        return df[[
+        logger.info(f"pykrx 실패, Naver 실제 데이터로 대체 성공 (종목={stock_code})")
+
+        return naver_df[[
             "Date", "Close",
             "Foreigner_Daily", "Institution_Daily", "Retail_Daily",
-            "Foreigner_Cum", "Institution_Cum", "Retail_Cum", "is_estimated",
+            "Foreigner_Cum", "Institution_Cum", "Retail_Cum",
+            "is_estimated", "source",
         ]]
 
-    except Exception as e:
-        logger.error(f"pykrx 실제 수급 데이터 수집 실패: {e}")
-        return estimate_flow_by_price_volume_heuristic(
-            stock_code, start_date_obj, end_date_obj
-        )
+    # 3순위: 가격/거래량 기반 통계적 추정치 (최후의 수단)
+    logger.error(f"pykrx, Naver 모두 실패. 가격/거래량 기반 추정치로 대체합니다 (종목={stock_code}).")
+    fallback_df = estimate_flow_by_price_volume_heuristic(stock_code, start_date_obj, end_date_obj)
+    if fallback_df is not None and not fallback_df.empty:
+        fallback_df = fallback_df.copy()
+        fallback_df["source"] = "가격/거래량 기반 통계적 추정치"
+    return fallback_df
