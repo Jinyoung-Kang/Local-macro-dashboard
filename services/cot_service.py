@@ -15,7 +15,7 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# [신규] 다중 자산 COT 코드 매핑
+# 1. 다중 자산 COT 코드 매핑
 # ==============================================================================
 COT_ASSETS = {
     "S&P 500 E-Mini": {
@@ -44,6 +44,10 @@ COT_ASSETS = {
     },
 }
 
+class CFTCTransientError(RuntimeError):
+    pass
+
+
 def _cftc_get_with_retry(url: str, params: dict, max_attempts: int = 3):
     """일시적인 Connection Reset 방어를 위한 재시도 래퍼"""
     last_error = None
@@ -70,7 +74,7 @@ def _cftc_get_with_retry(url: str, params: dict, max_attempts: int = 3):
 
 
 @st.cache_data(ttl=3600*12, show_spinner=False)
-def fetch_cftc_cot_legacy(contract_code: str, limit: int = 300) -> tuple:
+def fetch_cftc_cot_legacy(contract_code: str, limit: int = 300) -> pd.DataFrame:
     url = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
     params = {
         "cftc_contract_market_code": contract_code,
@@ -81,12 +85,12 @@ def fetch_cftc_cot_legacy(contract_code: str, limit: int = 300) -> tuple:
     res, error = _cftc_get_with_retry(url, params)
     
     if error:
-        return pd.DataFrame(), f"CFTC 재시도 후 실패: {error}"
+        raise CFTCTransientError(f"CFTC 재시도 후 실패: {error}")
     
     try:
         data = res.json()
         if not data:
-            return pd.DataFrame(), "결과 없음"
+            raise CFTCTransientError("결과 없음")
         
         records = []
         for row in data:
@@ -105,21 +109,22 @@ def fetch_cftc_cot_legacy(contract_code: str, limit: int = 300) -> tuple:
                 
         df = pd.DataFrame(records)
         if df.empty:
-            return df, "파싱 오류"
+            raise CFTCTransientError("파싱 오류")
         
         df["nc_net"] = df["nc_long"] - df["nc_short"]
         df["comm_net"] = df["comm_long"] - df["comm_short"]
         df["nr_net"] = df["nr_long"] - df["nr_short"]
         
-        return df, None
+        return df
+    except CFTCTransientError:
+        raise
     except Exception as e:
-        return pd.DataFrame(), str(e)
+        raise CFTCTransientError(str(e))
 
 
 # ==============================================================================
-# [신규] 다중 자산 3년 시계열 병렬 수집 및 AI Context 요약 헬퍼
+# 2. 다중 자산 3년 시계열 병렬 수집 및 AI Context 요약 헬퍼
 # ==============================================================================
-@st.cache_data(ttl=3600 * 12, show_spinner=False)
 def fetch_cot_multi_asset_history(years: int = 3, max_workers: int = 4) -> dict:
     """
     6개 COT 자산의 최근 N년 주간 데이터를 병렬 수집.
@@ -142,11 +147,10 @@ def fetch_cot_multi_asset_history(years: int = 3, max_workers: int = 4) -> dict:
             asset_name = futures[future]
 
             try:
-                df, error = future.result()
-                if error:
-                    results[asset_name] = {"data": pd.DataFrame(), "error": error}
-                else:
-                    results[asset_name] = {"data": df, "error": None}
+                df = future.result()
+                results[asset_name] = {"data": df, "error": None}
+            except CFTCTransientError as e:
+                results[asset_name] = {"data": pd.DataFrame(), "error": str(e)}
             except Exception as e:
                 results[asset_name] = {"data": pd.DataFrame(), "error": str(e)}
 
