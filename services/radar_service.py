@@ -4,16 +4,6 @@ services/radar_service.py
 [KIS(FHPTJ04400000) -> LS -> KRX -> Daum -> Naver -> PyKrx]
 공식 지원 투자주체(외국인/기관/투신/은행/보험/종금/기금/기타기관/기타법인) 매핑 탑재
 
-[수정 사항]
-1. get_market_radar_scanner()에 "장 마감 여부" 판정을 추가.
-   기존에는 "오늘 날짜 조회"이기만 하면 장마감 후에도 KIS/LS 장중 가집계를
-   최우선으로 반환해버려서, 장마감 후 KRX 공식 확정 데이터가 있어도 시도되지
-   않는 문제가 있었습니다. 이제 15:30 이후에는 KRX 확정 데이터를 우선 시도합니다.
-2. fetch_krx_date_deal_ranking(), fetch_pykrx_deal_ranking()에 실패 원인을
-   구체적으로 로그에 남기도록 보강. (HTTP 상태 코드, 응답 본문 일부, 예외 메시지)
-   -> Streamlit Cloud 로그에서 정확한 실패 지점을 바로 확인할 수 있습니다.
-3. get_stock_cumulative_flow_from_base()는 실제 pykrx 데이터(get_market_trading_value_by_date)를
-   우선 사용하고, 실패 시에만 가격/거래량 기반 추정치로 대체하며 is_estimated 플래그로 구분합니다.
 """
 import logging
 import re
@@ -38,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# 1. KIS / LS 증권사 API 실시간 연결 상태 진단 함수
+# 1. KIS / LS / PyKrx 연결 상태 진단 함수
 # ==============================================================================
 def test_kis_connection():
     params = {
@@ -114,6 +104,31 @@ def test_ls_connection():
         elif res:
             return False, f"LS 서버 응답: {res.get('rsp_msg', str(res))}"
         return False, "LS 서버 응답 없음"
+    except Exception as e:
+        return False, f"예외 발생: {str(e)}"
+
+
+def test_pykrx_connection():
+    """
+    [신규] PyKrx(KRX 웹 스크래핑 기반) 연결 상태를 점검합니다.
+    최근 영업일 KOSPI 종목 리스트 조회를 시도하여 정상 통신 여부를 확인합니다.
+    """
+    if not PYKRX_AVAILABLE:
+        return False, "pykrx 패키지가 설치되지 않았습니다 (requirements.txt 확인 필요)."
+
+    try:
+        now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+        check_date = now_kst
+
+        # 최근 영업일까지 최대 7일 역방향 탐색 (주말/공휴일 방어)
+        for _ in range(7):
+            date_str = check_date.strftime("%Y%m%d")
+            tickers = stock.get_market_ticker_list(date_str, market="KOSPI")
+            if tickers and len(tickers) > 0:
+                return True, f"정상 통신 성공 (기준일 {date_str}, KOSPI 종목 수: {len(tickers)}개)"
+            check_date -= timedelta(days=1)
+
+        return False, "최근 7일 내 유효한 KOSPI 종목 리스트를 가져오지 못했습니다."
     except Exception as e:
         return False, f"예외 발생: {str(e)}"
 
@@ -596,8 +611,6 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
 
 # ==============================================================================
 # 8. 5단계 무중단 파이프라인 마스터 함수 (Smart Fallback)
-# [수정] 오늘 날짜 조회라도 "장 마감 여부"를 확인하여,
-#        장마감 후에는 KIS/LS 장중 가집계보다 KRX 공식 확정 데이터를 우선 시도합니다.
 # ==============================================================================
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: str = "외국인", trade_type: str = "순매수", top_n: int = 30) -> pd.DataFrame:
@@ -605,7 +618,6 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
     today_str = now_kst.strftime("%Y%m%d")
     hm = now_kst.hour * 100 + now_kst.minute
 
-    # KOSPI/KOSDAQ 정규장은 15:30 마감. 마감 후에는 KRX 공식 확정 데이터를 우선 시도합니다.
     is_market_closed_today = hm >= 1530
 
     current_date_obj = target_date_obj
@@ -616,7 +628,6 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
         is_today = (search_date_str == today_str)
         prefer_intraday = is_today and not is_market_closed_today
 
-        # 1. 장중(마감 전)인 경우에만 실시간 증권사 API(KIS/LS) 먼저 시도
         if prefer_intraday:
             df = fetch_kis_deal_ranking(search_date_str, market, investor, trade_type, top_n)
             if not df.empty and len(df) >= 1:
@@ -626,12 +637,10 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
             if not df.empty and len(df) >= 1:
                 return df
 
-        # 2. KRX 공식 OpenAPI 시도 (장마감 후에는 이 단계가 최우선)
         df = fetch_krx_date_deal_ranking(search_date_str, market, investor, trade_type, top_n)
         if not df.empty and len(df) >= 1:
             return df
 
-        # 3. 장중인데 위 단계가 모두 실패했을 때만 실시간 웹 크롤러(Daum/Naver) 시도
         if prefer_intraday:
             df = fetch_daum_deal_ranking(search_date_str, market, investor, trade_type, top_n)
             if not df.empty and len(df) >= 1:
@@ -641,13 +650,11 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
             if not df.empty and len(df) >= 1:
                 return df
 
-        # 4. PyKrx 시도 (당일/과거 모두 지원)
         if PYKRX_AVAILABLE:
             df = fetch_pykrx_deal_ranking(search_date_str, market, investor, trade_type, top_n)
             if not df.empty and len(df) >= 1:
                 return df
 
-        # 당일 조회 실패 시 하루 전으로 롤백하여 재탐색
         current_date_obj -= timedelta(days=1)
 
     logger.error(
