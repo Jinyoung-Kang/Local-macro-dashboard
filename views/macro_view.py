@@ -84,7 +84,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         st.error(f"데이터 수집 중 오류가 발생했습니다: {e}")
         return
 
-    # 옵션 B: 화면 metric 카드 및 텍스트 브리핑용 데이터를 단 1회 3mo/3y 기준으로 통합 수집
     vix_hist = fetch_ticker_data("^VIX", period="3mo")
     move_hist = fetch_ticker_data("^MOVE", period="3mo")
     hy_df = fetch_fred_series("BAMLH0A0HYM2", period_years=3)
@@ -99,7 +98,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         "STLFSI4": stlfsi_df,
     }
 
-    # AI 호출 없는 거시경제 매크로 원본 브리핑 생성
     report_text = generate_full_macro_text(
         collected_data=collected_data,
         rate_10y_curr=rate_10y_curr,
@@ -114,7 +112,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         st.title("📊 Global Macro Dashboard")
         st.caption(f"최근 데이터 갱신 시각: {now_str_kst} (KST) | 갱신 주기: {refresh_interval}초")
 
-    # 우측 상단 팝오버 메뉴 2개
     with header_right:
         st.write("")
         with st.popover("📋 매크로 텍스트 브리핑 보기 / 복사", use_container_width=True):
@@ -125,64 +122,62 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             )
             st.code(report_text, language="text")
 
-        st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-
-        with st.popover(
-            "📚 전체 대시보드 원본 데이터 보기 / 복사",
-            use_container_width=True,
-        ):
-            st.markdown("**AI 분석 없이 수집한 전체 대시보드 최신 원본 데이터**")
-            st.caption(
-                "거시·리스크·유동성·섹터·자산군·COT·KRX·SEC 13F 데이터를 "
-                "수집 시각 및 데이터 출처 성격과 함께 표시합니다."
-            )
-
-            if "dashboard_raw_snapshot_text" not in st.session_state:
-                st.session_state.dashboard_raw_snapshot_text = ""
-
-            if st.button(
-                "🔄 전체 데이터 수집 및 텍스트 생성",
-                key="collect_dashboard_raw_snapshot",
-                use_container_width=True,
-            ):
-                with st.spinner("전체 대시보드 원본 데이터를 병렬 수집 중입니다..."):
-                    snapshot = collect_dashboard_snapshot()
-                    st.session_state.dashboard_raw_snapshot_text = (
-                        format_dashboard_snapshot_text(snapshot)
-                    )
-
-            raw_text = st.session_state.dashboard_raw_snapshot_text
-
-            if raw_text:
-                st.code(raw_text, language="text")
-            else:
-                st.info("버튼을 눌러 최신 전체 원본 데이터를 수집하세요.")
-
     st.divider()
 
+    # ==========================================================================
     # 1. 메인 시세 요약 카드
+    # [수정] 한 카테고리의 항목 수가 많아도 한 줄에 최대 MAX_COLS_PER_ROW개까지만
+    #        배치하고, 넘치는 항목은 다음 줄로 자동 줄바꿈합니다.
+    #        또한 야간선물/해외선물 항목의 월물·출처 정보는 캡션으로 별도 표시합니다.
+    # ==========================================================================
     st.subheader("실시간/최근 시세 요약")
     st.info("💡 **변동 수치(+/-) 기준:** 각 지표 하단의 수치는 '직전 거래일 공식 종가(Previous Close) 대비 등락폭과 등락률(%)'입니다.", icon="ℹ️")
 
+    MAX_COLS_PER_ROW = 4
+
     for cat_name, items in collected_data.items():
         st.markdown(f"#### {cat_name}")
-        cols = st.columns(len(items))
-        for idx, item in enumerate(items):
-            display_name = inject_market_status(item["name"])
 
-            if item["status"] == "ok":
-                cols[idx].metric(
-                    label=display_name,
-                    value=item["price_str"],
-                    delta=item["delta_str"],
-                    help=f"직전 거래일 종가: {item['prev_str']}"
-                )
-                cols[idx].caption(f"전일 종가: `{item['prev_str']}`")
-            elif item["status"] == "single":
-                cols[idx].metric(label=display_name, value=item["price_str"])
-                cols[idx].caption("전일 데이터 없음")
-            else:
-                cols[idx].metric(label=display_name, value="로드 실패")
+        for row_start in range(0, len(items), MAX_COLS_PER_ROW):
+            row_items = items[row_start: row_start + MAX_COLS_PER_ROW]
+            cols = st.columns(MAX_COLS_PER_ROW)
+
+            for idx, item in enumerate(row_items):
+                display_name = inject_market_status(item["name"])
+                col = cols[idx]
+
+                if item["status"] == "ok":
+                    col.metric(
+                        label=display_name,
+                        value=item["price_str"],
+                        delta=item["delta_str"],
+                        help=f"직전 거래일 종가: {item['prev_str']}"
+                    )
+
+                    extra_caption_parts = [f"전일 종가: `{item['prev_str']}`"]
+                    if item.get("contract_month"):
+                        extra_caption_parts.append(f"월물: `{item['contract_month']}`")
+                    if item.get("source"):
+                        extra_caption_parts.append(f"출처: `{item['source']}`")
+
+                    col.caption(" | ".join(extra_caption_parts))
+
+                elif item["status"] == "single":
+                    col.metric(label=display_name, value=item["price_str"])
+                    col.caption("전일 데이터 없음")
+                else:
+                    col.metric(label=display_name, value="로드 실패")
+                    fail_caption_parts = []
+                    if item.get("contract_month"):
+                        fail_caption_parts.append(f"월물: `{item['contract_month']}`")
+                    if item.get("source"):
+                        fail_caption_parts.append(f"출처: `{item['source']}`")
+                    if fail_caption_parts:
+                        col.caption(" | ".join(fail_caption_parts))
+
+            # 빈 칸(마지막 줄의 남는 컬럼)은 아무것도 렌더링하지 않음
+            for idx in range(len(row_items), MAX_COLS_PER_ROW):
+                cols[idx].empty()
 
     st.divider()
 
@@ -223,7 +218,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     st.dataframe(pd.DataFrame(SPREAD_TABLE_DATA), use_container_width=True, hide_index=True)
 
-    spread_period = st.selectbox("금리차 추이 기간 선택", ["6mo", "1y", "2y", "5y", "max"], index=1, key="spread_period_select")
+    spread_period = st.selectbox("금리차 추이 기간 선택", ["6mo", "1y", "2y", "5y", "max"], index=2, key="spread_period_select")
     df_10y = fetch_ticker_data("^TNX", period=spread_period)
     df_2y = fetch_ticker_data("2YY=F", period=spread_period)
 
