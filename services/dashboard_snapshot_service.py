@@ -1,13 +1,13 @@
 """
 services/dashboard_snapshot_service.py
 대시보드 전체 데이터를 AI 분석이나 텍스트 복사를 위해 병렬 수집하고 원본 텍스트 스냅샷을 생성합니다.
+UI Markdown 태그 정제 및 데이터 단위 포맷팅, 안전 파싱 로직 포함.
 """
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
 import pandas as pd
 
 from services.macro_service import (
@@ -74,7 +74,7 @@ def collect_dashboard_snapshot() -> dict:
         fut_liquidity = executor.submit(
             safe_call,
             get_fed_liquidity_data,
-            5,
+            10, # 캐시 키 일치를 위해 10으로 통일
         )
         fut_rotation = executor.submit(
             safe_call,
@@ -144,13 +144,10 @@ def _append_macro_section(lines: list[str], macro_res):
                         f"직전: {item.get('prev_str', 'N/A')}"
                     )
                 else:
-                    lines.append(
-                        f"- {clean_name}: 데이터 수집 실패"
-                    )
+                    lines.append(f"- {clean_name}: 데이터 수집 실패")
 
     if r10_curr is not None and r2_curr is not None:
         spread = r10_curr - r2_curr
-
         lines.extend([
             "",
             "### 장단기 금리차",
@@ -170,41 +167,11 @@ def _append_risk_section(lines: list[str], risk_res):
         lines.append("")
         return
 
-    lines.append(
-        summarize_series_for_ai(
-            risk_res.get("VIX"),
-            "Close",
-            "CBOE VIX (주식 변동성)",
-        )
-    )
-    lines.append(
-        summarize_series_for_ai(
-            risk_res.get("MOVE"),
-            "Close",
-            "ICE BofA MOVE (채권 변동성)",
-        )
-    )
-    lines.append(
-        summarize_series_for_ai(
-            risk_res.get("HY_OAS"),
-            "BAMLH0A0HYM2",
-            "미국 하이일드 스프레드 (HY OAS)",
-        )
-    )
-    lines.append(
-        summarize_series_for_ai(
-            risk_res.get("CP_SPREAD"),
-            "CP_SPREAD",
-            "3M 금융 CP 스프레드 (은행권 자금위험)",
-        )
-    )
-    lines.append(
-        summarize_series_for_ai(
-            risk_res.get("STLFSI4"),
-            "STLFSI4",
-            "세인트루이스 연준 금융스트레스 (STLFSI4)",
-        )
-    )
+    lines.append(summarize_series_for_ai(risk_res.get("VIX"), "Close", "CBOE VIX (주식 변동성)"))
+    lines.append(summarize_series_for_ai(risk_res.get("MOVE"), "Close", "ICE BofA MOVE (채권 변동성)"))
+    lines.append(summarize_series_for_ai(risk_res.get("HY_OAS"), "BAMLH0A0HYM2", "미국 하이일드 스프레드 (HY OAS)"))
+    lines.append(summarize_series_for_ai(risk_res.get("CP_SPREAD"), "CP_SPREAD", "3M 금융 CP 스프레드 (은행권 자금위험)"))
+    lines.append(summarize_series_for_ai(risk_res.get("STLFSI4"), "STLFSI4", "세인트루이스 연준 금융스트레스 (STLFSI4)"))
     lines.append("")
 
 
@@ -229,7 +196,10 @@ def _append_liquidity_section(lines: list[str], liquidity_res):
         f"- 연준 총자산 (WALCL): ${walcl_t:,.3f}T",
         f"- 재무부 일반계정 (TGA): ${tga_b:,.1f}B",
         f"- 역레포 (ON RRP): ${rrp_b:,.1f}B",
-        f"- 연준 순유동성: ${net_liq_t:,.3f}T (직전 대비 {net_liq_t - net_liq_prev_t:+,.3f}T)",
+        (
+            f"- 연준 순유동성: ${net_liq_t:,.3f}T "
+            f"(직전 대비 {net_liq_t - net_liq_prev_t:+,.3f}T)"
+        ),
         ""
     ])
 
