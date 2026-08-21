@@ -259,6 +259,23 @@ def render_radar_view():
             )
 
         if df_cum is not None and not df_cum.empty:
+            
+            # [추가됨] is_estimated 플래그 확인 및 경고 표시
+            is_estimated = bool(df_cum["is_estimated"].iloc[0]) if "is_estimated" in df_cum.columns else True
+
+            if is_estimated:
+                st.warning(
+                    "⚠️ **추정 데이터 안내**\n\n"
+                    "pykrx 실제 투자자별 데이터를 가져오지 못해, "
+                    "가격 변동률과 거래량 기반의 통계적 추정치로 대체됐습니다. "
+                    "실제 KRX 공시 수급과 다를 수 있습니다."
+                )
+            else:
+                st.caption("✅ pykrx 실제 투자자별 순매수 데이터 기준입니다.")
+
+            # [추가됨] 차트 범례용 (추정) 접미사 생성
+            suffix = " (추정)" if is_estimated else ""
+
             fig_cum = make_subplots(
                 rows=2, cols=1,
                 shared_xaxes=True,
@@ -277,11 +294,11 @@ def render_radar_view():
                 row=1, col=1
             )
 
-            # Row 2: 외인 / 기관 누적 수급
+            # Row 2: 외인 / 기관 누적 수급 (suffix 적용)
             fig_cum.add_trace(
                 go.Scatter(
                     x=df_cum["Date"], y=df_cum["Foreigner_Cum"],
-                    name="외국인 누적",
+                    name=f"외국인 누적{suffix}",
                     line=dict(color="#FF7B72", width=2)
                 ),
                 row=2, col=1
@@ -289,7 +306,7 @@ def render_radar_view():
             fig_cum.add_trace(
                 go.Scatter(
                     x=df_cum["Date"], y=df_cum["Institution_Cum"],
-                    name="기관 누적",
+                    name=f"기관 누적{suffix}",
                     line=dict(color="#FFA657", width=2)
                 ),
                 row=2, col=1
@@ -297,7 +314,7 @@ def render_radar_view():
             fig_cum.add_trace(
                 go.Scatter(
                     x=df_cum["Date"], y=df_cum["Retail_Cum"],
-                    name="개인 누적",
+                    name=f"개인 누적{suffix}",
                     line=dict(color="#7EE787", width=1.5, dash="dot")
                 ),
                 row=2, col=1
