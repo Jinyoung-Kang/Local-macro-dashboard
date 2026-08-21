@@ -110,10 +110,6 @@ def test_ls_connection():
 
 
 def test_pykrx_connection():
-    """
-    PyKrx(KRX 웹 스크래핑 기반) 연결 상태를 점검합니다.
-    최근 영업일 KOSPI 종목 리스트 조회를 시도하여 정상 통신 여부를 확인합니다.
-    """
     if not PYKRX_AVAILABLE:
         return False, "pykrx 패키지가 설치되지 않았습니다 (requirements.txt 확인 필요)."
 
@@ -196,6 +192,11 @@ def fetch_kis_deal_ranking(target_date: str, market: str, investor: str, trade_t
                         if amt_raw == 0:
                             amt_raw = float(row.get("organ_pure_byqty", row.get("orgn_ntby_qty", 0))) * price
 
+                # 투자자별 값을 전혀 찾지 못하면 (금액=0, 수량=0 모두) 신뢰할 수 없는
+                # 레코드이므로 건너뜁니다. (가짜 숫자를 만들어내지 않음)
+                if amt_raw == 0:
+                    continue
+
                 amt_eok = round(amt_raw / 100000000.0, 1) if abs(amt_raw) > 100000 else round(amt_raw, 1)
 
                 if trade_type == "순매도" and amt_eok > 0:
@@ -249,6 +250,10 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 
                     val_key = "forval" if investor == "외국인" else "orgval"
                     svalue = float(row.get(val_key, row.get("svalue", 0)))
+
+                    if svalue == 0:
+                        continue
+
                     net_amt_eok = round(svalue / 100.0, 1) if abs(svalue) > 1000 else round(svalue, 1)
 
                     if trade_type == "순매도" and net_amt_eok > 0:
@@ -293,10 +298,14 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
                     change_pct = float(row.get("diff", 0))
 
                     svalue = float(row.get("svalue", 0))
+                    svolume = float(row.get("svolume", row.get("volume", 0)))
+
+                    if svalue == 0 and svolume == 0:
+                        continue
+
                     if svalue != 0:
                         net_amt_eok = round(svalue / 100.0, 1)
                     else:
-                        svolume = float(row.get("svolume", row.get("volume", 0)))
                         net_amt_eok = round((svolume * price) / 100000000.0, 1)
 
                     if trade_type == "순매도" and net_amt_eok > 0:
@@ -322,6 +331,9 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 
 # ==============================================================================
 # 4. KRX 공식 OpenAPI
+# [중요 수정] 투자자별(외국인/기관) 실제 컬럼을 찾지 못하면 절대 대체값을
+# 만들지 않고 즉시 실패를 반환합니다. (기존에는 전체 거래대금이나
+# price×거래량×0.1 이라는 조작된 값을 "KRX 공식 데이터"로 잘못 표시했음)
 # ==============================================================================
 def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     auth_key = get_krx_key()
@@ -367,7 +379,21 @@ def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, tr
         name_col = cols.get("ISU_NM", cols.get("ISU_ABBRV", cols.get("HNAME", "")))
         price_col = cols.get("TDD_CLSPRC", cols.get("CLSPRC", ""))
         fluc_col = cols.get("FLUC_RT", "")
-        net_col = cols.get("FRGN_NETBID_AMT" if "외국인" in investor else "ORG_NETBID_AMT", cols.get("NETBID_AMT", cols.get("TRD_VAL", "")))
+
+        # [핵심 수정] 이 엔드포인트(/sto/stk_bydd_trd)는 유가증권 일별매매정보(OHLCV)이며
+        # 투자자별(외국인/기관) 순매수 컬럼을 제공하지 않을 가능성이 높습니다.
+        # TRD_VAL(전체 거래대금) 등으로 대체하지 않고, 실제 투자자별 컬럼이
+        # 없으면 명확히 실패로 처리합니다.
+        investor_col_name = "FRGN_NETBID_AMT" if "외국인" in investor else "ORG_NETBID_AMT"
+        net_col = cols.get(investor_col_name)
+
+        if not net_col:
+            logger.warning(
+                f"KRX OpenAPI 실패 (날짜={target_date}): 이 엔드포인트는 투자자별 "
+                f"컬럼({investor_col_name})을 제공하지 않습니다. 실제 컬럼: {list(df.columns)}. "
+                f"전체 거래대금으로 대체하지 않고 실패 처리합니다."
+            )
+            return pd.DataFrame()
 
         if not name_col or not price_col:
             logger.warning(f"KRX OpenAPI 실패 (날짜={target_date}): 필요한 컬럼을 찾지 못했습니다. 실제 컬럼: {list(df.columns)}")
@@ -385,10 +411,10 @@ def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, tr
             name = str(r.get(name_col, "")).strip()
             price = safe_float(r.get(price_col, 0))
             fluc = safe_float(r.get(fluc_col, 0))
-            amt_val = safe_float(r.get(net_col, r.get("TRD_VAL", 0)))
+            amt_val = safe_float(r.get(net_col, 0))
 
-            if amt_val == 0:
-                amt_val = price * safe_float(r.get("ACC_TRDVOL", 1000)) * (0.1 if trade_type == "순매수" else -0.1)
+            # 값이 0이면 "실제로 순매수가 0"인지 "데이터가 없는 것"인지 구분할 수
+            # 없으므로, 임의의 대체 공식을 쓰지 않고 그대로 0으로 남겨둡니다.
             amt_eok = round(amt_val / 100000000.0, 1)
 
             if price > 0 and name:
@@ -411,6 +437,10 @@ def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, tr
             res_df = res_df[res_df["순매수대금(억)"] > 0].sort_values("순매수대금(억)", ascending=False)
         else:
             res_df = res_df[res_df["순매수대금(억)"] < 0].sort_values("순매수대금(억)", ascending=True)
+
+        if res_df.empty:
+            logger.warning(f"KRX OpenAPI: {trade_type} 조건을 만족하는 종목이 없습니다 (날짜={target_date}).")
+            return pd.DataFrame()
 
         res_df = res_df.head(top_n).reset_index(drop=True)
         res_df["순위"] = range(1, len(res_df) + 1)
@@ -665,7 +695,9 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
 
 
 # ==============================================================================
-# 9. [신규] 네이버 금융 종목별 실제 투자자 순매매 데이터 (pykrx 실패 시 2순위 실제 데이터)
+# 9. 네이버 금융 종목별 실제 투자자 순매매 데이터
+# [중요 수정] 컬럼 정합성 검증 추가. 종가가 비합리적이거나 필수 컬럼이 숫자로
+# 변환되지 않으면(페이지 구조 변경 의심) 조용히 잘못된 값을 넘기지 않고 실패 처리.
 # ==============================================================================
 def fetch_naver_investor_daily_history(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
     """
@@ -674,9 +706,6 @@ def fetch_naver_investor_daily_history(stock_code: str, start_date_obj, end_date
     순매매 금액(원)으로 환산합니다.
 
     ⚠️ 비공식 스크래핑이므로 네이버 페이지 구조가 바뀌면 깨질 수 있습니다.
-    ⚠️ 순매매량(주식 수) × 종가로 환산한 근사값이며, 실제 체결가 기준 정확한
-       거래대금과는 소폭 차이가 있을 수 있습니다. 다만 통계적 추정치와 달리
-       "실제 순매수 방향과 수량"은 KRX 원본 그대로입니다.
     """
     headers = {
         "User-Agent": (
@@ -752,9 +781,32 @@ def fetch_naver_investor_daily_history(stock_code: str, start_date_obj, end_date
         combined = combined.dropna(subset=["Close", "Institution_Shares", "Foreigner_Shares"])
 
         if combined.empty:
+            logger.warning(f"Naver 종목별 투자자 데이터: 숫자 변환 후 유효한 행이 없습니다 (종목={stock_code}).")
             return pd.DataFrame()
 
-        # 순매매 수량(주식 수) × 종가 = 대략적인 순매매 금액(원) 환산
+        # [신규] 정합성 검증: 종가가 비정상적으로 작거나(0 이하) 크면(1000억 이상)
+        # 컬럼이 잘못 매핑됐을 가능성이 높으므로 실패 처리합니다.
+        invalid_close_ratio = ((combined["Close"] <= 0) | (combined["Close"] > 1e11)).mean()
+        if invalid_close_ratio > 0.1:
+            logger.warning(
+                f"Naver 종목별 투자자 데이터: 종가 컬럼이 비정상적입니다 "
+                f"(비정상 비율 {invalid_close_ratio:.0%}, 종목={stock_code}). "
+                f"페이지 구조 변경이 의심되어 이 데이터를 사용하지 않습니다."
+            )
+            return pd.DataFrame()
+
+        # [신규] 거래량 대비 순매매 수량이 비정상적으로 크면(거래량의 2배 초과)
+        # 컬럼이 밀렸을 가능성이 높으므로 의심스러운 행은 제외합니다.
+        valid_mask = (
+            (combined["Foreigner_Shares"].abs() <= combined["Volume"] * 2 + 1)
+            & (combined["Institution_Shares"].abs() <= combined["Volume"] * 2 + 1)
+        )
+        combined = combined.loc[valid_mask].reset_index(drop=True)
+
+        if combined.empty:
+            logger.warning(f"Naver 종목별 투자자 데이터: 정합성 검증 후 남은 데이터가 없습니다 (종목={stock_code}).")
+            return pd.DataFrame()
+
         combined["Foreigner_Daily"] = combined["Foreigner_Shares"] * combined["Close"]
         combined["Institution_Daily"] = combined["Institution_Shares"] * combined["Close"]
 
@@ -834,7 +886,6 @@ def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_dat
     start_str = start_date_obj.strftime("%Y%m%d")
     end_str = end_date_obj.strftime("%Y%m%d")
 
-    # 1순위: pykrx 실제 데이터
     if PYKRX_AVAILABLE:
         try:
             df = stock.get_market_trading_value_by_date(start_str, end_str, ticker_code)
@@ -877,7 +928,6 @@ def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_dat
     else:
         logger.warning("pykrx 미설치: 네이버 실제 데이터 대안을 시도합니다.")
 
-    # 2순위: [신규] 네이버 금융 종목별 실제 투자자 데이터
     naver_df = fetch_naver_investor_daily_history(stock_code, start_date_obj, end_date_obj)
     if naver_df is not None and not naver_df.empty and len(naver_df) >= 2:
         naver_df = naver_df.copy()
@@ -899,7 +949,6 @@ def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_dat
             "is_estimated", "source",
         ]]
 
-    # 3순위: 가격/거래량 기반 통계적 추정치 (최후의 수단)
     logger.error(f"pykrx, Naver 모두 실패. 가격/거래량 기반 추정치로 대체합니다 (종목={stock_code}).")
     fallback_df = estimate_flow_by_price_volume_heuristic(stock_code, start_date_obj, end_date_obj)
     if fallback_df is not None and not fallback_df.empty:
