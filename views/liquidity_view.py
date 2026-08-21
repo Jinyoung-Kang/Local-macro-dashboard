@@ -2,6 +2,11 @@
 views/liquidity_view.py
 🏛️ 연준 순유동성 트래커 (Fed Net Liquidity Tracker) 뷰
 연준 총자산, TGA, ON RRP 잔고 및 증시 지수 오버레이 상관관계 분석
+
+[수정 사항]
+- get_fed_liquidity_data()가 반환하는 'is_estimated' 컬럼을 확인하여,
+  FRED 실제 데이터 수집에 실패해 통계적 추정 Fallback이 사용된 경우
+  화면 최상단에 명확한 경고 배너를 표시하도록 변경.
 """
 from datetime import datetime
 import pandas as pd
@@ -11,6 +16,7 @@ import pytz
 import streamlit as st
 import yfinance as yf
 from services.liquidity_service import get_fed_liquidity_data
+
 
 @st.cache_data(ttl=60)
 def fetch_overlay_index_data(ticker: str, start_date: str) -> pd.DataFrame:
@@ -44,18 +50,33 @@ def render_liquidity_view():
     </div>
     """, unsafe_allow_html=True)
 
-    with st.spinner("연준(FRED)으로부터 최신 순유동성 데이터를 수집 및 연산하고 있습니다..."):
+    with st.spinner("연준(FRED)으로부터 최신 순유동성 데이터를 병렬 수집 중입니다..."):
         df_liq = get_fed_liquidity_data(period_years=10)
 
     if df_liq is None or df_liq.empty:
         st.error("유동성 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
         return
 
+    # ==========================================================================
+    # [신규] 실제/추정 데이터 여부 확인 및 경고 배너
+    # ==========================================================================
+    is_estimated = bool(df_liq["is_estimated"].iloc[-1]) if "is_estimated" in df_liq.columns else True
+
+    if is_estimated:
+        st.error(
+            "🔴 **실시간 데이터 수집 실패 안내**\n\n"
+            "FRED 공식 API와 웹 CSV 다운로드가 모두 실패하여, 현재 화면의 수치는 "
+            "실제 연준 데이터가 아닌 **통계적 추정(Fallback) 시계열**입니다. "
+            "투자 판단이나 실제 유동성 분석에 사용하지 마시고, 잠시 후 다시 시도해 주세요."
+        )
+    else:
+        st.caption("✅ FRED(세인트루이스 연방준비은행) 공식 데이터 기준입니다.")
+
     # 최신 수치 및 변동폭 계산
     latest = df_liq.iloc[-1]
     prev_1w = df_liq.iloc[-2] if len(df_liq) >= 2 else latest
     prev_1m = df_liq.iloc[-5] if len(df_liq) >= 5 else prev_1w
-    
+
     # YTD (연초 대비)
     curr_year = latest.name.year if hasattr(latest.name, 'year') else datetime.now().year
     df_curr_year = df_liq[df_liq.index.year == curr_year]
@@ -79,7 +100,7 @@ def render_liquidity_view():
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric(
-            label="현재 연준 순유동성",
+            label="현재 연준 순유동성" + (" (추정)" if is_estimated else ""),
             value=f"${net_curr_t:.3f} T",
             delta=f"{net_diff_1w_b:+.1f} B (1주)",
             help="연준 총자산(WALCL) - 재무부 TGA - 역레포(ON RRP)"
@@ -88,7 +109,7 @@ def render_liquidity_view():
 
     with m2:
         st.metric(
-            label="연준 총자산 (WALCL)",
+            label="연준 총자산 (WALCL)" + (" (추정)" if is_estimated else ""),
             value=f"${walcl_curr_t:.3f} T",
             help="연준의 전체 대차대조표 자산 규모"
         )
@@ -96,7 +117,7 @@ def render_liquidity_view():
 
     with m3:
         st.metric(
-            label="재무부 일반계좌 (TGA)",
+            label="재무부 일반계좌 (TGA)" + (" (추정)" if is_estimated else ""),
             value=f"${tga_curr_b:.1f} B",
             help="미국 재무부의 연준 현금 계좌 (증가 시 시중 유동성 흡수)"
         )
@@ -104,7 +125,7 @@ def render_liquidity_view():
 
     with m4:
         st.metric(
-            label="역레포 잔고 (ON RRP)",
+            label="역레포 잔고 (ON RRP)" + (" (추정)" if is_estimated else ""),
             value=f"${rrp_curr_b:.1f} B",
             help="시중 유동성이 연준에 예치된 잔고 (감소 시 시중 유동성 방출)"
         )
@@ -152,7 +173,7 @@ def render_liquidity_view():
 
         cutoff_date = pd.Timestamp.now() - pd.DateOffset(days=days_back)
         df_liq_sub = df_liq[df_liq.index >= cutoff_date].copy()
-        
+
         start_str = cutoff_date.strftime('%Y-%m-%d')
         df_index = fetch_overlay_index_data(selected_ticker, start_str)
 
@@ -168,24 +189,22 @@ def render_liquidity_view():
             if not merged_overlay.empty:
                 corr_val = merged_overlay['Net_Liquidity_T'].corr(merged_overlay['Close'])
                 corr_str = f"{corr_val:+.2f}" if not pd.isna(corr_val) else "N/A"
-                
+
                 st.info(f"💡 **선택 기간({selected_period_label}) 동안 연준 순유동성과 {selected_name} 간의 상관계수는 `{corr_str}` 입니다.** (1.0에 가까울수록 강한 양의 상관관계)")
 
                 fig_overlay = make_subplots(specs=[[{"secondary_y": True}]])
 
-                # 순유동성 (좌측 Y축)
                 fig_overlay.add_trace(
                     go.Scatter(
                         x=merged_overlay.index,
                         y=merged_overlay['Net_Liquidity_T'],
-                        name="연준 순유동성 ($T)",
+                        name="연준 순유동성 ($T)" + (" (추정)" if is_estimated else ""),
                         line=dict(color="#00D2D3", width=2.5),
                         mode="lines"
                     ),
                     secondary_y=False
                 )
 
-                # 비교 지수 (우측 Y축)
                 fig_overlay.add_trace(
                     go.Scatter(
                         x=merged_overlay.index,
@@ -208,7 +227,6 @@ def render_liquidity_view():
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                 )
 
-                # [수정 지점]: titlefont 대신 최신 Plotly 호환 title=dict(...) 및 tickfont 적용
                 fig_overlay.update_yaxes(
                     title=dict(text="순유동성 ($T)", font=dict(color="#00D2D3")),
                     secondary_y=False,
@@ -242,7 +260,7 @@ def render_liquidity_view():
         fig_comp.add_trace(go.Scatter(x=df_sub.index, y=df_sub['WALCL_T'], name="연준 총자산 (WALCL, $T)", line=dict(color="#3B82F6", width=2)))
         fig_comp.add_trace(go.Scatter(x=df_sub.index, y=df_sub['WTREGEN_T'], name="재무부 일반계정 (TGA, $T)", line=dict(color="#F59E0B", width=2)))
         fig_comp.add_trace(go.Scatter(x=df_sub.index, y=df_sub['RRP_B']/1000.0, name="역레포 잔고 (ON RRP, $T)", line=dict(color="#10B981", width=2)))
-        fig_comp.add_trace(go.Scatter(x=df_sub.index, y=df_sub['Net_Liquidity_T'], name="연준 순유동성 ($T)", line=dict(color="#00D2D3", width=2.5, dash="solid")))
+        fig_comp.add_trace(go.Scatter(x=df_sub.index, y=df_sub['Net_Liquidity_T'], name="연준 순유동성 ($T)" + (" (추정)" if is_estimated else ""), line=dict(color="#00D2D3", width=2.5, dash="solid")))
 
         fig_comp.update_layout(
             template="plotly_dark",
