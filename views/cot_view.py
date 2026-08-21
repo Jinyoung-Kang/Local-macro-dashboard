@@ -8,8 +8,7 @@ from plotly.subplots import make_subplots
 import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from services.cot_service import fetch_cftc_cot_legacy, CFTCTransientError
-from config import ASSET_CODES
+from services.cot_service import fetch_cftc_cot_legacy, CFTCTransientError, COT_ASSETS
 
 
 def render_cot_view():
@@ -31,7 +30,7 @@ def render_cot_view():
     with col1:
         selected_asset = st.selectbox(
             "분석 대상 자산 선택",
-            options=list(ASSET_CODES.keys()),
+            options=list(COT_ASSETS.keys()),
             index=0
         )
     with col2:
@@ -48,7 +47,7 @@ def render_cot_view():
     with st.spinner(f"{selected_asset}의 COT 주체별 데이터를 불러오는 중..."):
         try:
             df = fetch_cftc_cot_legacy(
-                ASSET_CODES[selected_asset],
+                COT_ASSETS[selected_asset]["code"],
                 limit=weeks_to_fetch,
             )
         except CFTCTransientError as e:
