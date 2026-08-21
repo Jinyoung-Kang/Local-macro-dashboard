@@ -3,6 +3,7 @@ services/dashboard_snapshot_service.py
 대시보드 전체 데이터를 AI 분석이나 텍스트 복사를 위해 병렬 수집하고 원본 텍스트 스냅샷을 생성합니다.
 """
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -38,6 +39,29 @@ def safe_call(fn, *args, **kwargs):
     except Exception as e:
         logger.warning("스냅샷 데이터 수집 실패 (%s): %s", fn.__name__, e)
         return None
+
+
+def clean_ui_tag(text: str) -> str:
+    """텍스트 내 포함된 UI 표시용 마크다운(gray 등)을 깔끔하게 제거합니다."""
+    if not isinstance(text, str):
+        return str(text)
+    text = re.sub(r":gray\[\[.*?\]\]", "", text)
+    text = re.sub(r":gray\[.*?\]", "", text)
+    text = re.sub(r"\[\[.*?\]\]", "", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _get_num(row, *keys, default=0.0):
+    """지정된 키 순서대로 값을 찾고 안전하게 float로 파싱합니다."""
+    for key in keys:
+        value = row.get(key)
+        if value is None or pd.isna(value):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
 
 
 def collect_dashboard_snapshot() -> dict:
@@ -102,24 +126,26 @@ def _append_macro_section(lines: list[str], macro_res):
 
     if isinstance(collected, dict):
         for category_name, items in collected.items():
-            lines.append(f"\n### {category_name}")
+            clean_category = clean_ui_tag(category_name)
+            lines.append(f"\n### {clean_category}")
 
             for item in items:
                 if not isinstance(item, dict):
                     continue
 
                 status = item.get("status")
+                clean_name = clean_ui_tag(item.get("name", ""))
 
                 if status in ["ok", "single"]:
                     lines.append(
-                        f"- {item.get('name', '')}: "
+                        f"- {clean_name}: "
                         f"{item.get('price_str', 'N/A')} | "
                         f"{item.get('delta_str', 'N/A')} | "
                         f"직전: {item.get('prev_str', 'N/A')}"
                     )
                 else:
                     lines.append(
-                        f"- {item.get('name', '')}: 데이터 수집 실패"
+                        f"- {clean_name}: 데이터 수집 실패"
                     )
 
     if r10_curr is not None and r2_curr is not None:
@@ -193,17 +219,17 @@ def _append_liquidity_section(lines: list[str], liquidity_res):
     latest = liquidity_res.iloc[-1]
     prev = liquidity_res.iloc[-2] if len(liquidity_res) > 1 else latest
     
-    walcl = float(latest.get("WALCL", 0))
-    tga = float(latest.get("WTREGEN", 0))
-    rrp = float(latest.get("RRPONTSYD", 0))
-    net_liq = float(latest.get("Net_Liquidity", 0))
-    net_liq_prev = float(prev.get("Net_Liquidity", 0))
+    walcl_t = _get_num(latest, "WALCL_T")
+    tga_b = _get_num(latest, "WTREGEN_B")
+    rrp_b = _get_num(latest, "RRP_B")
+    net_liq_t = _get_num(latest, "Net_Liquidity_T")
+    net_liq_prev_t = _get_num(prev, "Net_Liquidity_T")
     
     lines.extend([
-        f"- 연준 총자산 (WALCL): {walcl:,.2f}",
-        f"- 재무부 일반계정 (TGA): {tga:,.2f}",
-        f"- 역레포 (ON RRP): {rrp:,.2f}",
-        f"- 연준 순유동성 (Net Liquidity): {net_liq:,.2f} (직전 대비 {net_liq - net_liq_prev:+,.2f})",
+        f"- 연준 총자산 (WALCL): ${walcl_t:,.3f}T",
+        f"- 재무부 일반계정 (TGA): ${tga_b:,.1f}B",
+        f"- 역레포 (ON RRP): ${rrp_b:,.1f}B",
+        f"- 연준 순유동성: ${net_liq_t:,.3f}T (직전 대비 {net_liq_t - net_liq_prev_t:+,.3f}T)",
         ""
     ])
 
@@ -252,6 +278,7 @@ def _append_krx_section(lines: list[str], krx_res, krx_inv_res):
 
     if krx_inv_res is not None and isinstance(krx_inv_res, pd.DataFrame) and not krx_inv_res.empty:
         lines.append("\n### 주요 투자자 20일 누적 순매수:")
+        lines.append("⚠️ 투자자별 20일 누적 수급은 현재 예시/추정 데이터이며, KRX 공식 확정 투자자별 선물 거래 데이터가 아닙니다.")
         for _, r in krx_inv_res.iterrows():
             subj = r.get("투자 주체", r.get("주체", "Unknown"))
             amt = r.get("20일 누적", r.get("20일 누적 순매수 (계약)", 0))
