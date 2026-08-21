@@ -17,7 +17,6 @@ from services.macro_service import (
     fetch_ticker_data,
     generate_full_macro_text,
     get_collected_macro_data,
-    get_macro_risk_indicators_for_ai,
 )
 from services.dashboard_snapshot_service import (
     collect_dashboard_snapshot,
@@ -85,15 +84,20 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         st.error(f"데이터 수집 중 오류가 발생했습니다: {e}")
         return
 
-    # 거시 변동성 데이터 수집
-    vix_hist = fetch_ticker_data("^VIX", period="1mo")
-    move_hist = fetch_ticker_data("^MOVE", period="1mo")
-    hy_df = fetch_fred_series("BAMLH0A0HYM2")
-    stlfsi_df = fetch_fred_series("STLFSI4")
+    # 옵션 B: 화면 metric 카드 및 텍스트 브리핑용 데이터를 단 1회 3mo/3y 기준으로 통합 수집
+    vix_hist = fetch_ticker_data("^VIX", period="3mo")
+    move_hist = fetch_ticker_data("^MOVE", period="3mo")
+    hy_df = fetch_fred_series("BAMLH0A0HYM2", period_years=3)
+    stlfsi_df = fetch_fred_series("STLFSI4", period_years=3)
     cp_spread_df = fetch_fred_cp_spread()
-    
-    # 텍스트 출력용 리스크 지표 스냅샷
-    risk_data = get_macro_risk_indicators_for_ai()
+
+    risk_data = {
+        "VIX": vix_hist,
+        "MOVE": move_hist,
+        "HY_OAS": hy_df,
+        "CP_SPREAD": cp_spread_df,
+        "STLFSI4": stlfsi_df,
+    }
 
     # AI 호출 없는 거시경제 매크로 원본 브리핑 생성
     report_text = generate_full_macro_text(
