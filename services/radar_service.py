@@ -2,7 +2,7 @@
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
 [KIS(FHPTJ04400000) -> KRX -> Daum -> Naver -> PyKrx]
-공식 지원 투자주체(외국인/기관/투신/은행/보험/종금/기금/기타기관/기타법인) 매핑 탑재
+공식 지원 투자주체(외국인/기관/투신/은행/보험/종금/기금/기타기관/기타법인) 매핑 탑재 및 실제 pykrx 누적수급 산출 기능 강화
 """
 import logging
 import re
@@ -710,11 +710,87 @@ def get_market_radar_scanner(target_date_obj, market: str = "KOSPI", investor: s
 
 
 # ==============================================================================
-# 9. 기준일(0점) 누적 수급 계산
+# 9. 기준일(0점) 누적 수급 실제 데이터 로더 (pykrx 기반)
 # ==============================================================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
+    """
+    pykrx의 실제 투자자별 순매수 데이터를 기반으로
+    외국인/기관/개인 누적 수급 시계열을 생성합니다.
+    """
+    if not PYKRX_AVAILABLE:
+        logger.warning("pykrx 미설치: 실제 투자자별 데이터를 가져올 수 없으므로 추정치 헬퍼를 호출합니다.")
+        return estimate_flow_by_price_volume_heuristic(stock_code, start_date_obj, end_date_obj)
+
+    start_str = start_date_obj.strftime("%Y%m%d")
+    end_str = end_date_obj.strftime("%Y%m%d")
+
+    try:
+        df = stock.get_market_net_purchases_of_equities_by_date(
+            start_str,
+            end_str,
+            "11" if stock_code.endswith(".KQ") else "01",
+            stock_code.replace('.KS', '').replace('.KQ', '')
+        )
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.reset_index().rename(columns={"날짜": "Date"})
+        df["Date"] = pd.to_datetime(df["Date"])
+
+        col_map = {
+            "외국인합계": "Foreigner_Daily",
+            "기관합계": "Institution_Daily",
+            "개인": "Retail_Daily",
+        }
+
+        for src_col, new_col in col_map.items():
+            if src_col in df.columns:
+                df[new_col] = df[src_col]
+            else:
+                df[new_col] = 0.0
+
+        df["Foreigner_Cum"] = df["Foreigner_Daily"].cumsum()
+        df["Institution_Cum"] = df["Institution_Daily"].cumsum()
+        df["Retail_Cum"] = df["Retail_Daily"].cumsum()
+
+        price_df = stock.get_market_ohlcv_by_date(
+            start_str, end_str, stock_code.replace('.KS', '').replace('.KQ', '')
+        )
+
+        if price_df is not None and not price_df.empty:
+            price_df = price_df.reset_index().rename(
+                columns={"날짜": "Date", "종가": "Close"}
+            )
+            price_df["Date"] = pd.to_datetime(price_df["Date"])
+            df = df.merge(
+                price_df[["Date", "Close"]],
+                on="Date",
+                how="left",
+            )
+        else:
+            df["Close"] = None
+
+        return df[[
+            "Date", "Close",
+            "Foreigner_Daily", "Institution_Daily", "Retail_Daily",
+            "Foreigner_Cum", "Institution_Cum", "Retail_Cum",
+        ]]
+
+    except Exception as e:
+        logger.error(f"pykrx 실제 수급 데이터 수집 실패: {e}")
+        return estimate_flow_by_price_volume_heuristic(stock_code, start_date_obj, end_date_obj)
+
+
+def estimate_flow_by_price_volume_heuristic(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
+    """
+    ⚠️ 주의: 이 함수는 실제 투자자별 데이터가 아닙니다.
+    pykrx 오류 또는 접근 불가 시 가격 변동률과 거래량만으로 만든 통계적 추정치이며,
+    실제 KRX 공시 수급과 다를 수 있습니다.
+    """
     ticker_str = f"{stock_code}.KS" if not stock_code.endswith((".KS", ".KQ")) else stock_code
+
     try:
         start_str = start_date_obj.strftime("%Y-%m-%d")
         end_str = (end_date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -724,20 +800,30 @@ def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_dat
 
         if not df.empty:
             df = df.reset_index()
-            df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+            if "Date" in df.columns:
+                df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+            elif "Datetime" in df.columns:
+                df["Date"] = pd.to_datetime(df["Datetime"]).dt.tz_localize(None)
 
             pct_change = df["Close"].pct_change().fillna(0)
             vol = df["Volume"]
 
             df["Foreigner_Daily"] = (pct_change * vol * df["Close"] * 0.000000035).round(1)
             df["Institution_Daily"] = (pct_change.shift(1).fillna(0) * vol * df["Close"] * 0.00000002).round(1)
-            df["Retail_Daily"] = -(df["Foreigner_Daily"] + df["Institution_Daily"]).round(1)
+            df["Retail_Daily"] = (-df["Foreigner_Daily"] - df["Institution_Daily"]).round(1)
 
             df["Foreigner_Cum"] = df["Foreigner_Daily"].cumsum().round(1)
             df["Institution_Cum"] = df["Institution_Daily"].cumsum().round(1)
             df["Retail_Cum"] = df["Retail_Daily"].cumsum().round(1)
 
-            return df[["Date", "Close", "Foreigner_Daily", "Institution_Daily", "Retail_Daily", "Foreigner_Cum", "Institution_Cum", "Retail_Cum"]]
+            # 누락 방지를 위해 'is_estimated' 플래그 추가 (views에서 확인 가능)
+            df["is_estimated"] = True 
+
+            return df[[
+                "Date", "Close",
+                "Foreigner_Daily", "Institution_Daily", "Retail_Daily",
+                "Foreigner_Cum", "Institution_Cum", "Retail_Cum", "is_estimated"
+            ]]
     except Exception as e:
-        logger.error(f"기준일 누적 산출 실패: {e}")
-    return pd.DataFrame()
+        logger.error(f"Fallback 수급 추정치 생성 실패: {e}")
+        return pd.DataFrame()
