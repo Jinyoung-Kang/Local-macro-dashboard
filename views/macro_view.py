@@ -15,7 +15,6 @@ from services.macro_service import (
     fetch_fred_cp_spread,
     fetch_fred_series,
     fetch_ticker_data,
-    generate_briefing_text,
     generate_full_macro_text,
     get_collected_macro_data,
     get_macro_risk_indicators_for_ai,
@@ -93,10 +92,10 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     stlfsi_df = fetch_fred_series("STLFSI4")
     cp_spread_df = fetch_fred_cp_spread()
     
-    # 텍스트 출력용 리스크 지표
+    # 텍스트 출력용 리스크 지표 스냅샷
     risk_data = get_macro_risk_indicators_for_ai()
 
-    # AI용 스냅샷 요약 (모든 자산 전체 출력)
+    # AI 호출 없는 거시경제 매크로 원본 브리핑 생성
     report_text = generate_full_macro_text(
         collected_data=collected_data,
         rate_10y_curr=rate_10y_curr,
@@ -144,7 +143,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             ):
                 with st.spinner("전체 대시보드 원본 데이터를 병렬 수집 중입니다..."):
                     snapshot = collect_dashboard_snapshot()
-
                     st.session_state.dashboard_raw_snapshot_text = (
                         format_dashboard_snapshot_text(snapshot)
                     )
