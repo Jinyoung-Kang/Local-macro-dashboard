@@ -43,7 +43,25 @@ def inject_market_status(name: str) -> str:
 
     status = "마감"
 
-    if "비트코인" in name or "이더리움" in name or "암호화폐" in name:
+    # [신규] 야간/글로벌 선물 전용 판정 (일반 현물 지수 규칙보다 먼저 체크해야 함)
+    # KOSPI200 야간선물(CME 연계), 닛케이225 선물, 항셍 선물 등은
+    # 이름에 "코스피"/"닛케이"/"항셍"이 포함돼 있어 일반 현물 규칙과 충돌하므로
+    # "선물" 포함 여부로 먼저 걸러냅니다.
+    is_night_futures_item = "선물" in name and any(
+        k in name for k in ["코스피", "닛케이", "항셍"]
+    )
+
+    if is_night_futures_item:
+        # 야간선물 거래시간: 18:00 ~ 익일 06:00 (월~금 야간, 금요일 야간은 토요일 06:00까지 연장)
+        is_evening_session = hm >= 1800 and wd in [0, 1, 2, 3, 4]      # 월~금 18:00 이후
+        is_early_morning_session = hm < 600 and wd in [1, 2, 3, 4, 5]  # 화~토 06:00 이전 (전날 야간 연장)
+
+        if is_evening_session or is_early_morning_session:
+            status = "개장"
+        else:
+            status = "마감"
+
+    elif "비트코인" in name or "이더리움" in name or "암호화폐" in name:
         status = "개장"
     elif "코스피" in name or "코스닥" in name:
         if not is_weekend and 900 <= hm < 1530:
