@@ -591,32 +591,23 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 # ==============================================================================
 def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     """
-    Daum 금융 외국인/기관 매매종목 HTML 페이지에서 데이터를 스크래핑합니다.
+    Daum 금융 외국인/기관 매매종목 페이지에서 데이터를 스크래핑합니다.
 
-    주의: 예전 JSON API(api/trend/investors/...)는 HTTP 500을 반환하며
-    더 이상 사용할 수 없습니다. 현재는 서버 렌더링된 HTML 표를 직접
-    파싱합니다. 이 페이지는 외국인 매매만 제공하며(기관 미지원),
-    KOSPI/KOSDAQ 탭 전환용 파라미터는 공식적으로 확인되지 않았습니다.
+    주의: 이 페이지는 React로 렌더링되므로 requests.get()으로는 빈 뼈대
+    HTML만 받게 됩니다. 반드시 _fetch_rendered_html()로 헤드리스
+    브라우저를 통해 렌더링한 뒤 파싱해야 합니다. 외국인 매매만
+    제공하며(기관 미지원), KOSPI/KOSDAQ 탭 전환 파라미터는 아직
+    확인되지 않았습니다.
     """
     if investor != "외국인":
         logger.warning("Daum HTML 페이지는 외국인 매매만 지원합니다: %s (Naver/PyKrx로 대체됩니다)", investor)
         return pd.DataFrame()
 
     url = "https://finance.daum.net/domestic/influential_investors"
-    headers = {
-        **COMMON_HEADERS,
-        "Referer": "https://finance.daum.net/",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=8)
-
-        if resp.status_code != 200:
-            logger.warning(f"Daum HTML 페이지 실패: HTTP {resp.status_code}")
-            return pd.DataFrame()
-
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html = _fetch_rendered_html(url, wait_selector="table")
+        soup = BeautifulSoup(html, "html.parser")
 
         target_table = None
         for table in soup.find_all("table"):
@@ -626,7 +617,7 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
                 break
 
         if target_table is None:
-            logger.warning("Daum HTML 페이지에서 순매수/순매도 표를 찾지 못했습니다.")
+            logger.warning("Daum 렌더링 페이지에서 순매수/순매도 표를 찾지 못했습니다.")
             return pd.DataFrame()
 
         records = []
@@ -670,7 +661,7 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
                 "등락률(%)": change_pct,
                 "순매수대금(억)": amt_eok,
                 "시가총액_가중": 500,
-                "데이터_출처": f"Daum 실시간 페이지 ({target_date})"
+                "데이터_출처": f"Daum 실시간 (렌더링) ({target_date})"
             })
             rank += 1
             if rank > top_n:
@@ -680,7 +671,7 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
             return pd.DataFrame(records)
 
     except Exception as e:
-        logger.warning(f"Daum HTML 페이지 스크래핑 실패: {e}")
+        logger.warning(f"Daum 렌더링 스크래핑 실패: {e}")
 
     return pd.DataFrame()
 
