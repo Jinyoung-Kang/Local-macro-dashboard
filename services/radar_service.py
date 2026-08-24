@@ -1270,3 +1270,43 @@ def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_dat
 
     logger.error(f"pykrx, Daum 모두 실패. 가격/거래량 기반 추정치로 대체합니다 (종목={stock_code}).")
     return estimate_flow_by_price_volume_heuristic(stock_code, start_date_obj, end_date_obj)
+
+# 임시 함수
+def debug_daum_investor_periods() -> dict:
+    """
+    [진단 전용] Daum 외국인/기관매매 페이지에서 기간 탭(당일/5영업일/
+    20영업일) 클릭 시 실제로 어떤 네트워크 요청이 발생하는지 캡처합니다.
+    이 함수는 정확한 파라미터를 알아낸 뒤에는 삭제해도 됩니다.
+    """
+    captured_requests = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(user_agent=COMMON_HEADERS["User-Agent"])
+
+        page.on(
+            "request",
+            lambda req: captured_requests.append(req.url)
+            if "daum" in req.url and (
+                "api" in req.url or "investor" in req.url.lower()
+            )
+            else None,
+        )
+
+        page.goto(
+            "https://finance.daum.net/domestic/influential_investors",
+            wait_until="networkidle",
+            timeout=15000,
+        )
+
+        # 기간 탭으로 추정되는 텍스트를 찾아 클릭 시도
+        for label in ["5영업일", "20영업일", "당일"]:
+            try:
+                page.click(f"text={label}", timeout=3000)
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+        browser.close()
+
+    return {"captured_urls": list(dict.fromkeys(captured_requests))}
