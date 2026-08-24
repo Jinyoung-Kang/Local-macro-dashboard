@@ -107,9 +107,11 @@ SCRAPER_MARKETS = [
         "key": "shanghai",
         "name": "상해종합",
         "url": "https://www.investing.com/indices/shanghai-composite",
-        "provider": "Investing.com",
-        "kind": "investing_index",
+        "provider": "Yahoo Finance",
+        "kind": "yahoo_chart",
+        "symbol": "000001.SS",
         "unit": "pt",
+        "reference_source": "Investing.com",
     },
     {
         "key": "hang_seng",
@@ -147,6 +149,50 @@ def _fetch_html(url: str) -> str:
     )
     response.raise_for_status()
     return response.text
+
+
+def _fetch_yahoo_chart(
+    symbol: str,
+) -> tuple[float | None, float | None]:
+    """
+    Yahoo Finance chart endpoint에서 최근 종가와 전일 종가를 읽습니다.
+
+    반환값:
+      (최근 종가, 직전 거래일 종가)
+    """
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{symbol}?range=10d&interval=1d&includePrePost=false"
+    )
+
+    response = requests.get(
+        url,
+        headers=REQUEST_HEADERS,
+        timeout=10,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    result = payload["chart"]["result"][0]
+    closes = result["indicators"]["quote"][0]["close"]
+
+    valid_closes = [
+        float(close)
+        for close in closes
+        if close is not None
+    ]
+
+    if not valid_closes:
+        return None, None
+
+    current = valid_closes[-1]
+    previous = (
+        valid_closes[-2]
+        if len(valid_closes) >= 2
+        else None
+    )
+
+    return current, previous
 
 
 def _extract_previous_close(text: str) -> float | None:
@@ -472,24 +518,59 @@ def _collect_one_market(config: dict) -> dict:
     }
 
     try:
-        html = _fetch_html(config["url"])
+        kind = config["kind"]
 
-        if config["kind"].startswith("tradingview"):
-            price, previous_close, change, change_pct = (
-                _parse_tradingview(
-                    html,
-                    config["kind"],
-                )
+        if kind == "yahoo_chart":
+            price, previous_close = _fetch_yahoo_chart(
+                config["symbol"]
             )
+
+            change = (
+                price - previous_close
+                if price is not None
+                and previous_close is not None
+                else None
+            )
+
+            change_pct = (
+                (change / previous_close) * 100
+                if change is not None
+                and previous_close not in (None, 0)
+                else None
+            )
+
         else:
-            price, previous_close, change, change_pct = (
-                _parse_investing(html)
-            )
+            html = _fetch_html(config["url"])
+
+            if kind.startswith("tradingview"):
+                (
+                    price,
+                    previous_close,
+                    change,
+                    change_pct,
+                ) = _parse_tradingview(
+                    html,
+                    kind,
+                )
+
+            elif kind == "investing_index":
+                (
+                    price,
+                    previous_close,
+                    change,
+                    change_pct,
+                ) = _parse_investing(html)
+
+            else:
+                result["error"] = (
+                    f"지원하지 않는 수집 방식: {kind}"
+                )
+                return result
 
         if price is None:
             result["error"] = (
-                "페이지에서 현재값을 추출하지 못했습니다. "
-                "비공식 페이지 구조가 변경됐거나 접근이 제한됐을 수 있습니다."
+                "현재값을 수집하지 못했습니다. "
+                "외부 데이터 제공처의 응답 또는 페이지 구조를 확인하세요."
             )
             return result
 
@@ -505,7 +586,7 @@ def _collect_one_market(config: dict) -> dict:
 
     except Exception as e:
         logger.warning(
-            "비공식 스크래핑 실패 (%s / %s): %s",
+            "비공식 시세 수집 실패 (%s / %s): %s",
             config["name"],
             config["provider"],
             e,
