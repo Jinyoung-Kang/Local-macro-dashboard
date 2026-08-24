@@ -6,6 +6,12 @@ views/toss_test_view.py
 기존 Global Macro Dashboard 메뉴의 지표는 전혀 건드리지 않고,
 이 테스트 메뉴 안에서만 토스증권 API로 동일 지표를 조회해
 실시간/지연 여부와 함께 비교합니다.
+
+[Daum 기간 탭 진단 섹션]
+외국인/기관 수급 레이더 메뉴의 Daum 스크래핑에 "당일/5영업일/20영업일"
+기간 선택 기능을 추가하기 위해, 먼저 실제 네트워크 요청을 캡처해
+정확한 API 파라미터를 확인하는 진단 전용 버튼입니다. 파라미터를
+확인한 뒤에는 이 섹션을 삭제해도 됩니다.
 """
 import streamlit as st
 
@@ -16,6 +22,7 @@ from services.toss_service import (
     get_market_indicator_prices,
     get_stock_prices,
 )
+from services.radar_service import debug_daum_investor_periods
 
 # ==============================================================================
 # Global Macro Dashboard와 동일한 카테고리 구조로 매핑
@@ -305,3 +312,51 @@ def render_toss_test_view():
                     f"(조회방식: `{target['kind']}`, "
                     f"심볼: `{target.get('symbol', target.get('base', ''))}`)"
                 )
+
+    # ==========================================================================
+    # [진단 전용] Daum 외국인/기관매매 기간 탭(당일/5영업일/20영업일)
+    # 실제 API 파라미터 캡처
+    #
+    # 목적: 외국인/기관 수급 레이더 메뉴의 Daum 스크래핑에 기간 선택
+    # 기능을 추가하기 전에, 브라우저가 탭 클릭 시 실제로 어떤 네트워크
+    # 요청을 보내는지 먼저 확인합니다. 정확한 파라미터를 확인한 뒤에는
+    # 이 섹션 전체를 삭제해도 됩니다.
+    # ==========================================================================
+    st.divider()
+    st.subheader("🔬 [진단] Daum 기간 탭 API 캡처")
+    st.caption(
+        "Daum 외국인/기관매매 페이지(finance.daum.net/domestic/"
+        "influential_investors)에서 '당일/5영업일/20영업일' 탭을 "
+        "클릭했을 때 실제로 호출되는 네트워크 요청 주소를 캡처합니다. "
+        "정확한 API 파라미터를 확인하기 위한 일회성 진단 도구입니다."
+    )
+
+    if st.button(
+        "🔬 Daum 기간 탭 네트워크 요청 캡처 실행",
+        key="btn_debug_daum_period",
+    ):
+        with st.spinner(
+            "헤드리스 브라우저로 페이지를 열고 기간 탭을 "
+            "클릭하며 네트워크 요청을 캡처하는 중..."
+        ):
+            debug_result = debug_daum_investor_periods()
+
+        captured_urls = debug_result.get("captured_urls", [])
+
+        if not captured_urls:
+            st.warning(
+                "네트워크 요청이 캡처되지 않았습니다. 탭 버튼의 "
+                "텍스트가 다르거나(예: '5일'이 아니라 다른 표기), "
+                "탭 클릭이 새 요청을 만들지 않고 이미 로드된 데이터를 "
+                "JS로만 필터링하는 방식일 수 있습니다."
+            )
+        else:
+            st.success(
+                f"{len(captured_urls)}개의 관련 네트워크 요청을 "
+                "캡처했습니다."
+            )
+            for idx, url in enumerate(captured_urls, start=1):
+                st.code(f"{idx}. {url}", language="text")
+
+        with st.expander("원본 응답 보기"):
+            st.json(debug_result)
