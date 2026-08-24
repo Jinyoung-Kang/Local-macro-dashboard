@@ -143,7 +143,7 @@ def test_toss_connection() -> tuple[bool, str]:
 
     except Exception as e:
         return False, f"알 수 없는 오류: {type(e).__name__}: {e}"
-    
+
 
 def get_exchange_rate(
     base_currency: str = "USD",
@@ -187,7 +187,11 @@ def get_exchange_rate(
 
 def get_market_indicator_prices(symbols: list[str]) -> dict:
     """
-    지수/종목 시세를 조회합니다.
+    지수/채권 등 Market Indicators 카탈로그 시세를 조회합니다.
+
+    주의: 이 엔드포인트는 사전 정의된 카탈로그(지수·국채 등)만
+    지원합니다. 개별 종목(삼성전자 등)은 get_stock_prices()를
+    사용하세요.
     """
     token, error = get_access_token()
 
@@ -204,6 +208,52 @@ def get_market_indicator_prices(symbols: list[str]) -> dict:
         response.raise_for_status()
         return response.json()
 
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "알수없음"
+        body = e.response.text[:300] if e.response is not None else ""
+        logger.warning(
+            "토스증권 Market Indicator 조회 실패: HTTP %s %s",
+            status, body,
+        )
+        return {"error": f"HTTP {status}: {body}"}
+
     except Exception as e:
         logger.warning("토스증권 시세 조회 실패: %s", e)
+        return {"error": str(e)}
+
+
+def get_stock_prices(symbols: list[str]) -> dict:
+    """
+    개별 종목(국내/미국 주식) 현재가를 조회합니다.
+    최대 200개 심볼을 콤마로 구분해 한 번에 조회 가능합니다.
+
+    국내 종목 예시: 005930 (삼성전자)
+    미국 종목 예시: AAPL, MSFT
+    """
+    token, error = get_access_token()
+
+    if not token:
+        return {"error": error}
+
+    try:
+        response = requests.get(
+            f"{TOSS_API_BASE_URL}/api/v1/prices",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"symbols": ",".join(symbols)},
+            timeout=8,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "알수없음"
+        body = e.response.text[:300] if e.response is not None else ""
+        logger.warning(
+            "토스증권 종목 시세 조회 실패: HTTP %s %s",
+            status, body,
+        )
+        return {"error": f"HTTP {status}: {body}"}
+
+    except Exception as e:
+        logger.warning("토스증권 종목 시세 조회 실패: %s", e)
         return {"error": str(e)}
