@@ -620,87 +620,132 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 # ==============================================================================
 # 4. Daum 실시간 API (시장 전체 랭킹)
 # ==============================================================================
-def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
+def fetch_daum_deal_ranking(
+    target_date: str,
+    market: str,
+    investor: str,
+    trade_type: str,
+    top_n: int,
+    interval_type: str = "TODAY",
+) -> pd.DataFrame:
     """
-    ⚠️ 주의: 이 함수는 target_date를 실제로 조회 조건에 사용하지 않습니다.
-    Daum의 이 페이지는 "현재 시점"의 데이터만 제공하며, 특정 과거 날짜를
-    지정해 조회하는 기능이 없습니다. target_date는 결과 라벨링에만
-    사용됩니다. 반드시 get_market_radar_scanner()에서 "오늘" 조회일
-    때만 호출하세요.
+    Daum 금융 외국인/기관 매매종목 JSON API에서 데이터를 가져옵니다.
+
+    실제 API: finance.daum.net/api/trend/investor_purchase/
+    Playwright로 확인된 정확한 엔드포인트이며, JSON을 직접 반환하므로
+    헤드리스 브라우저가 필요 없습니다.
+
+    interval_type:
+      "TODAY"    당일
+      "DAYS_5"   5거래일 누적
+      "DAYS_20"  20거래일 누적
+
+    주의: 이 API는 investorType으로 "FOREIGN"(외국인)만 확인됐습니다.
+    기관(INSTITUTION) 등 다른 값이 실제로 지원되는지는 별도 확인이
+    필요하며, 확인 전까지는 외국인만 지원하는 것으로 처리합니다.
     """
     if investor != "외국인":
-        logger.warning("Daum HTML 페이지는 외국인 매매만 지원합니다: %s (Naver/PyKrx로 대체됩니다)", investor)
+        logger.warning(
+            "Daum investor_purchase API는 외국인만 확인됐습니다: %s "
+            "(Naver/PyKrx로 대체됩니다)",
+            investor,
+        )
         return pd.DataFrame()
 
-    url = "https://finance.daum.net/domestic/influential_investors"
+    valid_intervals = {"TODAY", "DAYS_5", "DAYS_20"}
+    if interval_type not in valid_intervals:
+        logger.warning(
+            "지원하지 않는 interval_type: %s (TODAY로 대체)",
+            interval_type,
+        )
+        interval_type = "TODAY"
+
+    market_param = (
+        "KOSPI"
+        if "KOSPI" in market.upper() or "코스피" in market
+        else "KOSDAQ"
+    )
+
+    url = "https://finance.daum.net/api/trend/investor_purchase/"
+    params = {
+        "buyFieldName": "straightPurchasePrice",
+        "buyOrder": "desc",
+        "sellFieldName": "straightPurchasePrice",
+        "sellOrder": "asc",
+        "limit": top_n,
+        "market": market_param,
+        "investorType": "FOREIGN",
+        "intervalType": interval_type,
+    }
+    headers = {
+        **COMMON_HEADERS,
+        "Referer": "https://finance.daum.net/domestic/influential_investors",
+        "Accept": "application/json, text/plain, */*",
+    }
 
     try:
-        html = _fetch_rendered_html(url, wait_selector="table")
-        soup = BeautifulSoup(html, "html.parser")
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
 
-        target_table = None
-        for table in soup.find_all("table"):
-            header_text = table.get_text()
-            if "순매수" in header_text and "순매도" in header_text:
-                target_table = table
-                break
+        if resp.status_code != 200:
+            logger.warning(
+                "Daum investor_purchase API 실패: HTTP %s",
+                resp.status_code,
+            )
+            return pd.DataFrame()
 
-        if target_table is None:
-            logger.warning("Daum 렌더링 페이지에서 순매수/순매도 표를 찾지 못했습니다.")
+        payload = resp.json()
+
+        buy_list = payload.get("buyRanking", payload.get("buy", []))
+        sell_list = payload.get("sellRanking", payload.get("sell", []))
+
+        target_list = buy_list if trade_type == "순매수" else sell_list
+
+        if not target_list:
+            logger.warning(
+                "Daum investor_purchase API: %s 결과가 비어 있습니다 "
+                "(interval=%s)",
+                trade_type,
+                interval_type,
+            )
             return pd.DataFrame()
 
         records = []
-        rank = 1
 
-        for row in target_table.find_all("tr"):
-            cols = row.find_all("td")
-            if len(cols) < 8:
-                continue
+        for idx, row in enumerate(target_list[:top_n], start=1):
+            code = str(row.get("symbolCode", row.get("code", ""))).replace("A", "")
+            name = row.get("name", row.get("stockName", ""))
+            price = float(row.get("tradePrice", row.get("price", 0)) or 0)
+            change_pct = float(row.get("changeRate", 0) or 0) * 100.0
 
-            if trade_type == "순매수":
-                name = cols[0].get_text().strip()
-                amt_text = cols[1].get_text().strip()
-                change_text = cols[3].get_text().strip()
-            else:
-                name = cols[4].get_text().strip()
-                amt_text = cols[5].get_text().strip()
-                change_text = cols[7].get_text().strip()
+            amt_raw = float(
+                row.get("straightPurchasePrice", row.get("purchasePrice", 0)) or 0
+            )
+            amt_eok = round(abs(amt_raw) / 100000000.0, 1)
+
+            if trade_type == "순매도":
+                amt_eok = -abs(amt_eok)
 
             if not name:
                 continue
 
-            def clean_num(text):
-                cleaned = re.sub(r"[^\d.]", "", text)
-                return float(cleaned) if cleaned else 0.0
-
-            amt_raw = clean_num(amt_text)
-            change_pct = clean_num(change_text)
-            if change_text.strip().startswith("-"):
-                change_pct = -change_pct
-
-            amt_eok = round(amt_raw / 100.0, 1)
-            if trade_type == "순매도":
-                amt_eok = -abs(amt_eok)
-
             records.append({
-                "순위": rank,
-                "종목코드": "",
+                "순위": idx,
+                "종목코드": code,
                 "종목명": name,
-                "현재가": 0.0,
-                "등락률(%)": change_pct,
+                "현재가": price,
+                "등락률(%)": round(change_pct, 2),
                 "순매수대금(억)": amt_eok,
-                "시가총액_가중": 500,
-                "데이터_출처": f"Daum 실시간 (렌더링) ({target_date})"
+                "시가총액_가중": max(price * 1000, 500),
+                "데이터_출처": (
+                    f"Daum API ({interval_type}, {target_date})"
+                ),
             })
-            rank += 1
-            if rank > top_n:
-                break
 
         if records:
             return pd.DataFrame(records)
 
     except Exception as e:
-        logger.warning(f"Daum 렌더링 스크래핑 실패: {e}")
+        logger.warning(f"Daum investor_purchase API 실패: {e}")
 
     return pd.DataFrame()
 
