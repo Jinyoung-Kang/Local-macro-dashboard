@@ -48,13 +48,23 @@ COMMON_HEADERS = {
 from playwright.sync_api import sync_playwright
 
 
-def _fetch_rendered_html(url: str, wait_selector: str = "table", timeout_ms: int = 10000) -> str:
+def _fetch_rendered_html(
+    url: str,
+    wait_selector: str = "table",
+    timeout_ms: int = 10000,
+    wait_state: str = "attached",
+) -> str:
     """
     JS로 렌더링되는 페이지(Naver/Daum 신규 UI)를 헤드리스 브라우저로
     실제 렌더링한 뒤 최종 HTML을 반환합니다.
 
     주의: 일반 requests.get()으로는 React/Next.js가 그리는 표를
     가져올 수 없어서 이 방식이 필요합니다.
+
+    wait_state="attached"를 기본값으로 사용합니다. Naver의 일부 표는
+    CSS로 숨겨져 있거나(display:none) 크기가 0이어서 "visible" 상태를
+    영원히 만족하지 못할 수 있지만, HTML 자체에는 데이터가 완성되어
+    있으므로 DOM에 존재하기만 하면 충분합니다.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -63,7 +73,11 @@ def _fetch_rendered_html(url: str, wait_selector: str = "table", timeout_ms: int
         )
         try:
             page.goto(url, timeout=timeout_ms, wait_until="networkidle")
-            page.wait_for_selector(wait_selector, timeout=timeout_ms)
+            page.wait_for_selector(
+                wait_selector,
+                timeout=timeout_ms,
+                state=wait_state,
+            )
             html = page.content()
         finally:
             browser.close()
@@ -268,7 +282,9 @@ def test_naver_scraping():
     try:
         html = _fetch_rendered_html(url, wait_selector="table")
         soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("table")
+        table = soup.find("table", {"class": "type_1"})
+        if table is None:
+            table = soup.find("table")
 
         if table is None:
             return False, "렌더링 후에도 표(table)를 찾지 못했습니다."
@@ -697,7 +713,9 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
     try:
         html = _fetch_rendered_html(url, wait_selector="table")
         soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("table")
+        table = soup.find("table", {"class": "type_1"})
+        if table is None:
+            table = soup.find("table")
 
         if not table:
             return pd.DataFrame()
