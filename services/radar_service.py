@@ -629,20 +629,18 @@ def fetch_daum_deal_ranking(
     interval_type: str = "TODAY",
 ) -> pd.DataFrame:
     """
-    Daum 금융 외국인/기관 매매종목 JSON API에서 데이터를 가져옵니다.
+    Daum 금융 외국인 매매종목 JSON API에서 데이터를 가져옵니다.
 
     실제 API: finance.daum.net/api/trend/investor_purchase/
-    Playwright로 확인된 정확한 엔드포인트이며, JSON을 직접 반환하므로
-    헤드리스 브라우저가 필요 없습니다.
+    응답 구조는 Playwright 네트워크 캡처로 직접 확인했습니다.
 
     interval_type:
       "TODAY"    당일
       "DAYS_5"   5거래일 누적
       "DAYS_20"  20거래일 누적
 
-    주의: 이 API는 investorType으로 "FOREIGN"(외국인)만 확인됐습니다.
-    기관(INSTITUTION) 등 다른 값이 실제로 지원되는지는 별도 확인이
-    필요하며, 확인 전까지는 외국인만 지원하는 것으로 처리합니다.
+    주의: 이 API는 investorType="FOREIGN"(외국인)만 확인됐습니다.
+    기관은 지원 여부가 확인되지 않아 자동으로 건너뜁니다.
     """
     if investor != "외국인":
         logger.warning(
@@ -694,11 +692,9 @@ def fetch_daum_deal_ranking(
             return pd.DataFrame()
 
         payload = resp.json()
+        data = payload.get("data", {})
 
-        buy_list = payload.get("buyRanking", payload.get("buy", []))
-        sell_list = payload.get("sellRanking", payload.get("sell", []))
-
-        target_list = buy_list if trade_type == "순매수" else sell_list
+        target_list = data.get("BUY" if trade_type == "순매수" else "SELL", [])
 
         if not target_list:
             logger.warning(
@@ -709,27 +705,29 @@ def fetch_daum_deal_ranking(
             )
             return pd.DataFrame()
 
+        from_date = payload.get("fromDate", "")
+        to_date = payload.get("toDate", target_date)
+
+        period_label = (
+            f"{from_date}~{to_date}" if interval_type != "TODAY" else to_date
+        )
+
         records = []
 
-        for idx, row in enumerate(target_list[:top_n], start=1):
-            code = str(row.get("symbolCode", row.get("code", ""))).replace("A", "")
-            name = row.get("name", row.get("stockName", ""))
-            price = float(row.get("tradePrice", row.get("price", 0)) or 0)
+        for row in target_list[:top_n]:
+            code = str(row.get("symbolCode", "")).replace("A", "")
+            name = row.get("name", "")
+            price = float(row.get("tradePrice", 0) or 0)
             change_pct = float(row.get("changeRate", 0) or 0) * 100.0
 
-            amt_raw = float(
-                row.get("straightPurchasePrice", row.get("purchasePrice", 0)) or 0
-            )
-            amt_eok = round(abs(amt_raw) / 100000000.0, 1)
+            amt_raw = float(row.get("straightPurchasePrice", 0) or 0)
+            amt_eok = round(amt_raw / 100000000.0, 1)
 
-            if trade_type == "순매도":
-                amt_eok = -abs(amt_eok)
-
-            if not name:
+            if not name or not code:
                 continue
 
             records.append({
-                "순위": idx,
+                "순위": row.get("rank", 0),
                 "종목코드": code,
                 "종목명": name,
                 "현재가": price,
@@ -737,7 +735,9 @@ def fetch_daum_deal_ranking(
                 "순매수대금(억)": amt_eok,
                 "시가총액_가중": max(price * 1000, 500),
                 "데이터_출처": (
-                    f"Daum API ({interval_type}, {target_date})"
+                    f"Daum API "
+                    f"({INTERVAL_LABELS.get(interval_type, interval_type)}, "
+                    f"{period_label})"
                 ),
             })
 
@@ -960,26 +960,8 @@ def get_market_radar_scanner(
     investor: str = "외국인",
     trade_type: str = "순매수",
     top_n: int = 30,
+    interval_type: str = "TODAY",
 ) -> pd.DataFrame:
-    """
-    무중단 파이프라인 마스터 함수 (Smart Fallback, 시장 전체 랭킹)
-
-    중요: Naver/Daum 스크래핑은 "특정 날짜"를 조회하는 기능이 없으며,
-    항상 조회 시점의 최신(오늘) 데이터만 제공합니다. 따라서 오늘이 아닌
-    과거 날짜를 조회할 때는 Naver/Daum을 완전히 건너뛰고, 날짜를
-    실제로 인자로 받아 처리하는 PyKrx만 사용합니다. 그렇지 않으면
-    과거 날짜를 선택해도 항상 "오늘 데이터"가 잘못된 날짜 라벨로
-    반환됩니다.
-
-    장중 (평일 09:00~15:30, 오늘 날짜):
-      KIS(가집계) -> Daum(실시간) -> Naver(실시간)
-
-    장마감 후 (오늘 날짜, 장 종료~24시):
-      Naver(오늘자 확정) -> Daum(오늘자 확정) -> PyKrx
-
-    진짜 과거 날짜 (오늘이 아닌 날짜):
-      PyKrx만 사용 (날짜를 실제로 지정 조회하는 유일한 소스)
-    """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     today_str = now_kst.strftime("%Y%m%d")
     current_time = now_kst.time()
@@ -998,7 +980,6 @@ def get_market_radar_scanner(
         is_live_session = is_today and is_regular_session
 
         if is_live_session:
-            # 장중(오늘): KIS 가집계 우선, 실패 시 Daum -> Naver
             df = fetch_kis_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
             )
@@ -1007,6 +988,7 @@ def get_market_radar_scanner(
 
             df = fetch_daum_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
+                interval_type=interval_type,
             )
             if df is not None and not df.empty:
                 return df
@@ -1018,7 +1000,6 @@ def get_market_radar_scanner(
                 return df
 
         elif is_today:
-            # 장마감 후(오늘): Naver/Daum이 "오늘자 최종 확정"을 의미하므로 유효
             df = fetch_naver_html_ranking(
                 search_date_str, market, investor, trade_type, top_n,
             )
@@ -1027,19 +1008,17 @@ def get_market_radar_scanner(
 
             df = fetch_daum_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
+                interval_type=interval_type,
             )
             if df is not None and not df.empty:
                 return df
 
         else:
-            # 진짜 과거 날짜: Naver/Daum은 날짜 조회를 지원하지 않으므로
-            # 완전히 건너뛰고 PyKrx로만 조회합니다.
             logger.info(
                 "과거 날짜(%s) 조회: 날짜 미지원 소스(Naver/Daum) 건너뛰고 PyKrx만 사용",
                 search_date_str,
             )
 
-        # PyKrx는 날짜를 실제로 지정해 조회하는 유일한 확정 데이터 소스
         if PYKRX_AVAILABLE:
             df = fetch_pykrx_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
