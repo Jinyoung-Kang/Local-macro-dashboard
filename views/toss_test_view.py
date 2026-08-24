@@ -7,12 +7,11 @@ views/toss_test_view.py
 이 테스트 메뉴 안에서만 토스증권 API로 동일 지표를 조회해
 실시간/지연 여부와 함께 비교합니다.
 
-[Daum 기간 탭 진단 섹션]
+[Daum 기간 선택 진단 섹션]
 외국인/기관 수급 레이더 메뉴의 Daum 스크래핑에 "당일/5영업일/20영업일"
-기간 선택 기능을 추가하기 위해, 먼저 실제 네트워크 요청을 캡처해
-정확한 API 파라미터를 확인하는 진단 전용 버튼입니다. 탭별로 요청이
-어떻게 바뀌는지 구분해서 캡처합니다. 파라미터를 확인한 뒤에는 이
-섹션을 삭제해도 됩니다.
+기간 선택 기능을 추가하기 위해, 페이지의 <select> 드롭다운 구조와
+옵션 선택 시 실제 API 요청이 어떻게 바뀌는지 확인하는 진단 전용
+버튼입니다. 정확한 파라미터를 확인한 뒤에는 이 섹션을 삭제해도 됩니다.
 """
 import streamlit as st
 
@@ -315,42 +314,51 @@ def render_toss_test_view():
                 )
 
     # ==========================================================================
-    # [진단 전용] Daum 외국인/기관매매 기간 탭(당일/5영업일/20영업일)
+    # [진단 전용] Daum 외국인/기관매매 기간 선택 <select> 드롭다운
     # 실제 API 파라미터 캡처
     #
     # 목적: 외국인/기관 수급 레이더 메뉴의 Daum 스크래핑에 기간 선택
-    # 기능을 추가하기 전에, 각 탭 클릭 시 investor_purchase API 요청이
-    # 어떻게 바뀌는지 탭별로 구분해서 확인합니다. 정확한 파라미터를
-    # 확인한 뒤에는 이 섹션 전체를 삭제해도 됩니다.
+    # 기능을 추가하기 전에, <select> 드롭다운의 실제 구조(옵션 값)와
+    # 옵션 선택 시 investor_purchase API 요청이 어떻게 바뀌는지
+    # 확인합니다. 정확한 파라미터를 확인한 뒤에는 이 섹션 전체를
+    # 삭제해도 됩니다.
     # ==========================================================================
     st.divider()
-    st.subheader("🔬 [진단] Daum 기간 탭 API 캡처")
+    st.subheader("🔬 [진단] Daum 기간 선택 API 캡처")
     st.caption(
         "Daum 외국인/기관매매 페이지(finance.daum.net/domestic/"
-        "influential_investors)에서 '당일/5영업일/20영업일' 탭을 "
-        "각각 클릭했을 때 investor_purchase API 요청이 어떻게 "
-        "바뀌는지 탭별로 구분해서 캡처합니다."
+        "influential_investors)의 기간 선택 드롭다운 구조를 확인하고, "
+        "'당일/5영업일/20영업일' 옵션 선택 시 investor_purchase API "
+        "요청이 어떻게 바뀌는지 캡처합니다."
     )
 
     if st.button(
-        "🔬 Daum 기간 탭 네트워크 요청 캡처 실행",
+        "🔬 Daum 기간 선택 네트워크 요청 캡처 실행",
         key="btn_debug_daum_period",
     ):
         with st.spinner(
-            "헤드리스 브라우저로 페이지를 열고 각 기간 탭을 "
-            "순서대로 클릭하며 네트워크 요청을 캡처하는 중..."
+            "헤드리스 브라우저로 페이지를 열고 드롭다운 구조를 "
+            "확인한 뒤, 각 기간 옵션을 선택하며 네트워크 요청을 "
+            "캡처하는 중..."
         ):
             debug_result = debug_daum_investor_periods()
 
-        for tab_name, urls in debug_result.items():
-            st.markdown(f"**{tab_name}**")
-            if not urls:
+        for section_name, payload in debug_result.items():
+            st.markdown(f"**{section_name}**")
+
+            if section_name == "__select_구조__":
+                st.json(payload)
+                continue
+
+            if not payload:
                 st.caption(
-                    "이 탭 클릭 시 investor_purchase 요청이 "
+                    "이 옵션 선택 시 investor_purchase 요청이 "
                     "발생하지 않았습니다."
                 )
-            for url in urls:
-                st.code(url, language="text")
+                continue
+
+            for item in payload:
+                st.code(item, language="text")
 
         with st.expander("원본 응답 보기"):
             st.json(debug_result)
