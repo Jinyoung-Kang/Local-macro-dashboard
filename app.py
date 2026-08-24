@@ -17,6 +17,7 @@ from views.krx_cot_view import render_krx_cot_view
 from views.radar_view import render_radar_view
 from views.ai_test_view import render_ai_test_view
 from views.ai_report_view import render_ai_report_view
+from views.toss_test_view import render_toss_test_view
 
 # SSL 경고 비활성화
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -138,8 +139,9 @@ menu_selection = st.sidebar.radio(
     "이동할 메뉴를 선택하세요",
     [
         "📊 거시경제 매크로 지표", 
-        "🏢 연준 순유동성 트래커",
+        "🏢 연준 순유동성 트래커",        
         "🔄 섹터 & 자산군 로테이션",
+        "🔌 토스증권 API 테스트",
         "📑 기관 13F 포트폴리오 분석", 
         "🎯 기관 13F Money 교집합",
         "🏛️ 글로벌 투기세력 (COT)",
@@ -192,6 +194,8 @@ elif menu_selection == "🏢 연준 순유동성 트래커":
     render_liquidity_view()
 elif menu_selection == "🔄 섹터 & 자산군 로테이션":
     render_sector_view()
+elif menu_selection == "🔌 토스증권 API 테스트":
+    render_toss_test_view()
 elif menu_selection == "📑 기관 13F 포트폴리오 분석":
     render_sec_view()
 elif menu_selection == "🎯 기관 13F Money 교집합":

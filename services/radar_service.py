@@ -825,17 +825,6 @@ def get_market_radar_scanner(
             if df is not None and not df.empty:
                 return df
 
-        # 장마감 후 또는 과거 영업일은 확정 데이터 우선
-        df = fetch_krx_date_deal_ranking(
-            search_date_str,
-            market,
-            investor,
-            trade_type,
-            top_n,
-        )
-        if df is not None and not df.empty:
-            return df
-
         if PYKRX_AVAILABLE:
             df = fetch_pykrx_deal_ranking(
                 search_date_str,

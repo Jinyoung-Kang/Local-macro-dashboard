@@ -5,6 +5,9 @@ config.py
 import os
 import streamlit as st
 
+for key, value in st.secrets.items():
+    os.environ.setdefault(key, str(value))
+    
 # ==============================================================================
 # 0. Secret & 환경 변수 로드 헬퍼 및 API 설정
 # ==============================================================================
@@ -56,6 +59,20 @@ def get_krx_key() -> str:
         key = get_secret("krx_api_key", "")
     return key
 
+def get_toss_credentials() -> tuple[str, str]:
+    """
+    Streamlit Secrets의 [toss] client_id/client_secret 또는
+    TOSS_CLIENT_ID / TOSS_CLIENT_SECRET 환경변수를 자동 탐색합니다.
+    """
+    client_id = get_secret("toss.client_id", "")
+    if not client_id:
+        client_id = get_secret("TOSS_CLIENT_ID", "")
+
+    client_secret = get_secret("toss.client_secret", "")
+    if not client_secret:
+        client_secret = get_secret("TOSS_CLIENT_SECRET", "")
+
+    return client_id, client_secret
 
 def get_fred_key() -> str:
     """
