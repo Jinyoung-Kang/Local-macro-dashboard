@@ -622,13 +622,11 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 # ==============================================================================
 def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     """
-    Daum 금융 외국인/기관 매매종목 페이지에서 데이터를 스크래핑합니다.
-
-    주의: 이 페이지는 React로 렌더링되므로 requests.get()으로는 빈 뼈대
-    HTML만 받게 됩니다. 반드시 _fetch_rendered_html()로 헤드리스
-    브라우저를 통해 렌더링한 뒤 파싱해야 합니다. 외국인 매매만
-    제공하며(기관 미지원), KOSPI/KOSDAQ 탭 전환 파라미터는 아직
-    확인되지 않았습니다.
+    ⚠️ 주의: 이 함수는 target_date를 실제로 조회 조건에 사용하지 않습니다.
+    Daum의 이 페이지는 "현재 시점"의 데이터만 제공하며, 특정 과거 날짜를
+    지정해 조회하는 기능이 없습니다. target_date는 결과 라벨링에만
+    사용됩니다. 반드시 get_market_radar_scanner()에서 "오늘" 조회일
+    때만 호출하세요.
     """
     if investor != "외국인":
         logger.warning("Daum HTML 페이지는 외국인 매매만 지원합니다: %s (Naver/PyKrx로 대체됩니다)", investor)
@@ -712,11 +710,9 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
 # ==============================================================================
 def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     """
-    Naver 금융 수급 순위 iframe 페이지에서 데이터를 스크래핑합니다.
-
-    주의: 이 페이지에는 class="type_1"인 표가 여러 개 존재할 수 있습니다.
-    첫 번째 표가 아니라, 실제로 종목 링크를 가장 많이 포함한 표를
-    선택해야 합니다.
+    ⚠️ 주의: 이 함수도 target_date를 실제로 조회 조건에 사용하지 않습니다.
+    Naver iframe 페이지는 "현재 시점"의 최신 순위만 제공합니다.
+    반드시 get_market_radar_scanner()에서 "오늘" 조회일 때만 호출하세요.
     """
     sosok = "01" if "KOSPI" in market.upper() or "코스피" in market else "02"
     inv_code = NAVER_INVESTOR_MAP.get(investor)
@@ -887,6 +883,25 @@ def get_market_radar_scanner(
     trade_type: str = "순매수",
     top_n: int = 30,
 ) -> pd.DataFrame:
+    """
+    무중단 파이프라인 마스터 함수 (Smart Fallback, 시장 전체 랭킹)
+
+    중요: Naver/Daum 스크래핑은 "특정 날짜"를 조회하는 기능이 없으며,
+    항상 조회 시점의 최신(오늘) 데이터만 제공합니다. 따라서 오늘이 아닌
+    과거 날짜를 조회할 때는 Naver/Daum을 완전히 건너뛰고, 날짜를
+    실제로 인자로 받아 처리하는 PyKrx만 사용합니다. 그렇지 않으면
+    과거 날짜를 선택해도 항상 "오늘 데이터"가 잘못된 날짜 라벨로
+    반환됩니다.
+
+    장중 (평일 09:00~15:30, 오늘 날짜):
+      KIS(가집계) -> Daum(실시간) -> Naver(실시간)
+
+    장마감 후 (오늘 날짜, 장 종료~24시):
+      Naver(오늘자 확정) -> Daum(오늘자 확정) -> PyKrx
+
+    진짜 과거 날짜 (오늘이 아닌 날짜):
+      PyKrx만 사용 (날짜를 실제로 지정 조회하는 유일한 소스)
+    """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     today_str = now_kst.strftime("%Y%m%d")
     current_time = now_kst.time()
@@ -905,7 +920,7 @@ def get_market_radar_scanner(
         is_live_session = is_today and is_regular_session
 
         if is_live_session:
-            # 장중: KIS 가집계 우선, 실패 시 Daum -> Naver
+            # 장중(오늘): KIS 가집계 우선, 실패 시 Daum -> Naver
             df = fetch_kis_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
             )
@@ -924,8 +939,8 @@ def get_market_radar_scanner(
             if df is not None and not df.empty:
                 return df
 
-        else:
-            # 장마감 후 / 과거 영업일: 확정 데이터 소스를 Naver -> Daum 순으로 우선
+        elif is_today:
+            # 장마감 후(오늘): Naver/Daum이 "오늘자 최종 확정"을 의미하므로 유효
             df = fetch_naver_html_ranking(
                 search_date_str, market, investor, trade_type, top_n,
             )
@@ -938,7 +953,15 @@ def get_market_radar_scanner(
             if df is not None and not df.empty:
                 return df
 
-        # 위 소스가 모두 실패하면 PyKrx를 최종 폴백으로 사용
+        else:
+            # 진짜 과거 날짜: Naver/Daum은 날짜 조회를 지원하지 않으므로
+            # 완전히 건너뛰고 PyKrx로만 조회합니다.
+            logger.info(
+                "과거 날짜(%s) 조회: 날짜 미지원 소스(Naver/Daum) 건너뛰고 PyKrx만 사용",
+                search_date_str,
+            )
+
+        # PyKrx는 날짜를 실제로 지정해 조회하는 유일한 확정 데이터 소스
         if PYKRX_AVAILABLE:
             df = fetch_pykrx_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
