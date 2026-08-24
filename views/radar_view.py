@@ -17,6 +17,8 @@ from services.radar_service import (
     test_kis_connection,
     test_ls_connection,
     test_pykrx_connection,
+    test_naver_scraping,
+    test_daum_scraping,
     PYKRX_AVAILABLE
 )
 
@@ -40,34 +42,71 @@ def render_radar_view():
     # ==========================================================================
     # KIS / LS / PyKrx API 연결 상태 진단 패널
     # ==========================================================================
-    with st.expander("🛠️ KIS / LS / PyKrx API 연결 상태 테스트", expanded=False):
-        st.write("KIS, LS 및 PyKrx의 작동 및 인증 상태를 점검합니다.")
-        st.caption("LS API는 실전투자 계좌 연동 시에만 정상 동작하며, 미등록 시 LS TR 시도는 건너뜁니다.")
-
-        if st.button("🔌 KIS / LS / PyKrx API 테스트 실행", key="btn_test_broker_apis"):
-            with st.spinner("KIS API 상태 점검 중..."):
+    with st.expander("🛠️ KIS / LS / PyKrx / Naver / Daum 연결 상태 테스트", expanded=False):
+        st.write("KIS, LS, PyKrx, Naver, Daum 5개 데이터 소스의 연결 상태를 각각 점검합니다.")
+        st.caption(
+            "LS API는 LS증권 계정이 없으면 실패가 정상입니다. "
+            "KIS는 장중 가집계 전용이라 장 마감 후 실패는 정상입니다. "
+            "Naver/Daum은 장 마감 후에도 확정 데이터를 제공해야 정상입니다."
+        )
+    
+        if st.button(
+            "🔍 5개 소스 연결 테스트 실행",
+            key="btn_test_broker_apis",
+        ):
+            with st.spinner("KIS API 점검 중..."):
                 k_ok, k_msg = test_kis_connection()
-            with st.spinner("LS API 상태 점검 중..."):
+            with st.spinner("LS API 점검 중..."):
                 l_ok, l_msg = test_ls_connection()
-            with st.spinner("PyKrx(KRX 웹) 상태 점검 중..."):
+            with st.spinner("PyKrx(KRX) 점검 중..."):
                 p_ok, p_msg = test_pykrx_connection()
-
-            c1, c2, c3 = st.columns(3)
+            with st.spinner("Naver 스크래핑 점검 중..."):
+                n_ok, n_msg = test_naver_scraping()
+            with st.spinner("Daum 스크래핑 점검 중..."):
+                d_ok, d_msg = test_daum_scraping()
+    
+            c1, c2, c3, c4, c5 = st.columns(5)
+    
             with c1:
                 if k_ok:
-                    st.success(f"**✅ KIS API:** {k_msg}")
+                    st.success(f"KIS API 정상\n\n{k_msg}")
                 else:
-                    st.error(f"**❌ KIS API:** {k_msg}")
+                    st.warning(f"KIS API 실패\n\n{k_msg}")
+    
             with c2:
                 if l_ok:
-                    st.success(f"**✅ LS API:** {l_msg}")
+                    st.success(f"LS API 정상\n\n{l_msg}")
                 else:
-                    st.warning(f"**⚠️ LS API (LS 계좌 미보유 시 정상):** {l_msg}")
+                    st.warning(f"LS API 실패 (LS 미보유 시 정상)\n\n{l_msg}")
+    
             with c3:
                 if p_ok:
-                    st.success(f"**✅ PyKrx(KRX 웹):** {p_msg}")
+                    st.success(f"PyKrx(KRX) 정상\n\n{p_msg}")
                 else:
-                    st.error(f"**❌ PyKrx(KRX 웹):** {p_msg}")
+                    st.error(f"PyKrx(KRX) 실패\n\n{p_msg}")
+    
+            with c4:
+                if n_ok:
+                    st.success(f"Naver 스크래핑 정상\n\n{n_msg}")
+                else:
+                    st.error(f"Naver 스크래핑 실패\n\n{n_msg}")
+    
+            with c5:
+                if d_ok:
+                    st.success(f"Daum 스크래핑 정상\n\n{d_msg}")
+                else:
+                    st.error(f"Daum 스크래핑 실패\n\n{d_msg}")
+    
+            if not n_ok and not d_ok:
+                st.error(
+                    "⚠️ Naver와 Daum이 모두 실패했습니다. 이 경우 장 마감 후 "
+                    "수급 데이터는 PyKrx로만 제공되며, PyKrx도 실패하면 "
+                    "수급 레이더가 완전히 비게 됩니다."
+                )
+            elif not n_ok:
+                st.info("Naver는 실패했지만 Daum이 정상이므로 데이터는 계속 제공됩니다.")
+            elif not d_ok:
+                st.info("Daum은 실패했지만 Naver가 정상이므로 데이터는 계속 제공됩니다.")
 
     # ==========================================================================
     # 조회 조건 설정
