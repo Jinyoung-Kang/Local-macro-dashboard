@@ -233,16 +233,19 @@ def test_pykrx_connection():
 
 def test_naver_scraping():
     """
-    Naver 금융 수급 순위 페이지(sise_deal_rank.naver)가 실제로 응답하고,
-    표(table.type_1)를 정상적으로 파싱할 수 있는지 점검합니다.
+    Naver 금융 수급 순위 iframe 페이지(sise_deal_rank_iframe.naver)가
+    실제로 응답하고, 표를 정상적으로 파싱할 수 있는지 점검합니다.
+
+    주의: 겉 페이지(sise_deal_rank.naver)는 더 이상 표를 직접 담고 있지
+    않으며, 실제 데이터는 sise_deal_rank_iframe.naver에 있습니다.
     """
     url = (
-        "https://finance.naver.com/sise/sise_deal_rank.naver"
-        "?investor_gubun=9000&sosok=01&type=1"
+        "https://finance.naver.com/sise/sise_deal_rank_iframe.naver"
+        "?sosok=01&investor_gubun=9000&type=buy"
     )
     headers = {
         **COMMON_HEADERS,
-        "Referer": "https://finance.naver.com/sise/",
+        "Referer": "https://finance.naver.com/sise/sise_deal_rank.naver",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
@@ -253,10 +256,10 @@ def test_naver_scraping():
             return False, f"HTTP {resp.status_code} 응답 (페이지 접속 실패)"
 
         soup = BeautifulSoup(resp.content.decode("euc-kr", "replace"), "html.parser")
-        table = soup.find("table", {"class": "type_1"})
+        table = soup.find("table")
 
         if table is None:
-            return False, "응답은 받았으나 예상한 표(table.type_1)를 찾지 못했습니다. 페이지 구조가 바뀌었을 수 있습니다."
+            return False, "응답은 받았으나 표(table)를 찾지 못했습니다. iframe 페이지 구조가 다시 바뀌었을 수 있습니다."
 
         rows = table.find_all("tr")
         parsed = 0
@@ -279,39 +282,49 @@ def test_naver_scraping():
 
 def test_daum_scraping():
     """
-    Daum 금융 투자자별 매매동향 API(finance.daum.net/api/trend/investors)가
-    실제로 JSON 데이터를 반환하는지 점검합니다.
+    Daum 금융 외국인/기관 매매종목 페이지
+    (finance.daum.net/domestic/influential_investors)가 실제로
+    HTML 표를 반환하는지 점검합니다.
+
+    주의: 예전 JSON API(api/trend/investors/...)는 더 이상 정상 동작하지
+    않으며(HTTP 500), 현재는 서버 렌더링된 HTML 페이지로 완전히
+    이전되었습니다.
     """
-    url = (
-        "https://finance.daum.net/api/trend/investors/top_net_buyers"
-        "?market=KOSPI&investorType=FOREIGN"
-    )
+    url = "https://finance.daum.net/domestic/influential_investors"
     headers = {
         **COMMON_HEADERS,
-        "Referer": "https://finance.daum.net/trend/investors",
-        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://finance.daum.net/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=6)
+        resp = requests.get(url, headers=headers, timeout=8)
 
         if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code} 응답 (API 접속 실패)"
+            return False, f"HTTP {resp.status_code} 응답 (페이지 접속 실패)"
 
-        try:
-            payload = resp.json()
-        except Exception:
-            return False, "응답을 JSON으로 해석할 수 없습니다 (형식이 바뀌었을 수 있습니다)."
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        items = payload.get("data", [])
+        target_table = None
+        for table in soup.find_all("table"):
+            header_text = table.get_text()
+            if "순매수" in header_text and "순매도" in header_text:
+                target_table = table
+                break
 
-        if not items:
-            return False, "정상 응답이지만 data 배열이 비어 있습니다 (휴장일이거나 데이터 미제공)."
+        if target_table is None:
+            return False, "응답은 받았으나 순매수/순매도 표를 찾지 못했습니다. 페이지 구조가 다시 바뀌었을 수 있습니다."
 
-        return True, f"정상 통신 성공 (외국인 순매수 상위 코스피 기준, 조회된 종목 수: {len(items)}개)"
+        rows = target_table.find_all("tr")
+        parsed = sum(1 for row in rows if len(row.find_all("td")) >= 8)
+
+        if parsed == 0:
+            return False, "표는 찾았지만 파싱 가능한 종목 행이 없습니다 (휴장일이거나 형식 변경 가능)."
+
+        return True, f"정상 통신 성공 (코스피 외국인 매매 기준, 파싱된 종목 수: {parsed}개)"
 
     except requests.exceptions.Timeout:
-        return False, "요청 시간 초과 (6초)"
+        return False, "요청 시간 초과 (8초)"
     except Exception as e:
         return False, f"예외 발생: {e}"
 
@@ -584,54 +597,97 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 # 4. Daum 실시간 API (시장 전체 랭킹)
 # ==============================================================================
 def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
-    market_param = "KOSPI" if "KOSPI" in market.upper() or "코스피" in market else "KOSDAQ"
-    inv_param = DAUM_INVESTOR_MAP.get(investor)
+    """
+    Daum 금융 외국인/기관 매매종목 HTML 페이지에서 데이터를 스크래핑합니다.
 
-    if inv_param is None:
-        logger.warning("Daum 미지원 투자주체: %s (Naver/PyKrx로 대체됩니다)", investor)
+    주의: 예전 JSON API(api/trend/investors/...)는 HTTP 500을 반환하며
+    더 이상 사용할 수 없습니다. 현재는 서버 렌더링된 HTML 표를 직접
+    파싱합니다. 이 페이지는 외국인 매매만 제공하며(기관 미지원),
+    KOSPI/KOSDAQ 탭 전환용 파라미터는 공식적으로 확인되지 않았습니다.
+    """
+    if investor != "외국인":
+        logger.warning("Daum HTML 페이지는 외국인 매매만 지원합니다: %s (Naver/PyKrx로 대체됩니다)", investor)
         return pd.DataFrame()
 
-    action = "top_net_buyers" if trade_type == "순매수" else "top_net_sellers"
-    url = f"https://finance.daum.net/api/trend/investors/{action}?market={market_param}&investorType={inv_param}"
+    url = "https://finance.daum.net/domestic/influential_investors"
     headers = {
         **COMMON_HEADERS,
-        "Referer": "https://finance.daum.net/trend/investors",
-        "Accept": "application/json, text/plain, */*"
+        "Referer": "https://finance.daum.net/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=6)
-        if resp.status_code == 200:
-            items = resp.json().get("data", [])
-            if items:
-                records = []
-                for idx, row in enumerate(items[:top_n], start=1):
-                    code = str(row.get("symbolCode", "")).replace("A", "")
-                    name = row.get("name", "")
-                    price = float(row.get("tradePrice", 0))
-                    change_pct = float(row.get("changeRate", 0)) * 100.0
-                    if str(row.get("change", "")).upper() in ["FALL", "DROP"]:
-                        change_pct = -abs(change_pct)
-                    net_amount = float(row.get("netBuyAmount", row.get("netAmount", 0)))
-                    amt_eok = round(abs(net_amount) / 100000000.0, 1)
-                    if trade_type == "순매도":
-                        amt_eok = -abs(amt_eok)
+        resp = requests.get(url, headers=headers, timeout=8)
 
-                    records.append({
-                        "순위": idx,
-                        "종목코드": code,
-                        "종목명": name,
-                        "현재가": price,
-                        "등락률(%)": round(change_pct, 2),
-                        "순매수대금(억)": amt_eok,
-                        "시가총액_가중": max(price * 1000, 500),
-                        "데이터_출처": f"Daum 실시간 API ({target_date})"
-                    })
-                return pd.DataFrame(records)
-        else:
-            logger.warning(f"Daum API 실패: HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            logger.warning(f"Daum HTML 페이지 실패: HTTP {resp.status_code}")
+            return pd.DataFrame()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        target_table = None
+        for table in soup.find_all("table"):
+            header_text = table.get_text()
+            if "순매수" in header_text and "순매도" in header_text:
+                target_table = table
+                break
+
+        if target_table is None:
+            logger.warning("Daum HTML 페이지에서 순매수/순매도 표를 찾지 못했습니다.")
+            return pd.DataFrame()
+
+        records = []
+        rank = 1
+
+        for row in target_table.find_all("tr"):
+            cols = row.find_all("td")
+            if len(cols) < 8:
+                continue
+
+            if trade_type == "순매수":
+                name = cols[0].get_text().strip()
+                amt_text = cols[1].get_text().strip()
+                change_text = cols[3].get_text().strip()
+            else:
+                name = cols[4].get_text().strip()
+                amt_text = cols[5].get_text().strip()
+                change_text = cols[7].get_text().strip()
+
+            if not name:
+                continue
+
+            def clean_num(text):
+                cleaned = re.sub(r"[^\d.]", "", text)
+                return float(cleaned) if cleaned else 0.0
+
+            amt_raw = clean_num(amt_text)
+            change_pct = clean_num(change_text)
+            if change_text.strip().startswith("-"):
+                change_pct = -change_pct
+
+            amt_eok = round(amt_raw / 100.0, 1)
+            if trade_type == "순매도":
+                amt_eok = -abs(amt_eok)
+
+            records.append({
+                "순위": rank,
+                "종목코드": "",
+                "종목명": name,
+                "현재가": 0.0,
+                "등락률(%)": change_pct,
+                "순매수대금(억)": amt_eok,
+                "시가총액_가중": 500,
+                "데이터_출처": f"Daum 실시간 페이지 ({target_date})"
+            })
+            rank += 1
+            if rank > top_n:
+                break
+
+        if records:
+            return pd.DataFrame(records)
+
     except Exception as e:
-        logger.warning(f"Daum API 실패: {e}")
+        logger.warning(f"Daum HTML 페이지 스크래핑 실패: {e}")
 
     return pd.DataFrame()
 
@@ -640,6 +696,11 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
 # 5. Naver 실시간 API (시장 전체 랭킹)
 # ==============================================================================
 def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
+    """
+    Naver 금융 수급 순위 iframe 페이지에서 데이터를 스크래핑합니다.
+    실제 데이터가 있는 페이지는 sise_deal_rank_iframe.naver입니다
+    (겉 페이지 sise_deal_rank.naver는 더 이상 표를 직접 담지 않음).
+    """
     sosok = "01" if "KOSPI" in market.upper() or "코스피" in market else "02"
     inv_code = NAVER_INVESTOR_MAP.get(investor)
 
@@ -647,12 +708,15 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
         logger.warning("Naver 미지원 투자주체: %s (Daum/PyKrx로 대체됩니다)", investor)
         return pd.DataFrame()
 
-    dir_type = "1" if trade_type == "순매수" else "2"
+    buy_sell = "buy" if trade_type == "순매수" else "sell"
 
-    url = f"https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun={inv_code}&sosok={sosok}&type={dir_type}"
+    url = (
+        "https://finance.naver.com/sise/sise_deal_rank_iframe.naver"
+        f"?sosok={sosok}&investor_gubun={inv_code}&type={buy_sell}"
+    )
     headers = {
         **COMMON_HEADERS,
-        "Referer": "https://finance.naver.com/sise/",
+        "Referer": "https://finance.naver.com/sise/sise_deal_rank.naver",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
 
@@ -660,7 +724,7 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
         resp = requests.get(url, headers=headers, timeout=8)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.content.decode("euc-kr", "replace"), "html.parser")
-            table = soup.find("table", {"class": "type_1"})
+            table = soup.find("table")
             if table:
                 records = []
                 rank = 1
