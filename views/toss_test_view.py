@@ -8,10 +8,13 @@ views/toss_test_view.py
 실시간/지연 여부와 함께 비교합니다.
 
 [Daum 기간 선택 진단 섹션]
-외국인/기관 수급 레이더 메뉴의 Daum 스크래핑에 "당일/5영업일/20영업일"
-기간 선택 기능을 추가하기 위해, 페이지의 <select> 드롭다운 구조와
-옵션 선택 시 실제 API 요청이 어떻게 바뀌는지 확인하는 진단 전용
-버튼입니다. 정확한 파라미터를 확인한 뒤에는 이 섹션을 삭제해도 됩니다.
+외국인/기관 수급 레이더 메뉴의 Daum 스크래핑에 "당일/5거래일/20거래일"
+기간 선택 기능을 추가하기 위한 진단 도구입니다.
+1. select 드롭다운 구조와 옵션 선택 시 URL 변화를 캡처 (완료:
+   intervalType=TODAY/DAYS_5/DAYS_20 확인됨)
+2. investor_purchase API의 실제 JSON 응답 키 구조를 확인
+   (fetch_daum_deal_ranking()의 필드 매핑 검증용)
+정확한 응답 구조를 확인한 뒤에는 이 섹션들을 삭제해도 됩니다.
 """
 import streamlit as st
 
@@ -22,7 +25,10 @@ from services.toss_service import (
     get_market_indicator_prices,
     get_stock_prices,
 )
-from services.radar_service import debug_daum_investor_periods
+from services.radar_service import (
+    debug_daum_investor_periods,
+    debug_daum_investor_purchase_response,
+)
 
 # ==============================================================================
 # Global Macro Dashboard와 동일한 카테고리 구조로 매핑
@@ -317,19 +323,17 @@ def render_toss_test_view():
     # [진단 전용] Daum 외국인/기관매매 기간 선택 <select> 드롭다운
     # 실제 API 파라미터 캡처
     #
-    # 목적: 외국인/기관 수급 레이더 메뉴의 Daum 스크래핑에 기간 선택
-    # 기능을 추가하기 전에, <select> 드롭다운의 실제 구조(옵션 값)와
-    # 옵션 선택 시 investor_purchase API 요청이 어떻게 바뀌는지
-    # 확인합니다. 정확한 파라미터를 확인한 뒤에는 이 섹션 전체를
-    # 삭제해도 됩니다.
+    # 확인 완료: select name="businessDay"
+    #   TODAY(당일) / DAYS_5(5거래일) / DAYS_20(20거래일)
+    # 실제 API: finance.daum.net/api/trend/investor_purchase/
+    #   ...&intervalType=TODAY|DAYS_5|DAYS_20
     # ==========================================================================
     st.divider()
     st.subheader("🔬 [진단] Daum 기간 선택 API 캡처")
     st.caption(
-        "Daum 외국인/기관매매 페이지(finance.daum.net/domestic/"
-        "influential_investors)의 기간 선택 드롭다운 구조를 확인하고, "
-        "'당일/5영업일/20영업일' 옵션 선택 시 investor_purchase API "
-        "요청이 어떻게 바뀌는지 캡처합니다."
+        "Daum 외국인/기관매매 페이지의 기간 선택 드롭다운 구조를 "
+        "확인하고, '당일/5거래일/20거래일' 옵션 선택 시 "
+        "investor_purchase API 요청이 어떻게 바뀌는지 캡처합니다."
     )
 
     if st.button(
@@ -362,3 +366,39 @@ def render_toss_test_view():
 
         with st.expander("원본 응답 보기"):
             st.json(debug_result)
+
+    # ==========================================================================
+    # [진단 전용] Daum investor_purchase API 실제 JSON 응답 구조 확인
+    #
+    # 목적: fetch_daum_deal_ranking()에서 사용할 정확한 JSON 키 이름
+    # (buyRanking/buyList, symbolCode/code 등)을 응답 원본으로 확인합니다.
+    # 응답 구조를 확정한 뒤에는 이 섹션을 삭제해도 됩니다.
+    # ==========================================================================
+    st.divider()
+    st.subheader("🔬 [진단] Daum JSON 응답 구조 확인")
+    st.caption(
+        "investor_purchase API를 직접 호출해 실제 응답 본문(JSON)의 "
+        "키 구조를 확인합니다. fetch_daum_deal_ranking()의 필드 매핑이 "
+        "정확한지 검증하기 위한 도구입니다."
+    )
+
+    interval_option = st.selectbox(
+        "확인할 기간",
+        options=["TODAY", "DAYS_5", "DAYS_20"],
+        format_func=lambda x: {
+            "TODAY": "당일",
+            "DAYS_5": "5거래일",
+            "DAYS_20": "20거래일",
+        }.get(x, x),
+        key="daum_debug_interval_select",
+    )
+
+    if st.button(
+        "🔬 investor_purchase 실제 응답 확인",
+        key="btn_debug_daum_response_body",
+    ):
+        with st.spinner("API 호출 중..."):
+            body_result = debug_daum_investor_purchase_response(
+                interval_option
+            )
+        st.json(body_result)
