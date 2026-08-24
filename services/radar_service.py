@@ -750,6 +750,39 @@ def fetch_daum_deal_ranking(
     return pd.DataFrame()
 
 
+def debug_daum_investor_purchase_response(interval_type: str = "TODAY") -> dict:
+    """
+    [진단 전용] investor_purchase API의 실제 JSON 응답 키 구조를
+    확인합니다. fetch_daum_deal_ranking()의 필드 매핑이 정확한지
+    검증하기 위한 일회성 도구입니다.
+    """
+    url = "https://finance.daum.net/api/trend/investor_purchase/"
+    params = {
+        "buyFieldName": "straightPurchasePrice",
+        "buyOrder": "desc",
+        "sellFieldName": "straightPurchasePrice",
+        "sellOrder": "asc",
+        "limit": 5,
+        "market": "KOSPI",
+        "investorType": "FOREIGN",
+        "intervalType": interval_type,
+    }
+    headers = {
+        **COMMON_HEADERS,
+        "Referer": "https://finance.daum.net/domestic/influential_investors",
+        "Accept": "application/json, text/plain, */*",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        return {
+            "status_code": resp.status_code,
+            "body": resp.json() if resp.status_code == 200 else resp.text[:500],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ==============================================================================
 # 5. Naver 실시간 API (시장 전체 랭킹)
 # ==============================================================================
