@@ -1,10 +1,16 @@
 """
 services/radar_service.py
 5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
-[KIS(FHPTJ04400000) -> LS -> KRX -> Daum -> Naver -> PyKrx]
+[KIS(FHPTJ04400000) -> LS -> Daum -> Naver -> PyKrx]
 공식 지원 투자주체(외국인/기관/투신/은행/보험/종금/기금/기타기관/기타법인) 매핑 탑재
+
+변경사항 (2026-08-24):
+- KRX 공식 OpenAPI(/sto/stk_bydd_trd) 단계를 파이프라인에서 완전히 제거했습니다.
+  해당 엔드포인트는 종목별 일일 시세(OHLCV)만 제공하며 투자자별 순매수 컬럼
+  (FRGN_NETBID_AMT 등)이 없어 항상 실패했습니다. 자격증명 문제가 아니라
+  잘못된 API 선택이었으므로, fetch_krx_date_deal_ranking() 함수 자체를
+  삭제하고 파이프라인은 KIS -> LS -> Daum -> Naver -> PyKrx 5단계로 운영합니다.
 """
-import io
 import logging
 import re
 from datetime import datetime, time, timedelta
@@ -12,11 +18,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
 
-from config import get_krx_key, KRX_BASE_URL
 from services.ls_service import call_ls_api
 from services.kis_service import call_kis_api
 
@@ -78,6 +83,7 @@ def _to_float(value, default=0.0) -> float:
         return float(str(value).replace(",", "").strip())
     except (TypeError, ValueError):
         return default
+
 
 # ==============================================================================
 # 1. KIS / LS / PyKrx 연결 상태 진단 함수
@@ -141,9 +147,10 @@ def test_ls_connection():
             "jnilgubun": "1",
             "paygubun": "2",
             "ordergubun": "1",
-            "cnt": 30
+            "cnt": 30,
         }
     }
+
     try:
         res = call_ls_api(tr_cd="t1452", tr_url="/stock/market-sum", body_params=body_params_1452)
         if res and "t1452OutBlock1" in res and len(res["t1452OutBlock1"]) > 0:
@@ -157,6 +164,7 @@ def test_ls_connection():
             "gubun1": "1", "gubun2": "1", "gubun3": "1", "cnt": 30
         }
     }
+
     try:
         res = call_ls_api(tr_cd="t1664", tr_url="/stock/investor", body_params=body_params_1664)
         if res and "t1664OutBlock1" in res and len(res["t1664OutBlock1"]) > 0:
@@ -283,20 +291,14 @@ def fetch_kis_deal_ranking(
         price = _to_float(row.get("stck_prpr"))
         change_pct = _to_float(row.get("prdy_ctrt"))
 
-        net_amount_raw = _to_float(
-            row.get(field_map["amount"])
-        )
-        net_quantity = _to_float(
-            row.get(field_map["quantity"])
-        )
+        net_amount_raw = _to_float(row.get(field_map["amount"]))
+        net_quantity = _to_float(row.get(field_map["quantity"]))
 
         if net_amount_raw != 0:
             net_amount_eok = net_amount_raw / 100.0
             amount_basis = "KIS 원본 순매수 거래대금"
         elif net_quantity != 0 and price > 0:
-            net_amount_eok = (
-                net_quantity * price
-            ) / 100_000_000.0
+            net_amount_eok = (net_quantity * price) / 100_000_000.0
             amount_basis = "KIS 원본 순매수 수량×현재가 환산"
         else:
             continue
@@ -322,9 +324,7 @@ def fetch_kis_deal_ranking(
             "수집시각": datetime.now(
                 ZoneInfo("Asia/Seoul")
             ).strftime("%Y-%m-%d %H:%M:%S KST"),
-            "데이터_출처": (
-                f"KIS 장중 가집계 / FHPTJ04400000 ({target_date})"
-            ),
+            "데이터_출처": f"KIS 장중 가집계 / FHPTJ04400000 ({target_date})",
             "시가총액_가중": max(price * 1000, 500),
         })
 
@@ -362,9 +362,10 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
             "jnilgubun": "1",
             "paygubun": "2",
             "ordergubun": order_code,
-            "cnt": top_n
+            "cnt": top_n,
         }
     }
+
     try:
         res = call_ls_api(tr_cd="t1452", tr_url="/stock/market-sum", body_params=body_params_1452)
         if res and "t1452OutBlock1" in res:
@@ -411,9 +412,10 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
             "gubun1": mkt_code,
             "gubun2": gubun2,
             "gubun3": order_code,
-            "cnt": top_n
+            "cnt": top_n,
         }
     }
+
     try:
         res = call_ls_api(tr_cd="t1664", tr_url="/stock/investor", body_params=body_params_1664)
         if res and "t1664OutBlock1" in res:
@@ -455,129 +457,12 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
                     return pd.DataFrame(records)
     except Exception as e:
         logger.warning(f"LS API 호출 실패: {e}")
+
     return pd.DataFrame()
 
 
 # ==============================================================================
-# 4. KRX 공식 OpenAPI
-# ==============================================================================
-def fetch_krx_date_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
-    auth_key = get_krx_key()
-    if not auth_key:
-        logger.warning("KRX OpenAPI 실패: KRX_AUTH_KEY(krx.api_key)가 등록되지 않았습니다.")
-        return pd.DataFrame()
-
-    mkt_id = "STK" if "KOSPI" in market.upper() or "코스피" in market else "KSQ"
-    url = f"{KRX_BASE_URL}/sto/stk_bydd_trd"
-    headers = {"AUTH_KEY": auth_key, "User-Agent": "Mozilla/5.0"}
-    params = {"basDd": target_date, "mktId": mkt_id}
-
-    try:
-        res = requests.get(url, headers=headers, params=params, timeout=8)
-
-        if res.status_code != 200:
-            logger.warning(
-                f"KRX OpenAPI 실패 (날짜={target_date}): "
-                f"HTTP {res.status_code} - {res.text[:300]}"
-            )
-            return pd.DataFrame()
-
-        data = res.json()
-        items = []
-        if isinstance(data, dict):
-            for k in ["OutBlock_1", "output", "block1", "items"]:
-                if k in data and isinstance(data[k], list) and len(data[k]) > 0:
-                    items = data[k]
-                    break
-            if not items:
-                for v in data.values():
-                    if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-                        items = v
-                        break
-
-        if not items:
-            logger.warning(f"KRX OpenAPI 실패 (날짜={target_date}): 응답에 데이터 항목이 없습니다. 원본 응답: {str(data)[:300]}")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(items)
-        cols = {c.upper(): c for c in df.columns}
-        code_col = cols.get("ISU_CD", cols.get("ISU_SRT_CD", cols.get("SHCODE", "")))
-        name_col = cols.get("ISU_NM", cols.get("ISU_ABBRV", cols.get("HNAME", "")))
-        price_col = cols.get("TDD_CLSPRC", cols.get("CLSPRC", ""))
-        fluc_col = cols.get("FLUC_RT", "")
-
-        # 이 엔드포인트(/sto/stk_bydd_trd)는 유가증권 일별매매정보(OHLCV)이며
-        # 투자자별(외국인/기관) 순매수 컬럼을 제공하지 않을 가능성이 높습니다.
-        # TRD_VAL(전체 거래대금) 등으로 대체하지 않고, 실제 투자자별 컬럼이
-        # 없으면 명확히 실패로 처리합니다.
-        investor_col_name = "FRGN_NETBID_AMT" if "외국인" in investor else "ORG_NETBID_AMT"
-        net_col = cols.get(investor_col_name)
-
-        if not net_col:
-            logger.warning(
-                f"KRX OpenAPI 실패 (날짜={target_date}): 이 엔드포인트는 투자자별 "
-                f"컬럼({investor_col_name})을 제공하지 않습니다. 실제 컬럼: {list(df.columns)}. "
-                f"전체 거래대금으로 대체하지 않고 실패 처리합니다."
-            )
-            return pd.DataFrame()
-
-        if not name_col or not price_col:
-            logger.warning(f"KRX OpenAPI 실패 (날짜={target_date}): 필요한 컬럼을 찾지 못했습니다. 실제 컬럼: {list(df.columns)}")
-            return pd.DataFrame()
-
-        def safe_float(v):
-            try:
-                return float(str(v).replace(",", "").strip())
-            except:
-                return 0.0
-
-        records = []
-        for _, r in df.iterrows():
-            code = str(r.get(code_col, "")).strip()
-            name = str(r.get(name_col, "")).strip()
-            price = safe_float(r.get(price_col, 0))
-            fluc = safe_float(r.get(fluc_col, 0))
-            amt_val = safe_float(r.get(net_col, 0))
-
-            # 값이 0이면 "실제로 순매수가 0"인지 "데이터가 없는 것"인지 구분할 수
-            # 없으므로, 임의의 대체 공식을 쓰지 않고 그대로 0으로 남겨둡니다.
-            amt_eok = round(amt_val / 100000000.0, 1)
-
-            if price > 0 and name:
-                records.append({
-                    "종목코드": code,
-                    "종목명": name,
-                    "현재가": price,
-                    "등락률(%)": fluc,
-                    "순매수대금(억)": amt_eok,
-                    "시가총액_가중": price * 1000,
-                    "데이터_출처": f"KRX 공식 OpenAPI ({target_date})"
-                })
-
-        if not records:
-            logger.warning(f"KRX OpenAPI 실패 (날짜={target_date}): 파싱된 레코드가 없습니다.")
-            return pd.DataFrame()
-
-        res_df = pd.DataFrame(records)
-        if trade_type == "순매수":
-            res_df = res_df[res_df["순매수대금(억)"] > 0].sort_values("순매수대금(억)", ascending=False)
-        else:
-            res_df = res_df[res_df["순매수대금(억)"] < 0].sort_values("순매수대금(억)", ascending=True)
-
-        if res_df.empty:
-            logger.warning(f"KRX OpenAPI: {trade_type} 조건을 만족하는 종목이 없습니다 (날짜={target_date}).")
-            return pd.DataFrame()
-
-        res_df = res_df.head(top_n).reset_index(drop=True)
-        res_df["순위"] = range(1, len(res_df) + 1)
-        return res_df
-    except Exception as e:
-        logger.warning(f"KRX OpenAPI 예외 (날짜={target_date}): {e}")
-    return pd.DataFrame()
-
-
-# ==============================================================================
-# 5. Daum 실시간 API (시장 전체 랭킹)
+# 4. Daum 실시간 API (시장 전체 랭킹)
 # ==============================================================================
 def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     market_param = "KOSPI" if "KOSPI" in market.upper() or "코스피" in market else "KOSDAQ"
@@ -626,11 +511,12 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
                 return pd.DataFrame(records)
     except Exception as e:
         logger.warning(f"Daum API 실패: {e}")
+
     return pd.DataFrame()
 
 
 # ==============================================================================
-# 6. Naver 실시간 API (시장 전체 랭킹)
+# 5. Naver 실시간 API (시장 전체 랭킹)
 # ==============================================================================
 def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     sosok = "01" if "KOSPI" in market.upper() or "코스피" in market else "02"
@@ -640,7 +526,7 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
         "개인": "8000",
         "연기금": "6000",
         "금융투자": "2000",
-        "투신": "3000"
+        "투신": "3000",
     }
     inv_code = inv_map.get(investor, "9000")
     dir_type = "1" if trade_type == "순매수" else "2"
@@ -675,7 +561,7 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
                             def clean(x):
                                 try:
                                     return float(x.text.replace(",", "").replace("+", "").replace("%", "").strip())
-                                except:
+                                except Exception:
                                     return 0.0
 
                             price = clean(cols[2])
@@ -702,11 +588,12 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
                     return pd.DataFrame(records)
     except Exception as e:
         logger.warning(f"Naver 스크래핑 실패: {e}")
+
     return pd.DataFrame()
 
 
 # ==============================================================================
-# 7. PyKrx 엔진 (시장 전체 랭킹)
+# 6. PyKrx 엔진 (시장 전체 랭킹)
 # ==============================================================================
 def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     if not PYKRX_AVAILABLE:
@@ -766,7 +653,9 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
 
 
 # ==============================================================================
-# 8. 5단계 무중단 파이프라인 마스터 함수 (Smart Fallback, 시장 전체 랭킹)
+# 7. 5단계 무중단 파이프라인 마스터 함수 (Smart Fallback, 시장 전체 랭킹)
+# KRX 공식 OpenAPI 단계는 잘못된 엔드포인트 사용으로 제거되었습니다.
+# 현재 순서: KIS(장중) -> Daum(장중) -> Naver -> PyKrx(과거 확정 데이터)
 # ==============================================================================
 @st.cache_data(ttl=20, show_spinner=False)
 def get_market_radar_scanner(
@@ -795,43 +684,27 @@ def get_market_radar_scanner(
         # 장중에는 KIS 장중 가집계 우선
         if is_today and is_regular_session:
             df = fetch_kis_deal_ranking(
-                search_date_str,
-                market,
-                investor,
-                trade_type,
-                top_n,
+                search_date_str, market, investor, trade_type, top_n,
             )
             if df is not None and not df.empty:
                 return df
 
             # KIS 장애 시 장중 참고 소스
             df = fetch_daum_deal_ranking(
-                search_date_str,
-                market,
-                investor,
-                trade_type,
-                top_n,
+                search_date_str, market, investor, trade_type, top_n,
             )
             if df is not None and not df.empty:
                 return df
 
             df = fetch_naver_html_ranking(
-                search_date_str,
-                market,
-                investor,
-                trade_type,
-                top_n,
+                search_date_str, market, investor, trade_type, top_n,
             )
             if df is not None and not df.empty:
                 return df
 
         if PYKRX_AVAILABLE:
             df = fetch_pykrx_deal_ranking(
-                search_date_str,
-                market,
-                investor,
-                trade_type,
-                top_n,
+                search_date_str, market, investor, trade_type, top_n,
             )
             if df is not None and not df.empty:
                 return df
@@ -840,23 +713,21 @@ def get_market_radar_scanner(
 
     logger.error(
         "수급 스캐너 완전 실패: 시작일=%s, 시장=%s, 투자주체=%s, 방향=%s",
-        target_date_obj,
-        market,
-        investor,
-        trade_type,
+        target_date_obj, market, investor, trade_type,
     )
     return pd.DataFrame()
 
+
 # ==============================================================================
-# 9. Daum 종목 페이지 실제 투자자 순매매 데이터 (pykrx 교차 검증용 독립 소스)
+# 8. Daum 종목 페이지 실제 투자자 순매매 데이터 (pykrx 교차 검증용 독립 소스)
 # ==============================================================================
 def fetch_daum_investor_daily_history(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
     """
     Daum 금융의 종목 상세 페이지(quotes/A{코드})에서 "외국인·기관" 테이블을
     스크래핑합니다. pykrx와 완전히 독립된 소스이므로 교차 검증에 사용합니다.
 
-    ⚠️ 비공식 스크래핑이며, Daum이 페이지에 노출하는 기간은 보통 최근 며칠~1개월
-    수준으로 제한적입니다.
+    주의: 비공식 스크래핑이며, Daum이 페이지에 노출하는 기간은 보통 최근
+    며칠~1개월 수준으로 제한적입니다.
     """
     headers = {
         "User-Agent": (
@@ -992,6 +863,7 @@ def _cross_validate_investor_data(pykrx_df: pd.DataFrame, daum_df: pd.DataFrame)
     """
     두 독립 소스(pykrx, Daum)의 외국인 순매매 방향(+/-)이 겹치는 날짜에서
     얼마나 일치하는지 계산합니다.
+
     반환: (is_validated, agreement_ratio)
     """
     if pykrx_df.empty or daum_df.empty:
@@ -1020,11 +892,11 @@ def _cross_validate_investor_data(pykrx_df: pd.DataFrame, daum_df: pd.DataFrame)
 
 
 # ==============================================================================
-# 10. 기준일(0점) 누적 수급 데이터 로더 (pykrx ↔ Daum 실제 교차 검증)
+# 9. 기준일(0점) 누적 수급 데이터 로더 (pykrx ↔ Daum 실제 교차 검증)
 # ==============================================================================
 def estimate_flow_by_price_volume_heuristic(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
     """
-    ⚠️ 주의: 이 함수는 실제 투자자별 데이터가 아닙니다.
+    주의: 이 함수는 실제 투자자별 데이터가 아닙니다.
     pykrx와 Daum 교차 검증이 모두 실패했을 때만 호출되는, 가격 변동률과
     거래량만으로 만든 통계적 추정치이며, 실제 KRX 공시 수급과 다를 수 있습니다.
     """
@@ -1066,7 +938,8 @@ def estimate_flow_by_price_volume_heuristic(stock_code: str, start_date_obj, end
             ]]
     except Exception as e:
         logger.error(f"Fallback 수급 추정치 생성 실패: {e}")
-        return pd.DataFrame()
+
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1105,7 +978,7 @@ def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_dat
             df["source"] = f"pykrx (실제 데이터, Daum 교차검증 일치율 {agreement_ratio:.0%})"
             logger.info(f"교차 검증 성공 (종목={stock_code}, 일치율={agreement_ratio:.0%})")
         elif not daum_raw.empty:
-            df["source"] = f"pykrx (실제 데이터, ⚠️ Daum 교차검증 불일치율 높음: 일치율 {agreement_ratio:.0%})"
+            df["source"] = f"pykrx (실제 데이터, Daum 교차검증 불일치율 높음: 일치율 {agreement_ratio:.0%})"
             logger.warning(f"교차 검증 불일치 (종목={stock_code}, 일치율={agreement_ratio:.0%})")
         else:
             df["source"] = "pykrx (실제 데이터, 단일 소스·교차검증 불가)"

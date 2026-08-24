@@ -143,6 +143,7 @@ def test_toss_connection() -> tuple[bool, str]:
 
     except Exception as e:
         return False, f"알 수 없는 오류: {type(e).__name__}: {e}"
+    
 
 def get_exchange_rate(
     base_currency: str = "USD",
