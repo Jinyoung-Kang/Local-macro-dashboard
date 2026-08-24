@@ -106,9 +106,9 @@ SCRAPER_MARKETS = [
     {
         "key": "shanghai",
         "name": "상해종합",
-        "url": "https://www.tradingview.com/symbols/SSE-COMPOSITE/",
-        "provider": "TradingView",
-        "kind": "tradingview_price",
+        "url": "https://www.investing.com/indices/shanghai-composite",
+        "provider": "Investing.com",
+        "kind": "investing_index",
         "unit": "pt",
     },
     {
@@ -309,11 +309,37 @@ def _parse_investing(
     text: str,
 ) -> tuple[float | None, float | None, float | None, float | None]:
     """
-    Investing.com 한국어 페이지에서 현재값/전일 종가/변화율 추출.
+    Investing.com 공개 페이지에서 현재가, 전일 종가,
+    등락폭 및 등락률을 추출합니다.
+
+    지원 형식:
+    - 영문:
+      Shanghai Composite live stock price is 3,897.31.
+      Currency in CNY
+      3,897.31
+      -7.90(-0.20%)
+      Prev. Close
+      3,905.2
+
+    - 한국어:
+      상해종합의 실시간 지수를 확인해 보세요. 3,905.20에 마감된 ...
+      전일 종가
+      3,903.72
     """
     current_patterns = [
+        # 영문 Investing.com FAQ 문구
+        r"(?:live\s+(?:stock\s+)?price\s+is)\s*([\d,]+(?:\.\d+)?)",
+
+        # 영문 페이지의 Currency in CNY 다음 현재가
+        r"Currency\s+in\s+[A-Z]{3}\s*[\n\r\s]+([\d,]+(?:\.\d+)?)",
+
+        # 한국어 Investing.com 문구
         r"실시간\s*(?:지수|주가).*?([\d,]+(?:\.\d+)?)에\s*(?:마감|거래|닫음)",
+
+        # 한국어 통화 다음 현재가
         r"통화\s+\w+\s*[\n\r\s]+([\d,]+(?:\.\d+)?)",
+
+        # 현재값 바로 다음에 변동값이 표시되는 일반 패턴
         r"\n([\d,]+(?:\.\d+)?)\s*\n[+\-−]\s*[\d,]+(?:\.\d+)?\s*\(",
     ]
 
@@ -325,14 +351,22 @@ def _parse_investing(
             text,
             flags=re.IGNORECASE | re.DOTALL,
         )
+
         if match:
             current = _to_float(match.group(1))
+
             if current is not None:
                 break
 
     previous_patterns = [
+        # 영문 Investing.com
+        r"Prev\.?\s*Close\s*[\n\r\s\-\*]*([\d,]+(?:\.\d+)?)",
+
+        # 영문 전체 표기
+        r"Previous\s+Close\s*[\n\r\s\-\*]*([\d,]+(?:\.\d+)?)",
+
+        # 한국어 Investing.com
         r"전일\s*종가\s*[\n\r\s\-\*]*([\d,]+(?:\.\d+)?)",
-        r"Previous\s+Close\s*[\n\r\s]*([\d,]+(?:\.\d+)?)",
     ]
 
     previous = None
@@ -343,33 +377,54 @@ def _parse_investing(
             text,
             flags=re.IGNORECASE,
         )
+
         if match:
             previous = _to_float(match.group(1))
+
             if previous is not None:
                 break
 
-    change_match = re.search(
-        r"([+\-−])\s*([\d,]+(?:\.\d+)?)\s*\(\s*([+\-−])?\s*([\d,]+(?:\.\d+)?)%",
-        text,
-        flags=re.MULTILINE,
-    )
+    change_patterns = [
+        # -7.90(-0.20%)
+        r"([+\-−])\s*([\d,]+(?:\.\d+)?)\s*"
+        r"\(\s*([+\-−])?\s*([\d,]+(?:\.\d+)?)%\s*\)",
+
+        # +1.48(+0.04%)
+        r"([+\-−])\s*([\d,]+(?:\.\d+)?)\s*"
+        r"\(\s*([+\-−])?\s*([\d,]+(?:\.\d+)?)%\s*\)",
+    ]
 
     change = None
     change_pct = None
 
-    if change_match:
-        change = _to_float(change_match.group(2))
-        change_pct = _to_float(change_match.group(4))
+    for pattern in change_patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.MULTILINE,
+        )
 
-        if change is not None and change_match.group(1) in ["-", "−"]:
+        if not match:
+            continue
+
+        change = _to_float(match.group(2))
+        change_pct = _to_float(match.group(4))
+
+        if (
+            change is not None
+            and match.group(1) in ["-", "−"]
+        ):
             change = -change
 
         if (
             change_pct is not None
-            and change_match.group(3) in ["-", "−"]
+            and match.group(3) in ["-", "−"]
         ):
             change_pct = -change_pct
 
+        break
+
+    # 전일 종가를 직접 읽지 못했지만 변화율은 있을 경우 역산
     if (
         previous is None
         and current is not None
@@ -378,6 +433,7 @@ def _parse_investing(
     ):
         previous = current / (1 + change_pct / 100)
 
+    # 변화율이 없고 현재가/전일 종가가 있으면 계산
     if (
         change_pct is None
         and current is not None
@@ -389,6 +445,7 @@ def _parse_investing(
             * 100
         )
 
+    # 등락폭이 없고 현재가/전일 종가가 있으면 계산
     if (
         change is None
         and current is not None
