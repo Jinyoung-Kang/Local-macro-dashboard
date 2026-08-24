@@ -45,6 +45,30 @@ COMMON_HEADERS = {
     ),
 }
 
+from playwright.sync_api import sync_playwright
+
+
+def _fetch_rendered_html(url: str, wait_selector: str = "table", timeout_ms: int = 10000) -> str:
+    """
+    JS로 렌더링되는 페이지(Naver/Daum 신규 UI)를 헤드리스 브라우저로
+    실제 렌더링한 뒤 최종 HTML을 반환합니다.
+
+    주의: 일반 requests.get()으로는 React/Next.js가 그리는 표를
+    가져올 수 없어서 이 방식이 필요합니다.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=COMMON_HEADERS["User-Agent"]
+        )
+        try:
+            page.goto(url, timeout=timeout_ms, wait_until="networkidle")
+            page.wait_for_selector(wait_selector, timeout=timeout_ms)
+            html = page.content()
+        finally:
+            browser.close()
+        return html
+
 # ==============================================================================
 # KIS FHPTJ04400000 투자자별 실제 필드 매핑
 # ==============================================================================
@@ -233,100 +257,69 @@ def test_pykrx_connection():
 
 def test_naver_scraping():
     """
-    Naver 금융 수급 순위 iframe 페이지(sise_deal_rank_iframe.naver)가
-    실제로 응답하고, 표를 정상적으로 파싱할 수 있는지 점검합니다.
-
-    주의: 겉 페이지(sise_deal_rank.naver)는 더 이상 표를 직접 담고 있지
-    않으며, 실제 데이터는 sise_deal_rank_iframe.naver에 있습니다.
+    Naver 금융 수급 순위 iframe 페이지를 헤드리스 브라우저로 렌더링하여
+    실제 표가 정상적으로 생성되는지 점검합니다.
     """
     url = (
         "https://finance.naver.com/sise/sise_deal_rank_iframe.naver"
         "?sosok=01&investor_gubun=9000&type=buy"
     )
-    headers = {
-        **COMMON_HEADERS,
-        "Referer": "https://finance.naver.com/sise/sise_deal_rank.naver",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=8)
-
-        if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code} 응답 (페이지 접속 실패)"
-
-        soup = BeautifulSoup(resp.content.decode("euc-kr", "replace"), "html.parser")
+        html = _fetch_rendered_html(url, wait_selector="table")
+        soup = BeautifulSoup(html, "html.parser")
         table = soup.find("table")
 
         if table is None:
-            return False, "응답은 받았으나 표(table)를 찾지 못했습니다. iframe 페이지 구조가 다시 바뀌었을 수 있습니다."
+            return False, "렌더링 후에도 표(table)를 찾지 못했습니다."
 
         rows = table.find_all("tr")
-        parsed = 0
-
-        for row in rows:
-            cols = row.find_all("td")
-            if len(cols) >= 4 and cols[1].find("a"):
-                parsed += 1
+        parsed = sum(
+            1 for row in rows
+            if len(row.find_all("td")) >= 4 and row.find("a")
+        )
 
         if parsed == 0:
-            return False, "표는 찾았지만 파싱 가능한 종목 행이 없습니다 (휴장일이거나 형식 변경 가능)."
+            return False, "표는 렌더링됐지만 파싱 가능한 종목 행이 없습니다 (휴장일 가능)."
 
-        return True, f"정상 통신 성공 (외국인 순매수 상위 코스피 기준, 파싱된 종목 수: {parsed}개)"
+        return True, f"정상 통신 성공 (렌더링 방식, 파싱된 종목 수: {parsed}개)"
 
-    except requests.exceptions.Timeout:
-        return False, "요청 시간 초과 (8초)"
     except Exception as e:
-        return False, f"예외 발생: {e}"
+        return False, f"헤드리스 브라우저 렌더링 실패: {e}"
 
 
 def test_daum_scraping():
     """
-    Daum 금융 외국인/기관 매매종목 페이지
-    (finance.daum.net/domestic/influential_investors)가 실제로
-    HTML 표를 반환하는지 점검합니다.
-
-    주의: 예전 JSON API(api/trend/investors/...)는 더 이상 정상 동작하지
-    않으며(HTTP 500), 현재는 서버 렌더링된 HTML 페이지로 완전히
-    이전되었습니다.
+    Daum 금융 외국인/기관 매매종목 페이지를 헤드리스 브라우저로 렌더링하여
+    실제 표가 정상적으로 생성되는지 점검합니다.
     """
     url = "https://finance.daum.net/domestic/influential_investors"
-    headers = {
-        **COMMON_HEADERS,
-        "Referer": "https://finance.daum.net/",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=8)
-
-        if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code} 응답 (페이지 접속 실패)"
-
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html = _fetch_rendered_html(url, wait_selector="table")
+        soup = BeautifulSoup(html, "html.parser")
 
         target_table = None
         for table in soup.find_all("table"):
-            header_text = table.get_text()
-            if "순매수" in header_text and "순매도" in header_text:
+            if "순매수" in table.get_text() and "순매도" in table.get_text():
                 target_table = table
                 break
 
         if target_table is None:
-            return False, "응답은 받았으나 순매수/순매도 표를 찾지 못했습니다. 페이지 구조가 다시 바뀌었을 수 있습니다."
+            return False, "렌더링 후에도 순매수/순매도 표를 찾지 못했습니다."
 
-        rows = target_table.find_all("tr")
-        parsed = sum(1 for row in rows if len(row.find_all("td")) >= 8)
+        parsed = sum(
+            1 for row in target_table.find_all("tr")
+            if len(row.find_all("td")) >= 8
+        )
 
         if parsed == 0:
-            return False, "표는 찾았지만 파싱 가능한 종목 행이 없습니다 (휴장일이거나 형식 변경 가능)."
+            return False, "표는 렌더링됐지만 파싱 가능한 종목 행이 없습니다 (휴장일 가능)."
 
-        return True, f"정상 통신 성공 (코스피 외국인 매매 기준, 파싱된 종목 수: {parsed}개)"
+        return True, f"정상 통신 성공 (렌더링 방식, 파싱된 종목 수: {parsed}개)"
 
-    except requests.exceptions.Timeout:
-        return False, "요청 시간 초과 (8초)"
     except Exception as e:
-        return False, f"예외 발생: {e}"
+        return False, f"헤드리스 브라우저 렌더링 실패: {e}"
 
 
 # ==============================================================================
@@ -696,11 +689,6 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
 # 5. Naver 실시간 API (시장 전체 랭킹)
 # ==============================================================================
 def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
-    """
-    Naver 금융 수급 순위 iframe 페이지에서 데이터를 스크래핑합니다.
-    실제 데이터가 있는 페이지는 sise_deal_rank_iframe.naver입니다
-    (겉 페이지 sise_deal_rank.naver는 더 이상 표를 직접 담지 않음).
-    """
     sosok = "01" if "KOSPI" in market.upper() or "코스피" in market else "02"
     inv_code = NAVER_INVESTOR_MAP.get(investor)
 
@@ -714,67 +702,63 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
         "https://finance.naver.com/sise/sise_deal_rank_iframe.naver"
         f"?sosok={sosok}&investor_gubun={inv_code}&type={buy_sell}"
     )
-    headers = {
-        **COMMON_HEADERS,
-        "Referer": "https://finance.naver.com/sise/sise_deal_rank.naver",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=8)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.content.decode("euc-kr", "replace"), "html.parser")
-            table = soup.find("table")
-            if table:
-                records = []
-                rank = 1
-                for row in table.find_all("tr"):
-                    cols = row.find_all("td")
-                    if len(cols) >= 4:
-                        name_tag = cols[1].find("a")
-                        if name_tag:
-                            href = name_tag.get("href", "")
-                            code_match = re.search(r'code=(\d+)', href)
-                            if not code_match:
-                                continue
-                            code = code_match.group(1)
-                            name = name_tag.text.strip()
+        html = _fetch_rendered_html(url, wait_selector="table")
+        soup = BeautifulSoup(html, "html.parser")
+        table = soup.find("table")
 
-                            def clean(x):
-                                try:
-                                    return float(x.text.replace(",", "").replace("+", "").replace("%", "").strip())
-                                except Exception:
-                                    return 0.0
+        if not table:
+            return pd.DataFrame()
 
-                            price = clean(cols[2])
-                            change_pct = clean(cols[4]) if len(cols) > 4 else 0.0
-                            net_amt_raw = clean(cols[7]) if len(cols) >= 8 else clean(cols[3])
-                            net_amt_eok = round(net_amt_raw / 100.0, 1) if net_amt_raw > 1000 else round(net_amt_raw, 1)
-                            if trade_type == "순매도":
-                                net_amt_eok = -abs(net_amt_eok)
+        records = []
+        rank = 1
+        for row in table.find_all("tr"):
+            cols = row.find_all("td")
+            if len(cols) >= 4:
+                name_tag = cols[1].find("a")
+                if name_tag:
+                    href = name_tag.get("href", "")
+                    code_match = re.search(r'code=(\d+)', href)
+                    if not code_match:
+                        continue
+                    code = code_match.group(1)
+                    name = name_tag.text.strip()
 
-                            records.append({
-                                "순위": rank,
-                                "종목코드": code,
-                                "종목명": name,
-                                "현재가": price,
-                                "등락률(%)": change_pct,
-                                "순매수대금(억)": net_amt_eok,
-                                "시가총액_가중": max(price * 1000, 500),
-                                "데이터_출처": f"Naver 실시간 API ({target_date})"
-                            })
-                            rank += 1
-                            if rank > top_n:
-                                break
-                if records:
-                    return pd.DataFrame(records)
-        else:
-            logger.warning(f"Naver 스크래핑 실패: HTTP {resp.status_code}")
+                    def clean(x):
+                        try:
+                            return float(x.text.replace(",", "").replace("+", "").replace("%", "").strip())
+                        except Exception:
+                            return 0.0
+
+                    price = clean(cols[2])
+                    change_pct = clean(cols[4]) if len(cols) > 4 else 0.0
+                    net_amt_raw = clean(cols[7]) if len(cols) >= 8 else clean(cols[3])
+                    net_amt_eok = round(net_amt_raw / 100.0, 1) if net_amt_raw > 1000 else round(net_amt_raw, 1)
+                    if trade_type == "순매도":
+                        net_amt_eok = -abs(net_amt_eok)
+
+                    records.append({
+                        "순위": rank,
+                        "종목코드": code,
+                        "종목명": name,
+                        "현재가": price,
+                        "등락률(%)": change_pct,
+                        "순매수대금(억)": net_amt_eok,
+                        "시가총액_가중": max(price * 1000, 500),
+                        "데이터_출처": f"Naver 실시간 (렌더링) ({target_date})"
+                    })
+                    rank += 1
+                    if rank > top_n:
+                        break
+
+        if records:
+            return pd.DataFrame(records)
+
     except Exception as e:
-        logger.warning(f"Naver 스크래핑 실패: {e}")
+        logger.warning(f"Naver 렌더링 스크래핑 실패: {e}")
 
     return pd.DataFrame()
-
 
 # ==============================================================================
 # 6. PyKrx 엔진 (시장 전체 랭킹, 최종 폴백)
@@ -848,7 +832,7 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
 # KIS는 장중 전용 TR이라 장마감 후에는 호출하지 않습니다.
 # KRX 공식 OpenAPI는 투자자별 컬럼을 제공하지 않아 사용하지 않습니다.
 # ==============================================================================
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_market_radar_scanner(
     target_date_obj,
     market: str = "KOSPI",
