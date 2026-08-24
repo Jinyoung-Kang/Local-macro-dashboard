@@ -634,13 +634,19 @@ def fetch_daum_deal_ranking(
     실제 API: finance.daum.net/api/trend/investor_purchase/
     응답 구조는 Playwright 네트워크 캡처로 직접 확인했습니다.
 
+    실제 응답 형태:
+      {
+        "data": {"BUY": [...], "SELL": [...]},
+        "fromDate": "YYYY-MM-DD",
+        "toDate": "YYYY-MM-DD"
+      }
+
     interval_type:
       "TODAY"    당일
       "DAYS_5"   5거래일 누적
       "DAYS_20"  20거래일 누적
 
-    주의: 이 API는 investorType="FOREIGN"(외국인)만 확인됐습니다.
-    기관은 지원 여부가 확인되지 않아 자동으로 건너뜁니다.
+    주의: investorType="FOREIGN"(외국인)만 확인됐습니다.
     """
     if investor != "외국인":
         logger.warning(
@@ -707,7 +713,6 @@ def fetch_daum_deal_ranking(
 
         from_date = payload.get("fromDate", "")
         to_date = payload.get("toDate", target_date)
-
         period_label = (
             f"{from_date}~{to_date}" if interval_type != "TODAY" else to_date
         )
@@ -719,7 +724,6 @@ def fetch_daum_deal_ranking(
             name = row.get("name", "")
             price = float(row.get("tradePrice", 0) or 0)
             change_pct = float(row.get("changeRate", 0) or 0) * 100.0
-
             amt_raw = float(row.get("straightPurchasePrice", 0) or 0)
             amt_eok = round(amt_raw / 100000000.0, 1)
 
