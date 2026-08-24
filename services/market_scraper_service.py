@@ -106,17 +106,17 @@ SCRAPER_MARKETS = [
     {
         "key": "shanghai",
         "name": "상해종합",
-        "url": "https://kr.investing.com/indices/shanghai-composite",
-        "provider": "Investing.com",
-        "kind": "investing_index",
+        "url": "https://www.tradingview.com/symbols/SSE-COMPOSITE/",
+        "provider": "TradingView",
+        "kind": "tradingview_price",
         "unit": "pt",
     },
     {
         "key": "hang_seng",
         "name": "항셍",
-        "url": "https://kr.investing.com/indices/hang-sen-40",
-        "provider": "Investing.com",
-        "kind": "investing_index",
+        "url": "https://www.tradingview.com/symbols/TVC-HSI/",
+        "provider": "TradingView",
+        "kind": "tradingview_price",
         "unit": "pt",
     },
 ]
