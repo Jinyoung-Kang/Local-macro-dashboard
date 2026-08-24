@@ -16,3 +16,8 @@ GitHub 웹에서 수정 → 커밋 (원격에만 반영됨)
    로컬에서 git pull 실행해야 비로소 반영됨
 
    
+[로컬에 반영하려면 반드시 필요한 절차]
+(bash)
+cd /Users/jinyoung/Projects/macro-dashboard-v2
+git pull origin main
+
