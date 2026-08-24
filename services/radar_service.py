@@ -975,6 +975,25 @@ def get_market_radar_scanner(
         and time(9, 0) <= current_time < time(15, 30)
     )
 
+    # interval_type이 TODAY가 아니면(5거래일/20거래일), Daum만이 유효한
+    # 유일한 소스입니다. KIS/Naver/PyKrx는 모두 "당일" 데이터만 제공하므로
+    # 이 경우 그 소스들을 시도하는 것은 무의미하며, Daum을 최우선/단독으로
+    # 사용합니다.
+    if interval_type != "TODAY":
+        search_date_str = target_date_obj.strftime("%Y%m%d")
+        df = fetch_daum_deal_ranking(
+            search_date_str, market, investor, trade_type, top_n,
+            interval_type=interval_type,
+        )
+        if df is not None and not df.empty:
+            return df
+
+        logger.warning(
+            "Daum 기간별(%s) 조회 실패. 당일 데이터로 자동 전환합니다.",
+            interval_type,
+        )
+        # Daum 기간별 조회가 실패하면 당일 파이프라인으로 자동 폴백
+
     current_date_obj = target_date_obj
     max_lookback_days = 7
 
@@ -992,7 +1011,7 @@ def get_market_radar_scanner(
 
             df = fetch_daum_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
-                interval_type=interval_type,
+                interval_type="TODAY",
             )
             if df is not None and not df.empty:
                 return df
@@ -1012,7 +1031,7 @@ def get_market_radar_scanner(
 
             df = fetch_daum_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
-                interval_type=interval_type,
+                interval_type="TODAY",
             )
             if df is not None and not df.empty:
                 return df
@@ -1033,8 +1052,8 @@ def get_market_radar_scanner(
         current_date_obj -= timedelta(days=1)
 
     logger.error(
-        "수급 스캐너 완전 실패: 시작일=%s, 시장=%s, 투자주체=%s, 방향=%s",
-        target_date_obj, market, investor, trade_type,
+        "수급 스캐너 완전 실패: 시작일=%s, 시장=%s, 투자주체=%s, 방향=%s, 기간=%s",
+        target_date_obj, market, investor, trade_type, interval_type,
     )
     return pd.DataFrame()
 
