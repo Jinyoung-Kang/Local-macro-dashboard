@@ -23,6 +23,9 @@ from services.dashboard_snapshot_service import (
     format_dashboard_snapshot_text,
 )
 
+from services.market_scraper_service import (
+    get_scraped_macro_markets,
+)
 
 @st.cache_data(ttl=60)
 def get_us_market_status() -> str:
@@ -43,7 +46,7 @@ def inject_market_status(name: str) -> str:
 
     status = "마감"
 
-    # [신규] 야간/글로벌 선물 전용 판정 (일반 현물 지수 규칙보다 먼저 체크해야 함)
+    # 야간/글로벌 선물 전용 판정 (일반 현물 지수 규칙보다 먼저 체크해야 함)
     # KOSPI200 야간선물(CME 연계), 닛케이225 선물, 항셍 선물 등은
     # 이름에 "코스피"/"닛케이"/"항셍"이 포함돼 있어 일반 현물 규칙과 충돌하므로
     # "선물" 포함 여부로 먼저 걸러냅니다.
@@ -176,13 +179,15 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     st.divider()
 
     # ==========================================================================
-    # 1. 메인 시세 요약 카드
-    # 한 카테고리의 항목 수가 많아도 한 줄에 최대 MAX_COLS_PER_ROW개까지만
-    # 배치하고, 넘치는 항목은 다음 줄로 자동 줄바꿈합니다.
-    # 야간선물/해외선물 항목의 월물·출처 정보는 캡션으로 별도 표시합니다.
+    # 1. 기존 공식/최근 시세 요약 카드
+    # 한 카테고리에 항목이 많으면 한 행 최대 4개씩 줄바꿈합니다.
     # ==========================================================================
     st.subheader("실시간/최근 시세 요약")
-    st.info("💡 **변동 수치(+/-) 기준:** 각 지표 하단의 수치는 '직전 거래일 공식 종가(Previous Close) 대비 등락폭과 등락률(%)'입니다.", icon="ℹ️")
+    st.info(
+        "💡 **변동 수치(+/-) 기준:** 각 지표 하단의 수치는 "
+        "'직전 거래일 공식 종가(Previous Close) 대비 등락폭과 등락률(%)'입니다.",
+        icon="ℹ️",
+    )
 
     MAX_COLS_PER_ROW = 4
 
@@ -190,45 +195,274 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         st.markdown(f"#### {cat_name}")
 
         for row_start in range(0, len(items), MAX_COLS_PER_ROW):
-            row_items = items[row_start: row_start + MAX_COLS_PER_ROW]
+            row_items = items[
+                row_start: row_start + MAX_COLS_PER_ROW
+            ]
             cols = st.columns(MAX_COLS_PER_ROW)
 
             for idx, item in enumerate(row_items):
-                display_name = inject_market_status(item["name"])
                 col = cols[idx]
+                display_name = inject_market_status(
+                    item["name"]
+                )
 
                 if item["status"] == "ok":
                     col.metric(
                         label=display_name,
                         value=item["price_str"],
                         delta=item["delta_str"],
-                        help=f"직전 거래일 종가: {item['prev_str']}"
+                        help=(
+                            "직전 거래일 종가: "
+                            f"{item['prev_str']}"
+                        ),
                     )
 
-                    extra_caption_parts = [f"전일 종가: `{item['prev_str']}`"]
-                    if item.get("contract_month"):
-                        extra_caption_parts.append(f"월물: `{item['contract_month']}`")
-                    if item.get("source"):
-                        extra_caption_parts.append(f"출처: `{item['source']}`")
+                    caption_parts = [
+                        f"전일 종가: `{item['prev_str']}`"
+                    ]
 
-                    col.caption(" | ".join(extra_caption_parts))
+                    # 야간선물/해외선물 스크래핑 데이터의 계약월 표시
+                    if item.get("contract_month"):
+                        caption_parts.append(
+                            f"월물: `{item['contract_month']}`"
+                        )
+
+                    # 야간선물/해외선물 스크래핑 데이터의 출처 표시
+                    if item.get("source"):
+                        caption_parts.append(
+                            f"출처: `{item['source']}`"
+                        )
+
+                    col.caption(" | ".join(caption_parts))
 
                 elif item["status"] == "single":
-                    col.metric(label=display_name, value=item["price_str"])
+                    col.metric(
+                        label=display_name,
+                        value=item["price_str"],
+                    )
                     col.caption("전일 데이터 없음")
-                else:
-                    col.metric(label=display_name, value="로드 실패")
-                    fail_caption_parts = []
-                    if item.get("contract_month"):
-                        fail_caption_parts.append(f"월물: `{item['contract_month']}`")
-                    if item.get("source"):
-                        fail_caption_parts.append(f"출처: `{item['source']}`")
-                    if fail_caption_parts:
-                        col.caption(" | ".join(fail_caption_parts))
 
-            # 빈 칸(마지막 줄의 남는 컬럼)은 아무것도 렌더링하지 않음
-            for idx in range(len(row_items), MAX_COLS_PER_ROW):
-                cols[idx].empty()
+                else:
+                    col.metric(
+                        label=display_name,
+                        value="로드 실패",
+                    )
+
+                    fail_parts = []
+
+                    if item.get("contract_month"):
+                        fail_parts.append(
+                            f"월물: `{item['contract_month']}`"
+                        )
+
+                    if item.get("source"):
+                        fail_parts.append(
+                            f"출처: `{item['source']}`"
+                        )
+
+                    if fail_parts:
+                        col.caption(" | ".join(fail_parts))
+
+            # 마지막 행에서 남는 빈 카드 영역 제거
+            for empty_idx in range(
+                len(row_items),
+                MAX_COLS_PER_ROW,
+            ):
+                cols[empty_idx].empty()
+
+    # ==========================================================================
+    # 1-1. 비공식 웹 스크래핑 시세 비교 구역
+    # 기존 공식/yfinance/FRED 데이터와 완전히 분리된 참고용 영역입니다.
+    # ==========================================================================
+    st.markdown(
+        "<div style='height: 12px;'></div>",
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
+    st.subheader("🔎 비공식 스크래핑 시세 비교")
+    st.caption(
+        "TradingView·Investing.com 공개 웹페이지를 비공식적으로 수집한 "
+        "참고용 데이터입니다. 기존 공식/FRED/yfinance 데이터를 대체하지 않으며, "
+        "웹페이지 구조·접근 정책 변경에 따라 수집 실패 또는 지연될 수 있습니다."
+    )
+
+    scraper_result = get_scraped_macro_markets()
+    scraper_items = scraper_result.get("items", [])
+    scraper_updated_at = scraper_result.get(
+        "updated_at",
+        "알 수 없음",
+    )
+
+    st.caption(
+        f"수집 시각: `{scraper_updated_at}` | "
+        "수집 데이터는 60초 동안 캐시됩니다."
+    )
+
+    SCRAPER_COLS_PER_ROW = 5
+
+    for row_start in range(
+        0,
+        len(scraper_items),
+        SCRAPER_COLS_PER_ROW,
+    ):
+        row_items = scraper_items[
+            row_start: row_start + SCRAPER_COLS_PER_ROW
+        ]
+        cols = st.columns(SCRAPER_COLS_PER_ROW)
+
+        for idx, item in enumerate(row_items):
+            col = cols[idx]
+
+            name = item.get("name", "알 수 없음")
+            provider = item.get("provider", "알 수 없음")
+            unit = item.get("unit", "")
+            status = item.get("status", "fail")
+
+            if status == "ok":
+                price = item.get("price")
+                previous_close = item.get("previous_close")
+                change = item.get("change")
+                change_pct = item.get("change_pct")
+
+                if price is None:
+                    col.metric(
+                        label=f"{name} :gray[[{provider}]]",
+                        value="수집 실패",
+                    )
+                    continue
+
+                if unit == "%":
+                    value_text = f"{price:,.3f}"
+                else:
+                    value_text = f"{price:,.2f}"
+
+                if (
+                    change is not None
+                    and change_pct is not None
+                ):
+                    if unit == "%":
+                        delta_text = (
+                            f"{change:+.3f} "
+                            f"({change_pct:+.2f}%)"
+                        )
+                    else:
+                        delta_text = (
+                            f"{change:+.2f} "
+                            f"({change_pct:+.2f}%)"
+                        )
+
+                    col.metric(
+                        label=f"{name} :gray[[{provider}]]",
+                        value=value_text,
+                        delta=delta_text,
+                        help=(
+                            f"비공식 스크래핑 출처: {provider}\n"
+                            f"원본 URL: {item.get('url', '')}"
+                        ),
+                    )
+                else:
+                    col.metric(
+                        label=f"{name} :gray[[{provider}]]",
+                        value=value_text,
+                        help=(
+                            f"비공식 스크래핑 출처: {provider}\n"
+                            f"원본 URL: {item.get('url', '')}"
+                        ),
+                    )
+
+                caption_parts = [
+                    f"단위: `{unit}`",
+                    f"출처: `{provider}`",
+                ]
+
+                if previous_close is not None:
+                    if unit == "%":
+                        previous_text = (
+                            f"{previous_close:,.3f}"
+                        )
+                    else:
+                        previous_text = (
+                            f"{previous_close:,.2f}"
+                        )
+
+                    caption_parts.insert(
+                        1,
+                        f"전일 종가: `{previous_text}`",
+                    )
+
+                col.caption(" | ".join(caption_parts))
+
+            else:
+                col.metric(
+                    label=f"{name} :gray[[{provider}]]",
+                    value="수집 실패",
+                )
+
+                error_text = item.get(
+                    "error",
+                    "페이지 구조 변경 또는 접속 지연",
+                )
+
+                col.caption(
+                    "비공식 소스 오류: "
+                    f"`{str(error_text)[:70]}`"
+                )
+
+        for empty_idx in range(
+            len(row_items),
+            SCRAPER_COLS_PER_ROW,
+        ):
+            cols[empty_idx].empty()
+
+    # ==========================================================================
+    # 개발자용: 비공식 스크래핑 수집 원본 상태
+    # ==========================================================================
+    with st.expander(
+        "🔍 비공식 스크래핑 원본 출처 및 상태",
+        expanded=False,
+    ):
+        scraper_rows = []
+
+        for item in scraper_items:
+            scraper_rows.append({
+                "지표": item.get("name"),
+                "출처": item.get("provider"),
+                "상태": (
+                    "수집 성공"
+                    if item.get("status") == "ok"
+                    else "수집 실패"
+                ),
+                "현재값": item.get("price"),
+                "전일 종가": item.get("previous_close"),
+                "변화율(%)": item.get("change_pct"),
+                "단위": item.get("unit"),
+                "URL": item.get("url"),
+                "오류": item.get("error"),
+            })
+
+        scraper_df = pd.DataFrame(scraper_rows)
+
+        st.dataframe(
+            scraper_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "현재값": st.column_config.NumberColumn(
+                    format="%.3f",
+                ),
+                "전일 종가": st.column_config.NumberColumn(
+                    format="%.3f",
+                ),
+                "변화율(%)": st.column_config.NumberColumn(
+                    format="%+.2f%%",
+                ),
+                "URL": st.column_config.LinkColumn(
+                    "원본 페이지",
+                    display_text="원본 보기",
+                ),
+            },
+        )
 
     st.divider()
 
