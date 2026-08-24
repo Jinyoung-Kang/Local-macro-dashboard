@@ -273,6 +273,10 @@ def test_naver_scraping():
     """
     Naver 금융 수급 순위 iframe 페이지를 헤드리스 브라우저로 렌더링하여
     실제 표가 정상적으로 생성되는지 점검합니다.
+
+    주의: 이 페이지에는 class="type_1"인 표가 여러 개(레이아웃용 포함)
+    존재할 수 있습니다. 첫 번째 표가 아니라, 실제로 종목 링크(a 태그)를
+    포함한 표를 찾아야 합니다.
     """
     url = (
         "https://finance.naver.com/sise/sise_deal_rank_iframe.naver"
@@ -282,23 +286,34 @@ def test_naver_scraping():
     try:
         html = _fetch_rendered_html(url, wait_selector="table")
         soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("table", {"class": "type_1"})
-        if table is None:
-            table = soup.find("table")
 
-        if table is None:
-            return False, "렌더링 후에도 표(table)를 찾지 못했습니다."
+        candidate_tables = soup.find_all("table", {"class": "type_1"})
+        if not candidate_tables:
+            candidate_tables = soup.find_all("table")
 
-        rows = table.find_all("tr")
-        parsed = sum(
-            1 for row in rows
-            if len(row.find_all("td")) >= 4 and row.find("a")
-        )
+        if not candidate_tables:
+            return False, "렌더링 후에도 표(table)를 전혀 찾지 못했습니다."
 
-        if parsed == 0:
-            return False, "표는 렌더링됐지만 파싱 가능한 종목 행이 없습니다 (휴장일 가능)."
+        best_table = None
+        best_parsed = 0
 
-        return True, f"정상 통신 성공 (렌더링 방식, 파싱된 종목 수: {parsed}개)"
+        for table in candidate_tables:
+            rows = table.find_all("tr")
+            parsed = sum(
+                1 for row in rows
+                if len(row.find_all("td")) >= 4 and row.find("a")
+            )
+            if parsed > best_parsed:
+                best_parsed = parsed
+                best_table = table
+
+        if best_table is None or best_parsed == 0:
+            return False, (
+                f"표는 {len(candidate_tables)}개 렌더링됐지만, "
+                "종목 링크가 포함된 유효한 표를 찾지 못했습니다 (휴장일 가능)."
+            )
+
+        return True, f"정상 통신 성공 (렌더링 방식, 파싱된 종목 수: {best_parsed}개)"
 
     except Exception as e:
         return False, f"헤드리스 브라우저 렌더링 실패: {e}"
@@ -696,6 +711,13 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
 # 5. Naver 실시간 API (시장 전체 랭킹)
 # ==============================================================================
 def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
+    """
+    Naver 금융 수급 순위 iframe 페이지에서 데이터를 스크래핑합니다.
+
+    주의: 이 페이지에는 class="type_1"인 표가 여러 개 존재할 수 있습니다.
+    첫 번째 표가 아니라, 실제로 종목 링크를 가장 많이 포함한 표를
+    선택해야 합니다.
+    """
     sosok = "01" if "KOSPI" in market.upper() or "코스피" in market else "02"
     inv_code = NAVER_INVESTOR_MAP.get(investor)
 
@@ -713,16 +735,32 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
     try:
         html = _fetch_rendered_html(url, wait_selector="table")
         soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("table", {"class": "type_1"})
-        if table is None:
-            table = soup.find("table")
 
-        if not table:
+        candidate_tables = soup.find_all("table", {"class": "type_1"})
+        if not candidate_tables:
+            candidate_tables = soup.find_all("table")
+
+        if not candidate_tables:
+            return pd.DataFrame()
+
+        best_table = None
+        best_row_count = 0
+
+        for table in candidate_tables:
+            row_count = sum(
+                1 for row in table.find_all("tr")
+                if len(row.find_all("td")) >= 4 and row.find("a")
+            )
+            if row_count > best_row_count:
+                best_row_count = row_count
+                best_table = table
+
+        if best_table is None:
             return pd.DataFrame()
 
         records = []
         rank = 1
-        for row in table.find_all("tr"):
+        for row in best_table.find_all("tr"):
             cols = row.find_all("td")
             if len(cols) >= 4:
                 name_tag = cols[1].find("a")
