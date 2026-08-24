@@ -1275,38 +1275,42 @@ def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_dat
 def debug_daum_investor_periods() -> dict:
     """
     [진단 전용] Daum 외국인/기관매매 페이지에서 기간 탭(당일/5영업일/
-    20영업일) 클릭 시 실제로 어떤 네트워크 요청이 발생하는지 캡처합니다.
-    이 함수는 정확한 파라미터를 알아낸 뒤에는 삭제해도 됩니다.
+    20영업일)을 각각 클릭했을 때, investor_purchase API 요청이
+    어떻게 바뀌는지 탭별로 구분해서 캡처합니다.
     """
-    captured_requests = []
+    results_by_tab = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(user_agent=COMMON_HEADERS["User-Agent"])
 
-        page.on(
-            "request",
-            lambda req: captured_requests.append(req.url)
-            if "daum" in req.url and (
-                "api" in req.url or "investor" in req.url.lower()
-            )
-            else None,
-        )
+        captured = []
+
+        def on_request(req):
+            if "investor_purchase" in req.url:
+                captured.append(req.url)
+
+        page.on("request", on_request)
 
         page.goto(
             "https://finance.daum.net/domestic/influential_investors",
             wait_until="networkidle",
             timeout=15000,
         )
+        page.wait_for_timeout(1000)
+        results_by_tab["초기 로드(당일 추정)"] = list(dict.fromkeys(captured))
 
-        # 기간 탭으로 추정되는 텍스트를 찾아 클릭 시도
         for label in ["5영업일", "20영업일", "당일"]:
+            captured.clear()
             try:
                 page.click(f"text={label}", timeout=3000)
                 page.wait_for_timeout(1500)
-            except Exception:
-                pass
+            except Exception as e:
+                results_by_tab[label] = [f"클릭 실패: {e}"]
+                continue
+
+            results_by_tab[label] = list(dict.fromkeys(captured))
 
         browser.close()
 
-    return {"captured_urls": list(dict.fromkeys(captured_requests))}
+    return results_by_tab
