@@ -173,9 +173,31 @@ if auto_refresh_enabled:
     st_autorefresh(interval=refresh_interval * 1000, key="datarefresh")
 
 st.sidebar.divider()
+
 if st.sidebar.button("로그아웃", use_container_width=True):
     st.session_state.authenticated = False
     st.rerun()
+
+st.sidebar.divider()
+
+if st.sidebar.button(
+    "🛑 앱 서버 종료",
+    use_container_width=True,
+    type="primary",
+):
+    st.session_state["shutdown_requested"] = True
+    st.rerun()
+
+if st.session_state.get("shutdown_requested"):
+    st.sidebar.error("서버를 종료합니다. 터미널 창을 확인하세요.")
+    st.warning(
+        "⚠️ 앱 서버가 종료되었습니다. 다시 사용하려면 터미널에서 "
+        "`streamlit run app.py`를 다시 실행하세요."
+    )
+    st.stop()
+
+    import os
+    os._exit(0)
 
 st.sidebar.caption("© 2026 Macro Web Dashboard v2.3")
 
