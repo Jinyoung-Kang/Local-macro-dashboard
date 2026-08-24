@@ -1,15 +1,19 @@
 """
 services/radar_service.py
-5단계 무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
-[KIS(FHPTJ04400000) -> LS -> Daum -> Naver -> PyKrx]
+무중단(Fail-safe) 파이프라인 기반 날짜별/누적 수급 스캐닝 엔진
+[장중: KIS -> Daum -> Naver] [장마감 후/과거: Naver -> Daum -> PyKrx]
 공식 지원 투자주체(외국인/기관/투신/은행/보험/종금/기금/기타기관/기타법인) 매핑 탑재
 
-변경사항 (2026-08-24):
-- KRX 공식 OpenAPI(/sto/stk_bydd_trd) 단계를 파이프라인에서 완전히 제거했습니다.
-  해당 엔드포인트는 종목별 일일 시세(OHLCV)만 제공하며 투자자별 순매수 컬럼
-  (FRGN_NETBID_AMT 등)이 없어 항상 실패했습니다. 자격증명 문제가 아니라
-  잘못된 API 선택이었으므로, fetch_krx_date_deal_ranking() 함수 자체를
-  삭제하고 파이프라인은 KIS -> LS -> Daum -> Naver -> PyKrx 5단계로 운영합니다.
+변경사항 (2026-08-25):
+- KRX 공식 OpenAPI(/sto/stk_bydd_trd)는 투자자별 순매수 컬럼을 제공하지
+  않아 파이프라인에서 완전히 제외했습니다 (재추가하지 않음).
+- KIS(FHPTJ04400000)는 장중 가집계 전용 TR이라 장 마감 후에는 호출 자체를
+  건너뛰도록 명확히 분리했습니다. 장 마감 후 호출은 정상적으로 빈 데이터를
+  반환하는 것이며 오류가 아닙니다.
+- 장 마감 후/과거 영업일 조회 시 Naver를 최우선 확정 데이터 소스로 승격하고,
+  Daum을 2차 소스로, PyKrx를 3차(최종) 소스로 재배치했습니다.
+- Naver/Daum 개별 소스의 정상 동작 여부를 진단할 수 있는
+  test_naver_scraping(), test_daum_scraping() 함수를 추가했습니다.
 """
 import logging
 import re
@@ -32,6 +36,14 @@ except ImportError:
     PYKRX_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+COMMON_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
 
 # ==============================================================================
 # KIS FHPTJ04400000 투자자별 실제 필드 매핑
@@ -75,6 +87,25 @@ KIS_INVESTOR_FIELDS = {
     },
 }
 
+# Naver/Daum이 지원하는 투자주체만 여기서 매핑합니다.
+NAVER_INVESTOR_MAP = {
+    "외국인": "9000",
+    "기관": "7000",
+    "개인": "8000",
+    "연기금": "6000",
+    "금융투자": "2000",
+    "투신": "3000",
+}
+
+DAUM_INVESTOR_MAP = {
+    "외국인": "FOREIGN",
+    "기관": "INSTITUTION",
+    "연기금": "PENSION",
+    "금융투자": "FINANCIAL",
+    "투신": "TRUST",
+    "개인": "INDIVIDUAL",
+}
+
 
 def _to_float(value, default=0.0) -> float:
     try:
@@ -86,7 +117,7 @@ def _to_float(value, default=0.0) -> float:
 
 
 # ==============================================================================
-# 1. KIS / LS / PyKrx 연결 상태 진단 함수
+# 1. KIS / LS / PyKrx / Naver / Daum 연결 상태 진단 함수
 # ==============================================================================
 def test_kis_connection():
     """
@@ -137,7 +168,10 @@ def test_kis_connection():
                 e,
             )
 
-    return False, "KIS FHPTJ04400000 가집계 데이터가 비어있거나 API 호출에 실패했습니다."
+    return False, (
+        "KIS FHPTJ04400000 가집계 데이터가 비어있거나 API 호출에 실패했습니다. "
+        "장 마감 후에는 이 TR이 원래 빈 데이터를 반환하는 것이 정상입니다."
+    )
 
 
 def test_ls_connection():
@@ -197,8 +231,93 @@ def test_pykrx_connection():
         return False, f"예외 발생: {str(e)}"
 
 
+def test_naver_scraping():
+    """
+    Naver 금융 수급 순위 페이지(sise_deal_rank.naver)가 실제로 응답하고,
+    표(table.type_1)를 정상적으로 파싱할 수 있는지 점검합니다.
+    """
+    url = (
+        "https://finance.naver.com/sise/sise_deal_rank.naver"
+        "?investor_gubun=9000&sosok=01&type=1"
+    )
+    headers = {
+        **COMMON_HEADERS,
+        "Referer": "https://finance.naver.com/sise/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=8)
+
+        if resp.status_code != 200:
+            return False, f"HTTP {resp.status_code} 응답 (페이지 접속 실패)"
+
+        soup = BeautifulSoup(resp.content.decode("euc-kr", "replace"), "html.parser")
+        table = soup.find("table", {"class": "type_1"})
+
+        if table is None:
+            return False, "응답은 받았으나 예상한 표(table.type_1)를 찾지 못했습니다. 페이지 구조가 바뀌었을 수 있습니다."
+
+        rows = table.find_all("tr")
+        parsed = 0
+
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) >= 4 and cols[1].find("a"):
+                parsed += 1
+
+        if parsed == 0:
+            return False, "표는 찾았지만 파싱 가능한 종목 행이 없습니다 (휴장일이거나 형식 변경 가능)."
+
+        return True, f"정상 통신 성공 (외국인 순매수 상위 코스피 기준, 파싱된 종목 수: {parsed}개)"
+
+    except requests.exceptions.Timeout:
+        return False, "요청 시간 초과 (8초)"
+    except Exception as e:
+        return False, f"예외 발생: {e}"
+
+
+def test_daum_scraping():
+    """
+    Daum 금융 투자자별 매매동향 API(finance.daum.net/api/trend/investors)가
+    실제로 JSON 데이터를 반환하는지 점검합니다.
+    """
+    url = (
+        "https://finance.daum.net/api/trend/investors/top_net_buyers"
+        "?market=KOSPI&investorType=FOREIGN"
+    )
+    headers = {
+        **COMMON_HEADERS,
+        "Referer": "https://finance.daum.net/trend/investors",
+        "Accept": "application/json, text/plain, */*",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=6)
+
+        if resp.status_code != 200:
+            return False, f"HTTP {resp.status_code} 응답 (API 접속 실패)"
+
+        try:
+            payload = resp.json()
+        except Exception:
+            return False, "응답을 JSON으로 해석할 수 없습니다 (형식이 바뀌었을 수 있습니다)."
+
+        items = payload.get("data", [])
+
+        if not items:
+            return False, "정상 응답이지만 data 배열이 비어 있습니다 (휴장일이거나 데이터 미제공)."
+
+        return True, f"정상 통신 성공 (외국인 순매수 상위 코스피 기준, 조회된 종목 수: {len(items)}개)"
+
+    except requests.exceptions.Timeout:
+        return False, "요청 시간 초과 (6초)"
+    except Exception as e:
+        return False, f"예외 발생: {e}"
+
+
 # ==============================================================================
-# 2. KIS 증권사 API (순매수/순매도 전용 TR)
+# 2. KIS 증권사 API (순매수/순매도 전용 TR, 장중 전용)
 # ==============================================================================
 def fetch_kis_deal_ranking(
     target_date: str,
@@ -213,7 +332,7 @@ def fetch_kis_deal_ranking(
     주의:
     - 장중 가집계이며 KRX 장마감 확정치와 다를 수 있습니다.
     - 이 TR은 당일 데이터만 조회합니다.
-    - 과거 날짜 조회에는 사용하지 않습니다.
+    - 장 마감 후 호출하면 정상적으로 빈 데이터를 반환합니다 (오류 아님).
     """
     field_map = KIS_INVESTOR_FIELDS.get(investor)
 
@@ -466,16 +585,16 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
 # ==============================================================================
 def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     market_param = "KOSPI" if "KOSPI" in market.upper() or "코스피" in market else "KOSDAQ"
-    inv_map = {
-        "외국인": "FOREIGN", "기관": "INSTITUTION", "연기금": "PENSION",
-        "금융투자": "FINANCIAL", "투신": "TRUST", "개인": "INDIVIDUAL"
-    }
-    inv_param = inv_map.get(investor, "FOREIGN")
+    inv_param = DAUM_INVESTOR_MAP.get(investor)
+
+    if inv_param is None:
+        logger.warning("Daum 미지원 투자주체: %s (Naver/PyKrx로 대체됩니다)", investor)
+        return pd.DataFrame()
 
     action = "top_net_buyers" if trade_type == "순매수" else "top_net_sellers"
     url = f"https://finance.daum.net/api/trend/investors/{action}?market={market_param}&investorType={inv_param}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        **COMMON_HEADERS,
         "Referer": "https://finance.daum.net/trend/investors",
         "Accept": "application/json, text/plain, */*"
     }
@@ -509,6 +628,8 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
                         "데이터_출처": f"Daum 실시간 API ({target_date})"
                     })
                 return pd.DataFrame(records)
+        else:
+            logger.warning(f"Daum API 실패: HTTP {resp.status_code}")
     except Exception as e:
         logger.warning(f"Daum API 실패: {e}")
 
@@ -520,20 +641,17 @@ def fetch_daum_deal_ranking(target_date: str, market: str, investor: str, trade_
 # ==============================================================================
 def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     sosok = "01" if "KOSPI" in market.upper() or "코스피" in market else "02"
-    inv_map = {
-        "외국인": "9000",
-        "기관": "7000",
-        "개인": "8000",
-        "연기금": "6000",
-        "금융투자": "2000",
-        "투신": "3000",
-    }
-    inv_code = inv_map.get(investor, "9000")
+    inv_code = NAVER_INVESTOR_MAP.get(investor)
+
+    if inv_code is None:
+        logger.warning("Naver 미지원 투자주체: %s (Daum/PyKrx로 대체됩니다)", investor)
+        return pd.DataFrame()
+
     dir_type = "1" if trade_type == "순매수" else "2"
 
     url = f"https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun={inv_code}&sosok={sosok}&type={dir_type}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        **COMMON_HEADERS,
         "Referer": "https://finance.naver.com/sise/",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
@@ -586,6 +704,8 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
                                 break
                 if records:
                     return pd.DataFrame(records)
+        else:
+            logger.warning(f"Naver 스크래핑 실패: HTTP {resp.status_code}")
     except Exception as e:
         logger.warning(f"Naver 스크래핑 실패: {e}")
 
@@ -593,7 +713,7 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
 
 
 # ==============================================================================
-# 6. PyKrx 엔진 (시장 전체 랭킹)
+# 6. PyKrx 엔진 (시장 전체 랭킹, 최종 폴백)
 # ==============================================================================
 def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
     if not PYKRX_AVAILABLE:
@@ -653,9 +773,16 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
 
 
 # ==============================================================================
-# 7. 5단계 무중단 파이프라인 마스터 함수 (Smart Fallback, 시장 전체 랭킹)
-# KRX 공식 OpenAPI 단계는 잘못된 엔드포인트 사용으로 제거되었습니다.
-# 현재 순서: KIS(장중) -> Daum(장중) -> Naver -> PyKrx(과거 확정 데이터)
+# 7. 무중단 파이프라인 마스터 함수 (Smart Fallback, 시장 전체 랭킹)
+#
+# 장중 (평일 09:00~15:30):
+#   KIS(가집계) -> Daum(실시간) -> Naver(실시간)
+#
+# 장마감 후 / 과거 영업일 (확정 데이터 우선):
+#   Naver(확정) -> Daum(확정) -> PyKrx(확정, 최종 폴백)
+#
+# KIS는 장중 전용 TR이라 장마감 후에는 호출하지 않습니다.
+# KRX 공식 OpenAPI는 투자자별 컬럼을 제공하지 않아 사용하지 않습니다.
 # ==============================================================================
 @st.cache_data(ttl=20, show_spinner=False)
 def get_market_radar_scanner(
@@ -680,16 +807,16 @@ def get_market_radar_scanner(
     for _ in range(max_lookback_days):
         search_date_str = current_date_obj.strftime("%Y%m%d")
         is_today = search_date_str == today_str
+        is_live_session = is_today and is_regular_session
 
-        # 장중에는 KIS 장중 가집계 우선
-        if is_today and is_regular_session:
+        if is_live_session:
+            # 장중: KIS 가집계 우선, 실패 시 Daum -> Naver
             df = fetch_kis_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
             )
             if df is not None and not df.empty:
                 return df
 
-            # KIS 장애 시 장중 참고 소스
             df = fetch_daum_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
             )
@@ -702,6 +829,21 @@ def get_market_radar_scanner(
             if df is not None and not df.empty:
                 return df
 
+        else:
+            # 장마감 후 / 과거 영업일: 확정 데이터 소스를 Naver -> Daum 순으로 우선
+            df = fetch_naver_html_ranking(
+                search_date_str, market, investor, trade_type, top_n,
+            )
+            if df is not None and not df.empty:
+                return df
+
+            df = fetch_daum_deal_ranking(
+                search_date_str, market, investor, trade_type, top_n,
+            )
+            if df is not None and not df.empty:
+                return df
+
+        # 위 소스가 모두 실패하면 PyKrx를 최종 폴백으로 사용
         if PYKRX_AVAILABLE:
             df = fetch_pykrx_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
@@ -730,10 +872,7 @@ def fetch_daum_investor_daily_history(stock_code: str, start_date_obj, end_date_
     며칠~1개월 수준으로 제한적입니다.
     """
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
+        **COMMON_HEADERS,
         "Referer": "https://finance.daum.net/",
     }
 
