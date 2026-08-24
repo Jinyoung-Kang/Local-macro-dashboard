@@ -1,10 +1,10 @@
 streamlit
 requests
-pandas>=2.2.0,<3.0
+pandas
 numpy
 yfinance
 plotly
 streamlit-autorefresh
 urllib3
-pykrx==1.2.8
-websocket-client
+pykrx
+playwright
