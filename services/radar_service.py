@@ -1274,11 +1274,11 @@ def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_dat
 # 임시 함수
 def debug_daum_investor_periods() -> dict:
     """
-    [진단 전용] Daum 외국인/기관매매 페이지에서 기간 탭(당일/5영업일/
-    20영업일)을 각각 클릭했을 때, investor_purchase API 요청이
-    어떻게 바뀌는지 탭별로 구분해서 캡처합니다.
+    [진단 전용] Daum 외국인/기관매매 페이지의 기간 선택 <select> 드롭다운을
+    실제로 선택(select_option)했을 때, investor_purchase API 요청이
+    어떻게 바뀌는지 옵션별로 구분해서 캡처합니다.
     """
-    results_by_tab = {}
+    results_by_option = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -1298,19 +1298,41 @@ def debug_daum_investor_periods() -> dict:
             timeout=15000,
         )
         page.wait_for_timeout(1000)
-        results_by_tab["초기 로드(당일 추정)"] = list(dict.fromkeys(captured))
 
-        for label in ["5영업일", "20영업일", "당일"]:
+        # 페이지 안의 모든 select 요소와 그 안의 option 값을 먼저 조사
+        select_info = page.evaluate(
+            """
+            () => {
+                const selects = Array.from(document.querySelectorAll('select'));
+                return selects.map(sel => ({
+                    name: sel.name || sel.id || '(이름없음)',
+                    options: Array.from(sel.options).map(o => ({
+                        value: o.value,
+                        text: o.text,
+                    })),
+                }));
+            }
+            """
+        )
+        results_by_option["__select_구조__"] = select_info
+
+        captured.clear()
+        results_by_option["초기 로드(당일 추정)"] = list(dict.fromkeys(captured))
+
+        # 기간 관련 값으로 추정되는 option value 시도
+        candidate_values = ["TODAY", "5", "20", "DAYS_5", "DAYS_20"]
+
+        for value in candidate_values:
             captured.clear()
             try:
-                page.click(f"text={label}", timeout=3000)
+                page.select_option("select", value=value, timeout=3000)
                 page.wait_for_timeout(1500)
+                results_by_option[f"value={value}"] = list(
+                    dict.fromkeys(captured)
+                )
             except Exception as e:
-                results_by_tab[label] = [f"클릭 실패: {e}"]
-                continue
-
-            results_by_tab[label] = list(dict.fromkeys(captured))
+                results_by_option[f"value={value}"] = [f"선택 실패: {e}"]
 
         browser.close()
 
-    return results_by_tab
+    return results_by_option
