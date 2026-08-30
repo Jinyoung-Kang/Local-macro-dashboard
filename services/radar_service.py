@@ -957,6 +957,29 @@ def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade
 # KIS는 장중 전용 TR이라 장마감 후에는 호출하지 않습니다.
 # KRX 공식 OpenAPI는 투자자별 컬럼을 제공하지 않아 사용하지 않습니다.
 # ==============================================================================
+def _get_latest_completed_session_str(now_kst: datetime) -> str:
+    """
+    지금 이 시점에 Naver/Daum이 '현재 데이터'로 보여주는 거래일을
+    계산합니다. Naver/Daum은 날짜 파라미터가 없으므로, 항상
+    "가장 최근에 끝난 거래일"의 확정 데이터만 제공합니다.
+
+    - 장중(평일 09:00~15:30): 오늘 (실시간 반영 중)
+    - 장 마감 후(평일 15:30~24:00): 오늘 (당일 확정)
+    - 장 시작 전(평일 00:00~09:00) 또는 주말: 가장 최근 평일
+    """
+    current_time = now_kst.time()
+    is_weekday = now_kst.weekday() < 5
+
+    if is_weekday and current_time >= time(9, 0):
+        return now_kst.strftime("%Y%m%d")
+
+    # 장 시작 전이거나 주말이면, 하루씩 거슬러 올라가 가장 최근 평일을 찾음
+    d = now_kst.date() - timedelta(days=1)
+    while d.weekday() >= 5:  # 토(5)/일(6) 건너뛰기
+        d -= timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_radar_scanner(
     target_date_obj,
@@ -975,10 +998,11 @@ def get_market_radar_scanner(
         and time(9, 0) <= current_time < time(15, 30)
     )
 
+    # 최근 거래일 확정치를 Naver/Daum이 커버할 수 있는 날짜 계산
+    latest_completed_str = _get_latest_completed_session_str(now_kst)
+
     # interval_type이 TODAY가 아니면(5거래일/20거래일), Daum만이 유효한
-    # 유일한 소스입니다. KIS/Naver/PyKrx는 모두 "당일" 데이터만 제공하므로
-    # 이 경우 그 소스들을 시도하는 것은 무의미하며, Daum을 최우선/단독으로
-    # 사용합니다.
+    # 유일한 소스입니다. 즉시·단독으로 시도합니다.
     if interval_type != "TODAY":
         search_date_str = target_date_obj.strftime("%Y%m%d")
         df = fetch_daum_deal_ranking(
@@ -992,7 +1016,6 @@ def get_market_radar_scanner(
             "Daum 기간별(%s) 조회 실패. 당일 데이터로 자동 전환합니다.",
             interval_type,
         )
-        # Daum 기간별 조회가 실패하면 당일 파이프라인으로 자동 폴백
 
     current_date_obj = target_date_obj
     max_lookback_days = 7
@@ -1002,6 +1025,13 @@ def get_market_radar_scanner(
         is_today = search_date_str == today_str
         is_live_session = is_today and is_regular_session
 
+        # [핵심 수정] "오늘"이 아니어도, 선택한 날짜가 Naver/Daum이
+        # 현재 보여줄 수 있는 "가장 최근 확정 거래일"과 일치하면
+        # Naver/Daum도 유효한 소스로 취급합니다.
+        can_use_intraday_sources = (
+            is_live_session or is_today or search_date_str == latest_completed_str
+        )
+
         if is_live_session:
             df = fetch_kis_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
@@ -1009,6 +1039,7 @@ def get_market_radar_scanner(
             if df is not None and not df.empty:
                 return df
 
+        if can_use_intraday_sources:
             df = fetch_daum_deal_ranking(
                 search_date_str, market, investor, trade_type, top_n,
                 interval_type="TODAY",
@@ -1021,26 +1052,18 @@ def get_market_radar_scanner(
             )
             if df is not None and not df.empty:
                 return df
-
-        elif is_today:
-            df = fetch_naver_html_ranking(
-                search_date_str, market, investor, trade_type, top_n,
-            )
-            if df is not None and not df.empty:
-                return df
-
-            df = fetch_daum_deal_ranking(
-                search_date_str, market, investor, trade_type, top_n,
-                interval_type="TODAY",
-            )
-            if df is not None and not df.empty:
-                return df
-
         else:
             logger.info(
-                "과거 날짜(%s) 조회: 날짜 미지원 소스(Naver/Daum) 건너뛰고 PyKrx만 사용",
+                "과거 날짜(%s) 조회: 날짜 미지원 소스(Naver/Daum) 건너뛰고 "
+                "KRX OpenAPI/PyKrx만 사용",
                 search_date_str,
             )
+
+        df = fetch_krx_date_deal_ranking(
+            search_date_str, market, investor, trade_type, top_n,
+        )
+        if df is not None and not df.empty:
+            return df
 
         if PYKRX_AVAILABLE:
             df = fetch_pykrx_deal_ranking(
@@ -1052,8 +1075,10 @@ def get_market_radar_scanner(
         current_date_obj -= timedelta(days=1)
 
     logger.error(
-        "수급 스캐너 완전 실패: 시작일=%s, 시장=%s, 투자주체=%s, 방향=%s, 기간=%s",
+        "수급 스캐너 완전 실패: 시작일=%s, 시장=%s, 투자주체=%s, 방향=%s, 기간=%s "
+        "(PYKRX_AVAILABLE=%s, KRX_AUTH_KEY 설정여부=%s)",
         target_date_obj, market, investor, trade_type, interval_type,
+        PYKRX_AVAILABLE, bool(get_krx_key()),
     )
     return pd.DataFrame()
 
