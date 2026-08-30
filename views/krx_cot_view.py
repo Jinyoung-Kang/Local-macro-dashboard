@@ -2,9 +2,8 @@
 views/krx_cot_view.py
 🇰🇷 국내 파생상품 수급 & COT 한국판 대시보드 뷰
 KOSPI 200 선물, 미결제약정(OI), 베이시스, 투자자별 포지션 분석
-
 """
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
@@ -15,32 +14,23 @@ from config import get_krx_key
 from services.ai_service import ask_krx_cot_agent
 from services.krx_service import get_krx_futures_history, get_krx_investor_derivatives_summary
 
-# 데이터 확정 기준일 배너 바로 아래에 추가
-from datetime import time as dt_time
 
 def _get_next_krx_publish_info(data_date_str: str, now_kst: datetime) -> str:
     """
     KRX Open API는 D-1 데이터를 익영업일 오전 8시에 공개합니다.
-    표시된 확정 기준일이 실제로는 더 최근 영업일 데이터가 아직 미공개 상태일 뿐인
-    경우, 다음 갱신 예정 시각을 안내 문구로 반환합니다.
+    표시된 확정 기준일이 실제로는 더 최근 영업일 데이터가 아직 미공개
+    상태일 뿐인 경우, 다음 갱신 예정 시각을 안내 문구로 반환합니다.
     """
     today_str = now_kst.strftime("%Y-%m-%d")
-    yesterday_weekday = now_kst.weekday()
+    is_weekday = now_kst.weekday() < 5
 
-    # 오늘이 평일이고 아직 오전 8시 이전이면, "가장 최근 영업일" 데이터가
-    # 아직 미공개 상태일 수 있음을 안내
-    if yesterday_weekday < 5 and now_kst.time() < dt_time(8, 0):
+    if is_weekday and now_kst.time() < dt_time(8, 0):
         return (
             f"💡 KRX Open API는 전일 데이터를 익영업일 오전 8시에 공개합니다. "
             f"오늘({today_str}) 오전 8시 이후 최신 확정치가 자동으로 반영됩니다."
         )
     return ""
 
-
-# render_krx_cot_view() 함수 내, "데이터 확정 기준일" 배너 렌더링 직후에 삽입
-publish_notice = _get_next_krx_publish_info(data_date_str, now_kst)
-if publish_notice:
-    st.caption(publish_notice)
 
 def render_krx_cot_view():
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
@@ -101,6 +91,11 @@ def render_krx_cot_view():
     prev = df_hist.iloc[-2] if len(df_hist) > 1 else latest
     data_date_str = latest["Date"].strftime("%Y-%m-%d") if hasattr(latest["Date"], "strftime") else str(latest["Date"])[:10]
 
+    # [수정] 데이터 확정 기준일이 실제로는 최신 영업일이 아직 미공개된
+    # 상태일 수 있음을 안내. 함수 내부에서 data_date_str/now_kst가 계산된
+    # 이후에 호출해야 하므로, 반드시 여기(함수 안)에 위치해야 합니다.
+    publish_notice = _get_next_krx_publish_info(data_date_str, now_kst)
+
     # NaN 결측치 안전 추출 함수
     def safe_val(val, fallback_val=0.0):
         if val is None or pd.isna(val):
@@ -115,8 +110,8 @@ def render_krx_cot_view():
     fut_close = safe_val(latest.get("Futures_Close"), safe_val(prev.get("Futures_Close"), 365.20))
     chg_pct = safe_val(latest.get("Change_Pct"), 0.0)
 
-    # [수정] 베이시스는 임의 기본값(0.75)으로 대체하지 않고, 계산이 안 됐으면
-    # NaN 상태를 그대로 유지해 "데이터 미제공"으로 명확히 표시합니다.
+    # 베이시스는 임의 기본값으로 채우지 않고, 계산이 안 됐으면
+    # NaN 상태를 그대로 유지해 "데이터 미제공"으로 명확히 표시
     raw_basis = latest.get("Market_Basis")
     m_basis = float(raw_basis) if raw_basis is not None and not pd.isna(raw_basis) else np.nan
     basis_is_missing = pd.isna(m_basis)
@@ -137,6 +132,10 @@ def render_krx_cot_view():
     </div>
     """, unsafe_allow_html=True)
 
+    # [수정] 배너 렌더링 직후, 함수 내부의 올바른 들여쓰기로 호출
+    if publish_notice:
+        st.caption(publish_notice)
+
     # ==========================================================================
     # 1. 핵심 지표 카드
     # ==========================================================================
@@ -156,13 +155,11 @@ def render_krx_cot_view():
         )
         st.caption("💡 청산되지 않은 포지션 합계(시장 에너지)")
     with m3:
-        # [수정] 베이시스 결측 시 "데이터 미제공"으로 표시, 억지로 콘탱고/백워데이션
-        # 상태를 판단하지 않음
         if basis_is_missing:
             st.metric(
                 label=f"시장 베이시스 (Basis){estimate_suffix}",
                 value="데이터 미제공",
-                delta="pykrx 현물지수 조회 불가",
+                delta="KRX 현물지수 조회 불가",
                 delta_color="off"
             )
             st.caption("💡 KRX API는 베이시스를 직접 제공하지 않아 현물 대비 계산이 필요합니다")
@@ -225,9 +222,7 @@ def render_krx_cot_view():
         row=1, col=1
     )
 
-    # [수정] 베이시스는 NaN을 0으로 강제 대체하지 않고 그대로 전달합니다.
-    # Plotly는 NaN 구간을 자동으로 공백(결측)으로 처리하므로, 값이 없는데
-    # 마치 0(균형 상태)인 것처럼 보이는 왜곡을 방지합니다.
+    # 베이시스는 NaN을 0으로 강제 대체하지 않고 그대로 전달
     basis_series = df_hist["Market_Basis"]
     basis_colors = [
         "#238636" if (pd.notna(b) and b >= 0) else ("#DA3633" if pd.notna(b) else "rgba(139,148,158,0.3)")
@@ -269,9 +264,8 @@ def render_krx_cot_view():
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # [수정] 베이시스 데이터가 전체 구간에서 결측인 경우 차트 하단에 안내 추가
     if basis_series.isna().all():
-        st.caption("⚠️ 조회 기간 전체에서 시장 베이시스 계산이 불가능했습니다 (pykrx 현물 지수 조회 실패). 위 베이시스 차트는 빈 상태로 표시됩니다.")
+        st.caption("⚠️ 조회 기간 전체에서 시장 베이시스 계산이 불가능했습니다 (KRX 현물 지수 조회 실패). 위 베이시스 차트는 빈 상태로 표시됩니다.")
 
     # 차트 판독 팁
     with st.expander("🔍 **파생상품 차트 실전 판독 가이드 (Basis & Open Interest)**", expanded=False):
@@ -380,9 +374,7 @@ def render_krx_cot_view():
 
     if st.button("🧠 현재 파생 수급 기반 투자 가설 & 심층 결론 리포트 생성", use_container_width=True):
         with st.spinner(f"[{selected_engine}] 파이프라인을 통해 정밀 마크다운 리포트를 렌더링하고 있습니다..."):
-            # [수정] 베이시스가 결측인 경우, AI 프롬프트에도 "데이터 없음"으로
-            # 정확히 전달해 AI가 임의의 수치를 해석하지 않도록 함
-            basis_prompt_str = "데이터 없음 (pykrx 조회 실패)" if basis_is_missing else f"{m_basis:+.2f} pt"
+            basis_prompt_str = "데이터 없음 (KRX 현물 지수 조회 실패)" if basis_is_missing else f"{m_basis:+.2f} pt"
 
             prompt = f"""
             [KOSPI 200 Derivatives Market Data]
