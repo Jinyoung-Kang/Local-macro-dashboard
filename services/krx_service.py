@@ -73,6 +73,13 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
     반환 DataFrame에는 'is_estimated' 컬럼이 포함됩니다.
     - False: KRX OpenAPI에서 수집한 실제 확정치
     - True : KRX OpenAPI 응답 부재로 KODEX 200 프록시 추정치를 사용함
+
+    [수정 사항] 상품명 필터를 "코스피200|KOSPI 200|F 20" → "코스피200|KOSPI 200"로
+    좁히고, 국채/달러/미니 등 다른 선물이 잘못 매칭되는 것을 차단했습니다.
+    "F 20"이라는 계약월 표기는 모든 선물 상품에 공통으로 들어가므로, 이 패턴만으로
+    필터링하면 코스피200선물이 아닌 10년국채선물 등이 잘못 선택될 수 있습니다.
+    또한 동일 상품의 여러 계약월(최근월/차근월)이 함께 잡힐 경우, 거래량이 가장 큰
+    실질적인 "최근월물"을 명시적으로 선택하도록 정렬 로직을 추가했습니다.
     """
     today = datetime.now(ZoneInfo("Asia/Seoul"))
     date_list = []
@@ -92,8 +99,31 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
 
             name_col = cols.get("ISU_NM", cols.get("PROD_NM", ""))
             if name_col and name_col in df_day.columns:
-                k200_futs = df_day[df_day[name_col].str.contains("코스피200|KOSPI 200|F 20", na=False)]
+                # [수정] "F 20" 패턴 제거: 계약월 표기는 모든 선물 상품에
+                # 공통으로 들어가므로 코스피200선물만 정확히 매칭
+                k200_futs = df_day[
+                    df_day[name_col].str.contains("코스피200|KOSPI 200", na=False, regex=True)
+                ]
+
+                # [수정] 국채/달러/미니/위클리 등 상품명에 "코스피200" 문자열이
+                # 우연히 겹치는 다른 선물을 한 번 더 명시적으로 배제
+                k200_futs = k200_futs[
+                    ~k200_futs[name_col].str.contains("국채|달러|미니|위클리", na=False)
+                ]
+
                 if not k200_futs.empty:
+                    # [수정] 여러 계약월(최근월/차근월)이 동시에 잡히면,
+                    # 실제 거래가 집중된 최근월물(거래량 최대)을 선택
+                    if len(k200_futs) > 1:
+                        vol_col = cols.get("ACC_TRDVOL", cols.get("TRDVOL", ""))
+                        if vol_col and vol_col in k200_futs.columns:
+                            k200_futs = k200_futs.copy()
+                            k200_futs["_vol_sort"] = pd.to_numeric(
+                                k200_futs[vol_col].astype(str).str.replace(",", ""),
+                                errors="coerce",
+                            ).fillna(0)
+                            k200_futs = k200_futs.sort_values("_vol_sort", ascending=False)
+
                     row = k200_futs.iloc[0]
 
                     def safe_float(val):
