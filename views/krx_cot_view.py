@@ -3,14 +3,6 @@ views/krx_cot_view.py
 🇰🇷 국내 파생상품 수급 & COT 한국판 대시보드 뷰
 KOSPI 200 선물, 미결제약정(OI), 베이시스, 투자자별 포지션 분석
 
-[수정 사항]
-- get_krx_futures_history()가 반환하는 'is_estimated' 컬럼을 확인하여 KRX
-  실제 데이터가 아닌 KODEX 200 프록시 추정치일 경우 명확한 경고 표시.
-- get_krx_investor_derivatives_summary()가 반환하는 'is_placeholder' 컬럼을
-  확인하여 투자자별 수급표가 실제 데이터가 아닌 예시(placeholder)임을 항상 경고.
-- [신규] Market_Basis가 NaN(pykrx 조회 실패로 실제 베이시스 계산 불가)인 경우,
-  "+0.00pt"처럼 오해를 주는 값 대신 "데이터 미제공"으로 명확히 표시.
-  차트에서도 NaN을 0으로 강제 대체하지 않고 결측 구간(공백)으로 그대로 표시.
 """
 from datetime import datetime
 from zoneinfo import ZoneInfo
