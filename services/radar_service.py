@@ -617,6 +617,12 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
     return pd.DataFrame()
 
 
+INTERVAL_LABELS = {
+    "TODAY": "당일",
+    "DAYS_5": "5거래일",
+    "DAYS_20": "20거래일",
+}
+
 # ==============================================================================
 # 4. Daum 실시간 API (시장 전체 랭킹)
 # ==============================================================================
