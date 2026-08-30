@@ -149,22 +149,16 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
                     # [수정 2] KRX fut_bydd_trd API는 THEO_PRC/BASIS 필드를
                     # 제공하지 않으므로, pykrx로 같은 날짜의 KOSPI200 현물
                     # 지수 종가를 조회해 베이시스를 직접 계산합니다.
-                    theo_val = np.nan
-                    basis_val = np.nan
-                    if close_val > 0 and PYKRX_AVAILABLE:
-                        try:
-                            idx_df = pykrx_stock.get_index_ohlcv_by_date(
-                                d_str, d_str, "1028"  # 1028 = 코스피 200
-                            )
-                            if idx_df is not None and not idx_df.empty:
-                                spot_close = float(idx_df["종가"].iloc[0])
-                                if spot_close > 0:
-                                    basis_val = round(close_val - spot_close, 2)
-                                    theo_val = spot_close
-                        except Exception as e:
-                            logger.warning(
-                                f"pykrx 코스피200 현물 지수 조회 실패 ({d_str}): {e}"
-                            )
+                    # [수정] pykrx 웹 스크래핑 → KRX Open API 지수 엔드포인트로 교체
+                   theo_val = np.nan
+                   basis_val = np.nan
+                    if close_val > 0:
+                       spot_close = fetch_kospi200_index_close(d_str)
+                       if spot_close is not None and spot_close > 0:
+                           basis_val = round(close_val - spot_close, 2)
+                           theo_val = spot_close
+                       else:
+                           logger.warning(f"KRX Open API 코스피200 현물 지수 조회 실패 ({d_str})")
 
                     if close_val > 0:
                         records.append({
@@ -376,3 +370,56 @@ def get_krx_investor_derivatives_summary() -> pd.DataFrame:
         "is_placeholder": [True] * len(categories),
     })
     return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_kospi200_index_close(date_str: str) -> float:
+    """
+    KRX Open API 지수 서비스(idx/kospi_dd_trd)로 코스피200 현물 지수
+    종가를 조회합니다. pykrx 웹 스크래핑 대신 정식 AUTH_KEY 기반
+    엔드포인트를 사용해 클라우드 환경에서의 빈 응답/차단 문제를 회피합니다.
+    """
+    auth_key = get_krx_key()
+    if not auth_key:
+        return None
+
+    url = f"{KRX_BASE_URL}/idx/kospi_dd_trd"
+    headers = {
+        "AUTH_KEY": auth_key,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    params = {"basDd": date_str}
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=8)
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+        items = []
+        if isinstance(data, dict):
+            for key in ["OutBlock_1", "output", "block1"]:
+                if key in data and isinstance(data[key], list) and len(data[key]) > 0:
+                    items = data[key]
+                    break
+
+        if not items:
+            return None
+
+        df = pd.DataFrame(items)
+        cols = {c.upper(): c for c in df.columns}
+        name_col = cols.get("IDX_NM", "")
+        close_col = cols.get("CLSPRC_IDX", cols.get("TDD_CLSPRC", ""))
+
+        if not name_col or not close_col:
+            return None
+
+        k200_row = df[df[name_col].str.contains("코스피200|코스피 200", na=False)]
+        if k200_row.empty:
+            return None
+
+        close_str = str(k200_row.iloc[0][close_col]).replace(",", "").strip()
+        return float(close_str) if close_str else None
+    except Exception as e:
+        logger.warning(f"KRX 지수 Open API 코스피200 조회 실패 ({date_str}): {e}")
+        return None
