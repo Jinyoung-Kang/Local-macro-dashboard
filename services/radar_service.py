@@ -973,7 +973,6 @@ def _get_latest_completed_session_str(now_kst: datetime) -> str:
     if is_weekday and current_time >= time(9, 0):
         return now_kst.strftime("%Y%m%d")
 
-    # 장 시작 전이거나 주말이면, 하루씩 거슬러 올라가 가장 최근 평일을 찾음
     d = now_kst.date() - timedelta(days=1)
     while d.weekday() >= 5:  # 토(5)/일(6) 건너뛰기
         d -= timedelta(days=1)
@@ -998,11 +997,8 @@ def get_market_radar_scanner(
         and time(9, 0) <= current_time < time(15, 30)
     )
 
-    # 최근 거래일 확정치를 Naver/Daum이 커버할 수 있는 날짜 계산
     latest_completed_str = _get_latest_completed_session_str(now_kst)
 
-    # interval_type이 TODAY가 아니면(5거래일/20거래일), Daum만이 유효한
-    # 유일한 소스입니다. 즉시·단독으로 시도합니다.
     if interval_type != "TODAY":
         search_date_str = target_date_obj.strftime("%Y%m%d")
         df = fetch_daum_deal_ranking(
@@ -1025,9 +1021,6 @@ def get_market_radar_scanner(
         is_today = search_date_str == today_str
         is_live_session = is_today and is_regular_session
 
-        # [핵심 수정] "오늘"이 아니어도, 선택한 날짜가 Naver/Daum이
-        # 현재 보여줄 수 있는 "가장 최근 확정 거래일"과 일치하면
-        # Naver/Daum도 유효한 소스로 취급합니다.
         can_use_intraday_sources = (
             is_live_session or is_today or search_date_str == latest_completed_str
         )
@@ -1055,15 +1048,9 @@ def get_market_radar_scanner(
         else:
             logger.info(
                 "과거 날짜(%s) 조회: 날짜 미지원 소스(Naver/Daum) 건너뛰고 "
-                "KRX OpenAPI/PyKrx만 사용",
+                "PyKrx만 사용",
                 search_date_str,
             )
-
-        df = fetch_krx_date_deal_ranking(
-            search_date_str, market, investor, trade_type, top_n,
-        )
-        if df is not None and not df.empty:
-            return df
 
         if PYKRX_AVAILABLE:
             df = fetch_pykrx_deal_ranking(
@@ -1076,9 +1063,9 @@ def get_market_radar_scanner(
 
     logger.error(
         "수급 스캐너 완전 실패: 시작일=%s, 시장=%s, 투자주체=%s, 방향=%s, 기간=%s "
-        "(PYKRX_AVAILABLE=%s, KRX_AUTH_KEY 설정여부=%s)",
+        "(PYKRX_AVAILABLE=%s)",
         target_date_obj, market, investor, trade_type, interval_type,
-        PYKRX_AVAILABLE, bool(get_krx_key()),
+        PYKRX_AVAILABLE,
     )
     return pd.DataFrame()
 
