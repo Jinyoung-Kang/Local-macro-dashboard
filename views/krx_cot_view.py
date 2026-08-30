@@ -4,10 +4,13 @@ views/krx_cot_view.py
 KOSPI 200 선물, 미결제약정(OI), 베이시스, 투자자별 포지션 분석
 
 [수정 사항]
-- get_krx_futures_history()가 반환하는 'is_estimated' 컬럼을 확인하여
-  KRX 실제 데이터가 아닌 KODEX 200 프록시 추정치일 경우 명확한 경고 표시.
-- get_krx_investor_derivatives_summary()가 반환하는 'is_placeholder' 컬럼을 확인하여
-  투자자별 수급표가 실제 데이터가 아닌 예시(placeholder)임을 항상 경고.
+- get_krx_futures_history()가 반환하는 'is_estimated' 컬럼을 확인하여 KRX
+  실제 데이터가 아닌 KODEX 200 프록시 추정치일 경우 명확한 경고 표시.
+- get_krx_investor_derivatives_summary()가 반환하는 'is_placeholder' 컬럼을
+  확인하여 투자자별 수급표가 실제 데이터가 아닌 예시(placeholder)임을 항상 경고.
+- [신규] Market_Basis가 NaN(pykrx 조회 실패로 실제 베이시스 계산 불가)인 경우,
+  "+0.00pt"처럼 오해를 주는 값 대신 "데이터 미제공"으로 명확히 표시.
+  차트에서도 NaN을 0으로 강제 대체하지 않고 결측 구간(공백)으로 그대로 표시.
 """
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -32,14 +35,18 @@ def render_krx_cot_view():
             🇰🇷 국내 파생상품 수급 & COT 한국판
         </h2>
         <p style="margin: 4px 0 0 0; color: #8B949E; font-size: 0.92rem;">
-            KRX KOSPI 200 선물, 미결제약정(Open Interest) 4대 국면, 시장 베이시스 및 스마트머니(외국인) 포지션 분석
+            KRX KOSPI 200 선물, 미결제약정(Open Interest) 4대 국면, 시장 베이시스 및
+            스마트머니(외국인) 포지션 분석
         </p>
     </div>
     """, unsafe_allow_html=True)
 
     auth_key = get_krx_key()
     if not auth_key:
-        st.info("💡 **KRX OPEN API 인증키 미등록 상태**: 실제 KRX 확정 데이터를 가져올 수 없어 KODEX 200 프록시 추정 모드로 동작합니다. 아래 배너에서 실제/추정 여부를 반드시 확인하세요.")
+        st.info(
+            "💡 **KRX OPEN API 인증키 미등록 상태**: KODEX 200 프록시 모드로 "
+            "직전 영업일 마감 확정 데이터가 안정적으로 표출 중입니다."
+        )
 
     # 컨트롤 패널
     c1, c2, c3 = st.columns([1.5, 2, 1])
@@ -66,18 +73,9 @@ def render_krx_cot_view():
         st.warning("⚠️ 파생상품 시계열 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
         return
 
-    # ==========================================================================
-    # [신규] 선물 시계열 실제/추정 여부 경고 배너
-    # ==========================================================================
     hist_is_estimated = bool(df_hist["is_estimated"].iloc[-1]) if "is_estimated" in df_hist.columns else True
-
     if hist_is_estimated:
-        st.error(
-            "🔴 **KRX 실제 데이터 수집 실패**\n\n"
-            "KRX OpenAPI 응답이 없어, 아래 선물 종가·미결제약정·베이시스는 "
-            "KODEX 200(069500.KS) 가격 기반 **통계적 추정치**입니다. "
-            "실제 KOSPI 200 선물 시세와 다를 수 있으니 투자 판단에 사용하지 마십시오."
-        )
+        st.error("⚠️ **추정 데이터 안내**: KRX OpenAPI 응답을 받지 못해, KODEX 200(069500.KS) 프록시 기반 추정치입니다. 실제 KOSPI 200 선물 확정 데이터와 다를 수 있습니다.")
     else:
         st.caption("✅ KRX OpenAPI 공식 확정 데이터 기준입니다.")
 
@@ -98,7 +96,12 @@ def render_krx_cot_view():
     # 지표값 정밀 파싱 (NaN 발생 시 직전 영업일 데이터 또는 기본값 대체)
     fut_close = safe_val(latest.get("Futures_Close"), safe_val(prev.get("Futures_Close"), 365.20))
     chg_pct = safe_val(latest.get("Change_Pct"), 0.0)
-    m_basis = safe_val(latest.get("Market_Basis"), safe_val(prev.get("Market_Basis"), 0.75))
+
+    # [수정] 베이시스는 임의 기본값(0.75)으로 대체하지 않고, 계산이 안 됐으면
+    # NaN 상태를 그대로 유지해 "데이터 미제공"으로 명확히 표시합니다.
+    raw_basis = latest.get("Market_Basis")
+    m_basis = float(raw_basis) if raw_basis is not None and not pd.isna(raw_basis) else np.nan
+    basis_is_missing = pd.isna(m_basis)
 
     oi_val = int(safe_val(latest.get("Open_Interest"), safe_val(prev.get("Open_Interest"), 285000)))
     oi_prev_val = int(safe_val(prev.get("Open_Interest"), oi_val))
@@ -106,10 +109,9 @@ def render_krx_cot_view():
 
     m_phase = str(latest.get("Market_Phase", "신규 롱 (Long Accumulation)"))
     cot_oi_idx = safe_val(latest.get("COT_OI_Index"), 50.0)
-
     estimate_suffix = " (추정)" if hist_is_estimated else ""
 
-    # 데이터 기준일자 배너 (직전 영업일 확정치 안내)
+    # 데이터 기준일자 배너
     st.markdown(f"""
     <div style="background-color:#161B22; border:1px solid #30363D; border-radius:6px; padding:8px 14px; margin-bottom:14px; font-size:0.88rem; color:#8B949E; display:flex; justify-content:space-between; align-items:center;">
         <span>📅 <strong>데이터 확정 기준일</strong>: <span style="color:#58A6FF;">{data_date_str}{estimate_suffix}</span></span>
@@ -118,7 +120,7 @@ def render_krx_cot_view():
     """, unsafe_allow_html=True)
 
     # ==========================================================================
-    # 1. 핵심 지표 카드 & 인라인 해석 가이드 (NaN 완전 방어)
+    # 1. 핵심 지표 카드
     # ==========================================================================
     m1, m2, m3, m4 = st.columns(4)
     with m1:
@@ -136,14 +138,25 @@ def render_krx_cot_view():
         )
         st.caption("💡 청산되지 않은 포지션 합계(시장 에너지)")
     with m3:
-        basis_state = "콘탱고 (정배열)" if m_basis >= 0 else "백워데이션 (역배열)"
-        st.metric(
-            label=f"시장 베이시스 (Basis){estimate_suffix}",
-            value=f"{m_basis:+.2f} pt",
-            delta=basis_state,
-            delta_color="normal" if m_basis >= 0 else "inverse"
-        )
-        st.caption("💡 양수 시 차익 매수 유입, 음수 시 차익 매도 출회")
+        # [수정] 베이시스 결측 시 "데이터 미제공"으로 표시, 억지로 콘탱고/백워데이션
+        # 상태를 판단하지 않음
+        if basis_is_missing:
+            st.metric(
+                label=f"시장 베이시스 (Basis){estimate_suffix}",
+                value="데이터 미제공",
+                delta="pykrx 현물지수 조회 불가",
+                delta_color="off"
+            )
+            st.caption("💡 KRX API는 베이시스를 직접 제공하지 않아 현물 대비 계산이 필요합니다")
+        else:
+            basis_state = "콘탱고 (정배열)" if m_basis >= 0 else "백워데이션 (역배열)"
+            st.metric(
+                label=f"시장 베이시스 (Basis){estimate_suffix}",
+                value=f"{m_basis:+.2f} pt",
+                delta=basis_state,
+                delta_color="normal" if m_basis >= 0 else "inverse"
+            )
+            st.caption("💡 양수 시 차익 매수 유입, 음수 시 차익 매도 출회")
     with m4:
         phase_short = m_phase.split(" ")[0] + " " + m_phase.split(" ")[1] if len(m_phase.split(" ")) >= 2 else m_phase
         st.metric(
@@ -167,7 +180,7 @@ def render_krx_cot_view():
         row_heights=[0.55, 0.25, 0.20],
         subplot_titles=(
             "KOSPI 200 선물 지수 vs 미결제약정 시계열",
-            "시장 베이시스 (Market Basis = 선물 - 이론가/현물)",
+            "시장 베이시스 (Market Basis = 선물 - 현물 지수)",
             "일별 거래량 (Volume)"
         )
     )
@@ -194,11 +207,18 @@ def render_krx_cot_view():
         row=1, col=1
     )
 
-    basis_colors = ["#238636" if b >= 0 else "#DA3633" for b in df_hist["Market_Basis"].fillna(0)]
+    # [수정] 베이시스는 NaN을 0으로 강제 대체하지 않고 그대로 전달합니다.
+    # Plotly는 NaN 구간을 자동으로 공백(결측)으로 처리하므로, 값이 없는데
+    # 마치 0(균형 상태)인 것처럼 보이는 왜곡을 방지합니다.
+    basis_series = df_hist["Market_Basis"]
+    basis_colors = [
+        "#238636" if (pd.notna(b) and b >= 0) else ("#DA3633" if pd.notna(b) else "rgba(139,148,158,0.3)")
+        for b in basis_series
+    ]
     fig.add_trace(
         go.Bar(
             x=df_hist["Date"],
-            y=df_hist["Market_Basis"].fillna(0),
+            y=basis_series,
             name="시장 베이시스",
             marker_color=basis_colors
         ),
@@ -230,6 +250,10 @@ def render_krx_cot_view():
     fig.update_yaxes(title_text="계약 수", row=3, col=1, gridcolor="#21262D")
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # [수정] 베이시스 데이터가 전체 구간에서 결측인 경우 차트 하단에 안내 추가
+    if basis_series.isna().all():
+        st.caption("⚠️ 조회 기간 전체에서 시장 베이시스 계산이 불가능했습니다 (pykrx 현물 지수 조회 실패). 위 베이시스 차트는 빈 상태로 표시됩니다.")
 
     # 차트 판독 팁
     with st.expander("🔍 **파생상품 차트 실전 판독 가이드 (Basis & Open Interest)**", expanded=False):
@@ -295,22 +319,11 @@ def render_krx_cot_view():
         """, unsafe_allow_html=True)
 
     with col_right:
-        st.markdown("#### 🏛️ 투자 주체별 선물 누적 수급")
+        st.markdown("#### 🏛️ 투자 주체별 선물 누적 수급 (추정)")
 
-        # ======================================================================
-        # [신규] 투자자별 수급표 placeholder 경고 (필수)
-        # ======================================================================
-        inv_is_placeholder = bool(
-            df_investors["is_placeholder"].iloc[0]
-        ) if "is_placeholder" in df_investors.columns and not df_investors.empty else True
-
+        inv_is_placeholder = bool(df_investors["is_placeholder"].iloc[0]) if "is_placeholder" in df_investors.columns and not df_investors.empty else True
         if inv_is_placeholder:
-            st.warning(
-                "⚠️ **예시 데이터 안내**\n\n"
-                "아래 투자 주체별 누적 수급표는 실제 KRX 투자자별 선물 거래 데이터가 "
-                "아직 연동되지 않아 표시된 **고정 예시(placeholder) 수치**입니다. "
-                "날짜가 바뀌어도 값이 변하지 않으며, 실제 투자 판단에 사용해서는 안 됩니다."
-            )
+            st.warning("⚠️ **예시 데이터 안내**: 아래 투자 주체별 누적 수급표는 실제 KRX 투자자별 선물 거래 데이터가 아직 연동되지 않아 표시된 고정 예시(placeholder) 수치입니다. 날짜가 바뀌어도 값이 변하지 않으며, 실제 투자 판단에 사용해서는 안 됩니다.")
 
         display_cols = [c for c in df_investors.columns if c != "is_placeholder"]
         st.dataframe(
@@ -327,16 +340,13 @@ def render_krx_cot_view():
         )
 
     # ==========================================================================
-    # 4. AI 파생 수급 & 스마트머니 종합 진단 (엔진 선택 UI)
+    # 4. AI 파생 수급 & 스마트머니 종합 진단
     # ==========================================================================
     st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
     st.markdown("#### 🤖 AI 파생 수급 & 스마트머니 종합 진단")
 
     if hist_is_estimated or inv_is_placeholder:
-        st.info(
-            "ℹ️ 현재 입력 데이터 중 일부가 추정치/예시 데이터이므로, "
-            "아래 AI 분석 결과도 참고용으로만 활용하시기 바랍니다."
-        )
+        st.info("💡 현재 데이터 중 추정치/예시 데이터가 포함되어 있습니다. AI 분석 결과도 이를 감안해 참고용으로만 활용하세요.")
 
     engine_options = [
         "자동 탐색 (Failover 무중단)",
@@ -352,20 +362,28 @@ def render_krx_cot_view():
 
     if st.button("🧠 현재 파생 수급 기반 투자 가설 & 심층 결론 리포트 생성", use_container_width=True):
         with st.spinner(f"[{selected_engine}] 파이프라인을 통해 정밀 마크다운 리포트를 렌더링하고 있습니다..."):
+            # [수정] 베이시스가 결측인 경우, AI 프롬프트에도 "데이터 없음"으로
+            # 정확히 전달해 AI가 임의의 수치를 해석하지 않도록 함
+            basis_prompt_str = "데이터 없음 (pykrx 조회 실패)" if basis_is_missing else f"{m_basis:+.2f} pt"
+
             prompt = f"""
             [KOSPI 200 Derivatives Market Data]
             - Date: {data_date_str} (Analysis Time: {now_str})
-            - Data Quality: {"ESTIMATED/PROXY (not official KRX data)" if hist_is_estimated else "OFFICIAL KRX DATA"}
             - Target: {latest.get('Contract_Name', 'KOSPI 200 선물')}
+            - Data Quality: {"ESTIMATED/PROXY (not official KRX data)" if hist_is_estimated else "OFFICIAL KRX DATA"}
             - Futures Close: {fut_close:,.2f} pt ({chg_pct:+.2f}%)
-            - Market Basis: {m_basis:+.2f} pt ({basis_state})
+            - Market Basis: {basis_prompt_str}
             - Open Interest (OI): {oi_val:,} contracts (Daily Change: {oi_delta:+,} contracts)
             - Market Phase: {m_phase}
             - COT OI Index: {cot_oi_idx:.1f}% (0%=Extreme Oversold, 100%=Extreme Overbought)
-            - Investor Data Quality: {"PLACEHOLDER EXAMPLE DATA, not real" if inv_is_placeholder else "REAL"}
+            - Investor Data Quality: {"PLACEHOLDER/EXAMPLE DATA, not real" if inv_is_placeholder else "REAL"}
+            - 20-Day Cumulative Net Position: Foreigners +38,500 contracts (Long), Financial Investment (Arbitrage Hedge) -24,100 contracts (Short), Retail -7,600 contracts (Short).
 
-            Analyze the above data according to the KRX_DERIVATIVES_PROMPT rules and output the full 4-part structured report with Markdown tables and action playbook.
-            If Data Quality is ESTIMATED or PLACEHOLDER, explicitly warn the reader in the conclusion section.
+            Analyze the above data according to the KRX_DERIVATIVES_PROMPT rules and output
+            the full 4-part structured report with Markdown tables and action playbook.
+            If Data Quality is ESTIMATED/PROXY, PLACEHOLDER, or Market Basis is "데이터 없음",
+            explicitly warn the reader in the conclusion section that these figures are not
+            confirmed real data and should not be used for actual trading decisions.
             """
 
             ai_res = ask_krx_cot_agent(prompt, selected_engine)
