@@ -21,6 +21,12 @@ import streamlit as st
 import yfinance as yf
 from config import get_krx_key, KRX_BASE_URL
 
+try:
+    from pykrx import stock as pykrx_stock
+    PYKRX_AVAILABLE = True
+except ImportError:
+    PYKRX_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
@@ -74,12 +80,15 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
     - False: KRX OpenAPI에서 수집한 실제 확정치
     - True : KRX OpenAPI 응답 부재로 KODEX 200 프록시 추정치를 사용함
 
-    [수정 사항] 상품명 필터를 "코스피200|KOSPI 200|F 20" → "코스피200|KOSPI 200"로
-    좁히고, 국채/달러/미니 등 다른 선물이 잘못 매칭되는 것을 차단했습니다.
-    "F 20"이라는 계약월 표기는 모든 선물 상품에 공통으로 들어가므로, 이 패턴만으로
-    필터링하면 코스피200선물이 아닌 10년국채선물 등이 잘못 선택될 수 있습니다.
-    또한 동일 상품의 여러 계약월(최근월/차근월)이 함께 잡힐 경우, 거래량이 가장 큰
-    실질적인 "최근월물"을 명시적으로 선택하도록 정렬 로직을 추가했습니다.
+    [수정 사항 1] 상품명 필터를 "코스피200|KOSPI 200"로 좁히고, 국채/달러/미니
+    등 다른 선물이 잘못 매칭되는 것을 차단. 여러 계약월이 잡히면 거래량이 가장
+    큰 실질적인 최근월물을 선택.
+
+    [수정 사항 2] KRX fut_bydd_trd API는 'BASIS'(시장 베이시스) 필드를 원래
+    제공하지 않습니다. 이 필드를 조회하면 항상 기본값 0이 반환되어 실제 값처럼
+    오인될 수 있으므로, pykrx를 통해 같은 날짜의 KOSPI200 현물 지수 종가를
+    별도로 조회하여 베이시스(선물 종가 - 현물 지수)를 직접 계산합니다.
+    pykrx 조회가 실패하면 베이시스는 NaN(결측)으로 남겨 오해를 방지합니다.
     """
     today = datetime.now(ZoneInfo("Asia/Seoul"))
     date_list = []
@@ -99,21 +108,20 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
 
             name_col = cols.get("ISU_NM", cols.get("PROD_NM", ""))
             if name_col and name_col in df_day.columns:
-                # [수정] "F 20" 패턴 제거: 계약월 표기는 모든 선물 상품에
+                # [수정 1] "F 20" 패턴 제거: 계약월 표기는 모든 선물 상품에
                 # 공통으로 들어가므로 코스피200선물만 정확히 매칭
                 k200_futs = df_day[
                     df_day[name_col].str.contains("코스피200|KOSPI 200", na=False, regex=True)
                 ]
 
-                # [수정] 국채/달러/미니/위클리 등 상품명에 "코스피200" 문자열이
-                # 우연히 겹치는 다른 선물을 한 번 더 명시적으로 배제
+                # 국채/달러/미니/위클리 등 다른 선물이 우연히 겹치는 것을 배제
                 k200_futs = k200_futs[
                     ~k200_futs[name_col].str.contains("국채|달러|미니|위클리", na=False)
                 ]
 
                 if not k200_futs.empty:
-                    # [수정] 여러 계약월(최근월/차근월)이 동시에 잡히면,
-                    # 실제 거래가 집중된 최근월물(거래량 최대)을 선택
+                    # 여러 계약월(최근월/차근월)이 동시에 잡히면 거래량이
+                    # 가장 큰 실질적인 최근월물을 선택
                     if len(k200_futs) > 1:
                         vol_col = cols.get("ACC_TRDVOL", cols.get("TRDVOL", ""))
                         if vol_col and vol_col in k200_futs.columns:
@@ -137,8 +145,26 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
                     fluc_val = safe_float(row.get("FLUC_RT", 0))
                     vol_val = safe_float(row.get("ACC_TRDVOL", row.get("TRDVOL", 0)))
                     oi_val = safe_float(row.get("ACC_OPNINT_QTY", row.get("OPNINT_QTY", 0)))
-                    theo_val = safe_float(row.get("THEO_PRC", 0))
-                    basis_val = safe_float(row.get("BASIS", 0))
+
+                    # [수정 2] KRX fut_bydd_trd API는 THEO_PRC/BASIS 필드를
+                    # 제공하지 않으므로, pykrx로 같은 날짜의 KOSPI200 현물
+                    # 지수 종가를 조회해 베이시스를 직접 계산합니다.
+                    theo_val = np.nan
+                    basis_val = np.nan
+                    if close_val > 0 and PYKRX_AVAILABLE:
+                        try:
+                            idx_df = pykrx_stock.get_index_ohlcv_by_date(
+                                d_str, d_str, "1028"  # 1028 = 코스피 200
+                            )
+                            if idx_df is not None and not idx_df.empty:
+                                spot_close = float(idx_df["종가"].iloc[0])
+                                if spot_close > 0:
+                                    basis_val = round(close_val - spot_close, 2)
+                                    theo_val = spot_close
+                        except Exception as e:
+                            logger.warning(
+                                f"pykrx 코스피200 현물 지수 조회 실패 ({d_str}): {e}"
+                            )
 
                     if close_val > 0:
                         records.append({
@@ -162,7 +188,7 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
 
     df_hist = pd.DataFrame(records).sort_values("Date").reset_index(drop=True)
 
-    # NaN 및 0 결측치 보정
+    # NaN 및 0 결측치 보정 (베이시스/이론가는 결측 그대로 유지, 임의 대체하지 않음)
     df_hist["Futures_Close"] = df_hist["Futures_Close"].replace(0, np.nan).ffill().bfill()
     df_hist["Open_Interest"] = df_hist["Open_Interest"].replace(0, np.nan).ffill().bfill()
 
@@ -189,6 +215,13 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
     max_oi = df_hist["Open_Interest"].rolling(window=min(20, len(df_hist)), min_periods=1).max()
     denom = (max_oi - min_oi).replace(0, 1)
     df_hist["COT_OI_Index"] = ((df_hist["Open_Interest"] - min_oi) / denom * 100).round(1)
+
+    # 베이시스 계산이 전부 실패했다면(pykrx 미가용 등) 경고 로그
+    if df_hist["Market_Basis"].isna().all():
+        logger.warning(
+            "전체 구간에서 베이시스 계산이 실패했습니다 (pykrx 조회 불가). "
+            "Market_Basis는 NaN으로 유지되며 화면에서 '데이터 미제공'으로 표시해야 합니다."
+        )
 
     # 실제 KRX 확정 데이터임을 명시
     df_hist["is_estimated"] = False
