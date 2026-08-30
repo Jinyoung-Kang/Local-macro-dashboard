@@ -23,6 +23,32 @@ from config import get_krx_key
 from services.ai_service import ask_krx_cot_agent
 from services.krx_service import get_krx_futures_history, get_krx_investor_derivatives_summary
 
+# 데이터 확정 기준일 배너 바로 아래에 추가
+from datetime import time as dt_time
+
+def _get_next_krx_publish_info(data_date_str: str, now_kst: datetime) -> str:
+    """
+    KRX Open API는 D-1 데이터를 익영업일 오전 8시에 공개합니다.
+    표시된 확정 기준일이 실제로는 더 최근 영업일 데이터가 아직 미공개 상태일 뿐인
+    경우, 다음 갱신 예정 시각을 안내 문구로 반환합니다.
+    """
+    today_str = now_kst.strftime("%Y-%m-%d")
+    yesterday_weekday = now_kst.weekday()
+
+    # 오늘이 평일이고 아직 오전 8시 이전이면, "가장 최근 영업일" 데이터가
+    # 아직 미공개 상태일 수 있음을 안내
+    if yesterday_weekday < 5 and now_kst.time() < dt_time(8, 0):
+        return (
+            f"💡 KRX Open API는 전일 데이터를 익영업일 오전 8시에 공개합니다. "
+            f"오늘({today_str}) 오전 8시 이후 최신 확정치가 자동으로 반영됩니다."
+        )
+    return ""
+
+
+# render_krx_cot_view() 함수 내, "데이터 확정 기준일" 배너 렌더링 직후에 삽입
+publish_notice = _get_next_krx_publish_info(data_date_str, now_kst)
+if publish_notice:
+    st.caption(publish_notice)
 
 def render_krx_cot_view():
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
