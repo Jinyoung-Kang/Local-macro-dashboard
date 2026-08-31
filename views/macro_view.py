@@ -3,8 +3,15 @@ views/macro_view.py
 거시경제 매크로 지표 대시보드 뷰
 장단기 금리차, 하이일드 OAS, 3M CP 스프레드, STLFSI4, 개장 상태 표시 및
 데이터 스냅샷 추출 연동
+
+[수정 사항]
+- 미국채 금리(2년/10년/30년물)는 yfinance(^TNX 등)가 분봉을 제공하지 않아
+  데이터 시각이 일봉 수준으로 지연되므로, "비공식 스크래핑 시세 비교"에
+  이미 있는 TradingView 기반 us02y/us10y/us30y 값으로 화면에서 대체합니다.
+  스크래핑이 실패하면 기존 yfinance 값을 그대로 유지하는 안전한 폴백 구조입니다.
 """
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.graph_objects as go
 import pytz
@@ -26,6 +33,16 @@ from services.dashboard_snapshot_service import (
 from services.market_scraper_service import (
     get_scraped_macro_markets,
 )
+
+# [수정] 미국채 카테고리 항목명 → 비공식 스크래핑 키 매핑
+BOND_SCRAPER_KEY_MAP = {
+    "미국채 2년물 금리(%) :gray[[15분 지연]]": "us02y",
+    "미국채 10년물 금리(%) :gray[[15분 지연]]": "us10y",
+    "미국채 30년물 금리(%) :gray[[15분 지연]]": "us30y",
+}
+
+# [수정] "미국 국채 금리" 카테고리의 정확한 키 문자열 (config.py MACRO_CATEGORIES와 일치)
+BOND_CATEGORY_NAME = "🏛️ 미국 국채 금리 :gray[(15분 지연)]"
 
 
 @st.cache_data(ttl=60)
@@ -96,6 +113,42 @@ def inject_market_status(name: str) -> str:
         return name.replace("]", f" / {status}]")
     else:
         return f"{name} :gray[({status})]"
+
+
+def _override_with_scraper_bond(item: dict, scraper_items_for_bonds: dict) -> dict:
+    """
+    미국채 금리 항목을 TradingView 비공식 스크래핑 값으로 대체합니다.
+    yfinance(^TNX 등)는 분봉을 제공하지 않아 데이터 시각이 일봉 수준으로
+    지연되므로, 실시간성이 더 나은 스크래핑 값으로 교체합니다.
+    스크래핑이 실패한 경우 기존 yfinance 값을 그대로 유지합니다(안전한 폴백).
+    """
+    scraper_key = BOND_SCRAPER_KEY_MAP.get(item.get("name"))
+    if not scraper_key:
+        return item
+
+    scraped = scraper_items_for_bonds.get(scraper_key)
+    if not scraped or scraped.get("status") != "ok" or scraped.get("price") is None:
+        return item
+
+    price = scraped["price"]
+    prev = scraped.get("previous_close")
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+
+    new_item = dict(item)
+    new_item["price"] = price
+    new_item["price_str"] = f"{price:,.2f}"
+    new_item["status"] = "ok"
+    new_item["last_ts"] = now_kst.strftime("%H:%M:%S KST") + " (TradingView 비공식)"
+
+    if prev is not None and prev != 0:
+        delta = price - prev
+        pct = (delta / prev) * 100
+        new_item["delta"] = delta
+        new_item["pct"] = pct
+        new_item["delta_str"] = f"{delta:+.2f} ({pct:+.2f}%)"
+        new_item["prev_str"] = f"{prev:,.2f}"
+
+    return new_item
 
 
 def render_macro_view(now_str_kst: str, refresh_interval: int):
@@ -181,6 +234,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     # ==========================================================================
     # 1. 기존 공식/최근 시세 요약 카드
     # 한 카테고리에 항목이 많으면 한 행 최대 4개씩 줄바꿈합니다.
+    # [수정] "미국 국채 금리" 카테고리는 비공식 스크래핑 값으로 대체합니다.
     # ==========================================================================
     st.subheader("실시간/최근 시세 요약")
     st.info(
@@ -188,6 +242,12 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         "'직전 거래일 공식 종가(Previous Close) 대비 등락폭과 등락률(%)'입니다.",
         icon="ℹ️",
     )
+
+    # [수정] 미국채 스크래핑 값을 미리 조회 (카드 반복문에서 재사용)
+    scraper_result_for_bonds = get_scraped_macro_markets()
+    scraper_items_for_bonds = {
+        item["key"]: item for item in scraper_result_for_bonds.get("items", [])
+    }
 
     MAX_COLS_PER_ROW = 4
 
@@ -199,6 +259,10 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             cols = st.columns(MAX_COLS_PER_ROW)
 
             for idx, item in enumerate(row_items):
+                # [수정] 미국채 금리 카테고리만 스크래핑 값으로 교체
+                if cat_name == BOND_CATEGORY_NAME:
+                    item = _override_with_scraper_bond(item, scraper_items_for_bonds)
+
                 display_name = inject_market_status(item["name"])
                 col = cols[idx]
 
@@ -246,7 +310,9 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     st.caption(
         "TradingView·Investing.com 공개 웹페이지를 비공식적으로 수집한 "
         "참고용 데이터입니다. 기존 공식/FRED/yfinance 데이터를 대체하지 않으며, "
-        "웹페이지 구조·접근 정책 변경에 따라 수집 실패 또는 지연될 수 있습니다."
+        "웹페이지 구조·접근 정책 변경에 따라 수집 실패 또는 지연될 수 있습니다.\n\n"
+        "💡 미국채 2년물/10년물/30년물은 위 '실시간/최근 시세 요약' 카드에서 "
+        "이 스크래핑 값을 실제로 사용하고 있습니다 (yfinance 일봉 지연 문제 회피)."
     )
 
     scraper_result = get_scraped_macro_markets()
