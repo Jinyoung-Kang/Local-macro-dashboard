@@ -283,9 +283,20 @@ def render_radar_view():
     # ==========================================================================
     st.markdown(f"#### {market_sel} {investor_sel} {trade_type_sel} 상위 종목 트리맵")
 
+    # 트리맵 면적은 종목의 주가나 임의 가중치가 아니라 실제 수급 규모를 뜻합니다.
+    # 순매도 데이터는 금액이 음수이므로 면적 계산에는 절대값을 사용합니다.
     df_plot = df_radar.copy()
-    df_plot["시가총액_가중"] = df_plot["시가총액_가중"].abs()
-    df_plot["시가총액_가중"] = df_plot["시가총액_가중"].apply(lambda x: max(x, 1.0))
+    df_plot["절대순매수대금"] = pd.to_numeric(
+        df_plot["순매수대금(억)"], errors="coerce"
+    ).abs().fillna(0.0)
+
+    # Plotly Treemap은 0 이하의 면적을 표시할 수 없으므로 최소값을 적용합니다.
+    df_plot["절대순매수대금"] = df_plot["절대순매수대금"].clip(lower=0.1)
+
+    # 상세 테이블과 동일한 수급 규모 기준으로 데이터 순서를 통일합니다.
+    df_plot = df_plot.sort_values(
+        "절대순매수대금", ascending=False
+    ).reset_index(drop=True)
 
     max_abs_pct = (
         float(df_plot["등락률(%)"].abs().quantile(0.95))
@@ -297,7 +308,7 @@ def render_radar_view():
     fig_treemap = px.treemap(
         df_plot,
         path=["종목명"],
-        values="시가총액_가중",
+        values="절대순매수대금",
         color="등락률(%)",
         color_continuous_scale=["#1F6FEB", "#0D1117", "#F85149"],
         color_continuous_midpoint=0.0,
