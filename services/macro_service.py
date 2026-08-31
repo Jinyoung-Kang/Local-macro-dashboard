@@ -322,19 +322,27 @@ def get_collected_macro_data():
         
             elif df is not None and isinstance(df, pd.DataFrame) and len(df) == 1:
                 curr = float(df['Close'].iloc[-1])
-        
+            
                 last_timestamp = df.index[-1]
+                is_intraday = bool(df.attrs.get("is_intraday", False))
+            
                 try:
-                    if hasattr(last_timestamp, "tzinfo") and last_timestamp.tzinfo is not None:
+                    if is_intraday and hasattr(last_timestamp, "tzinfo") and last_timestamp.tzinfo is not None:
                         last_ts_kst = last_timestamp.astimezone(ZoneInfo("Asia/Seoul"))
-                    elif hasattr(last_timestamp, "tz_localize"):
+                        last_ts_str = last_ts_kst.strftime("%H:%M:%S KST")
+                    elif is_intraday and hasattr(last_timestamp, "tz_localize"):
                         last_ts_kst = last_timestamp.tz_localize("UTC").astimezone(ZoneInfo("Asia/Seoul"))
+                        last_ts_str = last_ts_kst.strftime("%H:%M:%S KST")
                     else:
-                        last_ts_kst = None
-                    last_ts_str = last_ts_kst.strftime("%H:%M:%S KST") if last_ts_kst is not None else "N/A"
+                        trading_date = (
+                            last_timestamp.strftime("%Y-%m-%d")
+                            if hasattr(last_timestamp, "strftime")
+                            else "N/A"
+                        )
+                        last_ts_str = f"{trading_date} 일봉 기준"
                 except Exception:
                     last_ts_str = "N/A"
-        
+            
                 collected[cat_name].append({
                     "name": name,
                     "price": curr,
