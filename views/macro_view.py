@@ -1,7 +1,8 @@
 """
 views/macro_view.py
 거시경제 매크로 지표 대시보드 뷰
-장단기 금리차, 하이일드 OAS, 3M CP 스프레드, STLFSI4, 개장 상태 표시 및 데이터 스냅샷 추출 연동
+장단기 금리차, 하이일드 OAS, 3M CP 스프레드, STLFSI4, 개장 상태 표시 및
+데이터 스냅샷 추출 연동
 """
 from datetime import datetime
 import pandas as pd
@@ -22,10 +23,10 @@ from services.dashboard_snapshot_service import (
     collect_dashboard_snapshot,
     format_dashboard_snapshot_text,
 )
-
 from services.market_scraper_service import (
     get_scraped_macro_markets,
 )
+
 
 @st.cache_data(ttl=60)
 def get_us_market_status() -> str:
@@ -63,7 +64,6 @@ def inject_market_status(name: str) -> str:
             status = "개장"
         else:
             status = "마감"
-
     elif "비트코인" in name or "이더리움" in name or "암호화폐" in name:
         status = "개장"
     elif "코스피" in name or "코스닥" in name:
@@ -192,62 +192,56 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     MAX_COLS_PER_ROW = 4
 
     for cat_name, items in collected_data.items():
-    st.markdown(f"#### {cat_name}")
+        st.markdown(f"#### {cat_name}")
 
-    for row_start in range(0, len(items), MAX_COLS_PER_ROW):
-        row_items = items[row_start: row_start + MAX_COLS_PER_ROW]
-        cols = st.columns(MAX_COLS_PER_ROW)
+        for row_start in range(0, len(items), MAX_COLS_PER_ROW):
+            row_items = items[row_start: row_start + MAX_COLS_PER_ROW]
+            cols = st.columns(MAX_COLS_PER_ROW)
 
-        for idx, item in enumerate(row_items):
-            display_name = inject_market_status(item["name"])
-            col = cols[idx]
+            for idx, item in enumerate(row_items):
+                display_name = inject_market_status(item["name"])
+                col = cols[idx]
 
-            if item["status"] == "ok":
-                col.metric(
-                    label=display_name,
-                    value=item["price_str"],
-                    delta=item["delta_str"],
-                    help=f"직전 거래일 종가: {item['prev_str']}"
-                )
+                if item["status"] == "ok":
+                    col.metric(
+                        label=display_name,
+                        value=item["price_str"],
+                        delta=item["delta_str"],
+                        help=f"직전 거래일 종가: {item['prev_str']}"
+                    )
 
-                extra_caption_parts = [f"전일 종가: `{item['prev_str']}`"]
-                if item.get("contract_month"):
-                    extra_caption_parts.append(f"월물: `{item['contract_month']}`")
-                if item.get("source"):
-                    extra_caption_parts.append(f"출처: `{item['source']}`")
+                    extra_caption_parts = [f"전일 종가: `{item['prev_str']}`"]
+                    if item.get("contract_month"):
+                        extra_caption_parts.append(f"월물: `{item['contract_month']}`")
+                    if item.get("source"):
+                        extra_caption_parts.append(f"출처: `{item['source']}`")
+                    if item.get("last_ts"):
+                        extra_caption_parts.append(f"데이터 시각: `{item['last_ts']}`")
 
-                # ↓↓↓ 여기에 데이터 시각(last_ts) 항목을 추가 ↓↓↓
-                if item.get("last_ts"):
-                    extra_caption_parts.append(f"데이터 시각: `{item['last_ts']}`")
+                    col.caption(" | ".join(extra_caption_parts))
 
-                col.caption(" | ".join(extra_caption_parts))
+                elif item["status"] == "single":
+                    col.metric(label=display_name, value=item["price_str"])
+                    col.caption("전일 데이터 없음")
+                else:
+                    col.metric(label=display_name, value="로드 실패")
+                    fail_caption_parts = []
+                    if item.get("contract_month"):
+                        fail_caption_parts.append(f"월물: `{item['contract_month']}`")
+                    if item.get("source"):
+                        fail_caption_parts.append(f"출처: `{item['source']}`")
+                    if fail_caption_parts:
+                        col.caption(" | ".join(fail_caption_parts))
 
-            elif item["status"] == "single":
-                col.metric(label=display_name, value=item["price_str"])
-                col.caption("전일 데이터 없음")
-            else:
-                col.metric(label=display_name, value="로드 실패")
-                fail_caption_parts = []
-                if item.get("contract_month"):
-                    fail_caption_parts.append(f"월물: `{item['contract_month']}`")
-                if item.get("source"):
-                    fail_caption_parts.append(f"출처: `{item['source']}`")
-                if fail_caption_parts:
-                    col.caption(" | ".join(fail_caption_parts))
-
-        for idx in range(len(row_items), MAX_COLS_PER_ROW):
-            cols[idx].empty()
+            for idx in range(len(row_items), MAX_COLS_PER_ROW):
+                cols[idx].empty()
 
     # ==========================================================================
     # 1-1. 비공식 웹 스크래핑 시세 비교 구역
     # 기존 공식/yfinance/FRED 데이터와 완전히 분리된 참고용 영역입니다.
     # ==========================================================================
-    st.markdown(
-        "<div style='height: 12px;'></div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
     st.divider()
-
     st.subheader("🔎 비공식 스크래핑 시세 비교")
     st.caption(
         "TradingView·Investing.com 공개 웹페이지를 비공식적으로 수집한 "
@@ -270,9 +264,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     SCRAPER_COLS_PER_ROW = 5
 
     for row_start in range(
-        0,
-        len(scraper_items),
-        SCRAPER_COLS_PER_ROW,
+        0, len(scraper_items), SCRAPER_COLS_PER_ROW,
     ):
         row_items = scraper_items[
             row_start: row_start + SCRAPER_COLS_PER_ROW
@@ -281,7 +273,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
         for idx, item in enumerate(row_items):
             col = cols[idx]
-
             name = item.get("name", "알 수 없음")
             provider = item.get("provider", "알 수 없음")
             unit = item.get("unit", "")
@@ -319,7 +310,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                             f"{change:+.2f} "
                             f"({change_pct:+.2f}%)"
                         )
-
                     col.metric(
                         label=f"{name} :gray[[{provider}]]",
                         value=value_text,
@@ -343,7 +333,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                     f"단위: `{unit}`",
                     f"출처: `{provider}`",
                 ]
-
                 if previous_close is not None:
                     if unit == "%":
                         previous_text = (
@@ -353,33 +342,27 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                         previous_text = (
                             f"{previous_close:,.2f}"
                         )
-
                     caption_parts.insert(
                         1,
                         f"전일 종가: `{previous_text}`",
                     )
-
                 col.caption(" | ".join(caption_parts))
-
             else:
                 col.metric(
                     label=f"{name} :gray[[{provider}]]",
                     value="수집 실패",
                 )
-
                 error_text = item.get(
                     "error",
                     "페이지 구조 변경 또는 접속 지연",
                 )
-
                 col.caption(
                     "비공식 소스 오류: "
                     f"`{str(error_text)[:70]}`"
                 )
 
         for empty_idx in range(
-            len(row_items),
-            SCRAPER_COLS_PER_ROW,
+            len(row_items), SCRAPER_COLS_PER_ROW,
         ):
             cols[empty_idx].empty()
 
@@ -391,7 +374,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         expanded=False,
     ):
         scraper_rows = []
-
         for item in scraper_items:
             scraper_rows.append({
                 "지표": item.get("name"),
@@ -410,7 +392,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             })
 
         scraper_df = pd.DataFrame(scraper_rows)
-
         st.dataframe(
             scraper_df,
             use_container_width=True,
@@ -434,7 +415,9 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     st.divider()
 
+    # ==========================================================================
     # 2. 10Y-2Y 장단기 금리차
+    # ==========================================================================
     st.subheader("📊 10Y-2Y 장단기 금리차의 핵심 해석 모델")
     st.markdown("미국채 10년물(장기 금리)에서 2년물(단기 금리)을 뺀 값은 채권 시장에서 가장 주목하는 **경기 선행 지표**입니다.")
     st.code("스프레드(Spread) = 장기 금리(미래 경기 전망) - 단기 금리(현재 통화 정책)", language="text")
@@ -505,7 +488,9 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     st.divider()
 
+    # ==========================================================================
     # 3. 신용 리스크, 은행권 및 시장 변동성
+    # ==========================================================================
     st.subheader("⚡ 신용 리스크, 은행권 및 시장 변동성 (Credit & Liquidity Risk)")
     st.caption("주식·채권 가격 변동성, 기업 부도 위험(HY OAS), 글로벌 은행권 단기 자금경색(3M CP) 및 종합 금융스트레스(STLFSI4)를 모니터링합니다.")
 
@@ -635,7 +620,9 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     st.divider()
 
+    # ==========================================================================
     # 4. 개별 지표 상세 차트
+    # ==========================================================================
     st.subheader("지표별 기간별 단독 차트")
     ALL_TICKERS = {}
     for cat in MACRO_CATEGORIES.values():
@@ -657,7 +644,9 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     st.divider()
 
+    # ==========================================================================
     # 5. 다중 지표 오버레이 비교 차트
+    # ==========================================================================
     st.subheader("🔀 다중 지표 오버레이 비교 차트")
     st.caption("서로 다른 지표들을 한 차트 위에 겹쳐서 추세 및 상관관계를 비교합니다.")
 
