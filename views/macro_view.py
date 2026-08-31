@@ -192,83 +192,51 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     MAX_COLS_PER_ROW = 4
 
     for cat_name, items in collected_data.items():
-        st.markdown(f"#### {cat_name}")
+    st.markdown(f"#### {cat_name}")
 
-        for row_start in range(0, len(items), MAX_COLS_PER_ROW):
-            row_items = items[
-                row_start: row_start + MAX_COLS_PER_ROW
-            ]
-            cols = st.columns(MAX_COLS_PER_ROW)
+    for row_start in range(0, len(items), MAX_COLS_PER_ROW):
+        row_items = items[row_start: row_start + MAX_COLS_PER_ROW]
+        cols = st.columns(MAX_COLS_PER_ROW)
 
-            for idx, item in enumerate(row_items):
-                col = cols[idx]
-                display_name = inject_market_status(
-                    item["name"]
+        for idx, item in enumerate(row_items):
+            display_name = inject_market_status(item["name"])
+            col = cols[idx]
+
+            if item["status"] == "ok":
+                col.metric(
+                    label=display_name,
+                    value=item["price_str"],
+                    delta=item["delta_str"],
+                    help=f"직전 거래일 종가: {item['prev_str']}"
                 )
 
-                if item["status"] == "ok":
-                    col.metric(
-                        label=display_name,
-                        value=item["price_str"],
-                        delta=item["delta_str"],
-                        help=(
-                            "직전 거래일 종가: "
-                            f"{item['prev_str']}"
-                        ),
-                    )
+                extra_caption_parts = [f"전일 종가: `{item['prev_str']}`"]
+                if item.get("contract_month"):
+                    extra_caption_parts.append(f"월물: `{item['contract_month']}`")
+                if item.get("source"):
+                    extra_caption_parts.append(f"출처: `{item['source']}`")
 
-                    caption_parts = [
-                        f"전일 종가: `{item['prev_str']}`"
-                    ]
+                # ↓↓↓ 여기에 데이터 시각(last_ts) 항목을 추가 ↓↓↓
+                if item.get("last_ts"):
+                    extra_caption_parts.append(f"데이터 시각: `{item['last_ts']}`")
 
-                    # 야간선물/해외선물 스크래핑 데이터의 계약월 표시
-                    if item.get("contract_month"):
-                        caption_parts.append(
-                            f"월물: `{item['contract_month']}`"
-                        )
+                col.caption(" | ".join(extra_caption_parts))
 
-                    # 야간선물/해외선물 스크래핑 데이터의 출처 표시
-                    if item.get("source"):
-                        caption_parts.append(
-                            f"출처: `{item['source']}`"
-                        )
+            elif item["status"] == "single":
+                col.metric(label=display_name, value=item["price_str"])
+                col.caption("전일 데이터 없음")
+            else:
+                col.metric(label=display_name, value="로드 실패")
+                fail_caption_parts = []
+                if item.get("contract_month"):
+                    fail_caption_parts.append(f"월물: `{item['contract_month']}`")
+                if item.get("source"):
+                    fail_caption_parts.append(f"출처: `{item['source']}`")
+                if fail_caption_parts:
+                    col.caption(" | ".join(fail_caption_parts))
 
-                    col.caption(" | ".join(caption_parts))
-
-                elif item["status"] == "single":
-                    col.metric(
-                        label=display_name,
-                        value=item["price_str"],
-                    )
-                    col.caption("전일 데이터 없음")
-
-                else:
-                    col.metric(
-                        label=display_name,
-                        value="로드 실패",
-                    )
-
-                    fail_parts = []
-
-                    if item.get("contract_month"):
-                        fail_parts.append(
-                            f"월물: `{item['contract_month']}`"
-                        )
-
-                    if item.get("source"):
-                        fail_parts.append(
-                            f"출처: `{item['source']}`"
-                        )
-
-                    if fail_parts:
-                        col.caption(" | ".join(fail_parts))
-
-            # 마지막 행에서 남는 빈 카드 영역 제거
-            for empty_idx in range(
-                len(row_items),
-                MAX_COLS_PER_ROW,
-            ):
-                cols[empty_idx].empty()
+        for idx in range(len(row_items), MAX_COLS_PER_ROW):
+            cols[idx].empty()
 
     # ==========================================================================
     # 1-1. 비공식 웹 스크래핑 시세 비교 구역
