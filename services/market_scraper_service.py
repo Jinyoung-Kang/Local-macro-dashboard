@@ -66,21 +66,21 @@ SCRAPER_MARKETS = [
         "unit": "%",
     },
     {
-        "key": "wti",
-        "name": "WTI 원유",
-        "url": "https://www.tradingview.com/symbols/USOIL/",
-        "provider": "TradingView",
-        "kind": "tradingview_usoil",
-        "unit": "USD/bbl",
-    },
-    {
-        "key": "brent",
-        "name": "브렌트유",
-        "url": "https://www.tradingview.com/symbols/UKOIL/",
-        "provider": "TradingView",
-        "kind": "tradingview_ukoil",
-        "unit": "USD/bbl",
-    },
+      "key": "wti",
+      "name": "WTI 원유",
+      "url": "https://www.tradingview.com/symbols/USOIL/",
+      "provider": "TradingView",
+      "kind": "tradingview_usoil",
+      "unit": "USD/bbl",
+  },
+  {
+      "key": "brent",
+      "name": "브렌트유",
+      "url": "https://www.tradingview.com/symbols/UKOIL/",
+      "provider": "TradingView",
+      "kind": "tradingview_ukoil",
+      "unit": "USD/bbl",
+  },
     {
         "key": "gold_spot",
         "name": "금 현물",
@@ -281,33 +281,51 @@ def _parse_tradingview_oil(
     text: str,
 ) -> tuple[float | None, float | None]:
     """
-    TradingView USOIL/UKOIL 전용 파서입니다.
+    TradingView USOIL/UKOIL 전용 파서.
 
-    TradingView 응답 예:
-        Market open
-        85.35USD / BLLR
-        ...
-        Previous close
-        83.45 USD
+    TradingView 페이지 텍스트는 시점·지역·렌더링 상태에 따라
+    다음과 같이 조금씩 다른 형식으로 내려올 수 있습니다.
 
-    WTI/브렌트유 실제 가격 범위(20~250 USD/bbl)를 검증하여,
-    페이지 내 다른 숫자(예: 2,000)를 가격으로 오인하는 문제를 차단합니다.
+    - Market open\\n85.35USD / BLLR
+    - Market closed\\n88.28USD / BLLR
+    - 85.35RUSD / BLL
+    - 88.28RUSD / BLL
+    - Previous close\\n83.45 USD
+
+    R은 TradingView 텍스트 추출 과정에서 섞이는 렌더링 구분 문자입니다.
+    이 함수를 거치면 먼저 R 구분자를 정규화하고, 실제 원유 가격 범위
+    (20~250 USD/bbl)를 검증해 페이지 내부의 다른 숫자를 오인하지 않습니다.
+
+    반환:
+        (현재가, 전일 종가)
     """
-    current_patterns = [
-        r"Market\s+(?:open|closed)\s+"
-        r"([0-9][0-9,\.\s]*)\s*R?USD\s*/\s*BLLR?",
+    if not text:
+        return None, None
 
-        r"\n([0-9][0-9,\.\s]*)R?USD\s*/\s*BLL\s*\n",
+    # TradingView 텍스트의 렌더링 구분 문자(R)를 단위 주변에서 정규화.
+    # 숫자 자체의 R은 가격 표시에 쓰이는 구분 문자이므로 제거해도 무방합니다.
+    normalized = text.replace("RUSD", " USD")
+    normalized = normalized.replace("BLLR", "BLL")
+    normalized = normalized.replace("RHKD", " HKD")
+    normalized = normalized.replace("RJPY", " JPY")
+    normalized = normalized.replace("RPOINT", " POINT")
 
-        r"\b([0-9]{2,3}(?:\.\d+)?)R?USD\s*/\s*BLLR?\b",
+    # 1차: Market open/closed 뒤의 현재가를 가장 신뢰도 높게 추출.
+    market_patterns = [
+        r"Market\s+(?:open|closed)\s*"
+        r"([0-9][0-9,\.\s]*)\s*USD\s*/\s*BLL",
+
+        r"Market\s+(?:open|closed)\s*"
+        r"([0-9][0-9,\.\s]*)\s*USD",
     ]
 
     current = None
-    for pattern in current_patterns:
+
+    for pattern in market_patterns:
         match = re.search(
             pattern,
-            text,
-            flags=re.IGNORECASE | re.MULTILINE,
+            normalized,
+            flags=re.IGNORECASE | re.DOTALL,
         )
         if match:
             candidate = _to_float(match.group(1))
@@ -315,17 +333,55 @@ def _parse_tradingview_oil(
                 current = candidate
                 break
 
+    # 2차: 페이지 전체에서 '가격 + USD / BLL' 조합을 찾아
+    # 현실적 가격 범위를 통과한 첫 번째 값을 사용.
+    if current is None:
+        oil_candidates = re.findall(
+            r"([0-9][0-9,\.\s]*)\s*USD\s*/\s*BLL",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
+        for raw_value in oil_candidates:
+            candidate = _to_float(raw_value)
+            if _is_in_range(candidate, 20.0, 250.0):
+                current = candidate
+                break
+
+    # 3차: 일부 HTML 응답은 USD / BLL 앞 단위 사이에 공백/줄바꿈이 다르게
+    # 섞일 수 있으므로 더 느슨한 보조 패턴을 사용.
+    if current is None:
+        loose_candidates = re.findall(
+            r"([0-9]{2,3}(?:\.\d+)?)\s*USD",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
+        for raw_value in loose_candidates:
+            candidate = _to_float(raw_value)
+            if _is_in_range(candidate, 20.0, 250.0):
+                current = candidate
+                break
+
+    # 전일 종가 파싱.
     previous_patterns = [
-        r"Previous\s+close\s+([0-9][0-9,\.\s]*)\s*USD",
-        r"Previous\s+Close\s+([0-9][0-9,\.\s]*)\s*USD",
+        r"Previous\s+close\s*"
+        r"([0-9][0-9,\.\s]*)\s*USD",
+
+        r"Previous\s+Close\s*"
+        r"([0-9][0-9,\.\s]*)\s*USD",
+
+        r"전일\s*종가\s*"
+        r"([0-9][0-9,\.\s]*)\s*USD",
     ]
 
     previous = None
+
     for pattern in previous_patterns:
         match = re.search(
             pattern,
-            text,
-            flags=re.IGNORECASE,
+            normalized,
+            flags=re.IGNORECASE | re.DOTALL,
         )
         if match:
             candidate = _to_float(match.group(1))
