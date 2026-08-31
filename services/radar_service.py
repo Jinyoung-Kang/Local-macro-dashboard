@@ -4,16 +4,6 @@ services/radar_service.py
 [장중: KIS -> Daum -> Naver] [장마감 후/과거: Naver -> Daum -> PyKrx]
 공식 지원 투자주체(외국인/기관/투신/은행/보험/종금/기금/기타기관/기타법인) 매핑 탑재
 
-변경사항 (2026-08-25):
-- KRX 공식 OpenAPI(/sto/stk_bydd_trd)는 투자자별 순매수 컬럼을 제공하지
-  않아 파이프라인에서 완전히 제외했습니다 (재추가하지 않음).
-- KIS(FHPTJ04400000)는 장중 가집계 전용 TR이라 장 마감 후에는 호출 자체를
-  건너뛰도록 명확히 분리했습니다. 장 마감 후 호출은 정상적으로 빈 데이터를
-  반환하는 것이며 오류가 아닙니다.
-- 장 마감 후/과거 영업일 조회 시 Naver를 최우선 확정 데이터 소스로 승격하고,
-  Daum을 2차 소스로, PyKrx를 3차(최종) 소스로 재배치했습니다.
-- Naver/Daum 개별 소스의 정상 동작 여부를 진단할 수 있는
-  test_naver_scraping(), test_daum_scraping() 함수를 추가했습니다.
 """
 import logging
 import re
@@ -1047,10 +1037,31 @@ def get_market_radar_scanner(
                 return df
 
             df = fetch_naver_html_ranking(
-                search_date_str, market, investor, trade_type, top_n,
+                search_date_str,
+                market,
+                investor,
+                trade_type,
+                top_n,
             )
+            
             if df is not None and not df.empty:
+                logger.info(
+                    "수급 레이더 성공: source=Naver, date=%s, market=%s, investor=%s, trade_type=%s, rows=%s",
+                    search_date_str,
+                    market,
+                    investor,
+                    trade_type,
+                    len(df),
+                )
                 return df
+            
+            logger.warning(
+                "수급 레이더 Naver 실패 또는 빈 결과: date=%s, market=%s, investor=%s, trade_type=%s",
+                search_date_str,
+                market,
+                investor,
+                trade_type,
+            )
         else:
             logger.info(
                 "과거 날짜(%s) 조회: 날짜 미지원 소스(Naver/Daum) 건너뛰고 "
@@ -1059,11 +1070,32 @@ def get_market_radar_scanner(
             )
 
         if PYKRX_AVAILABLE:
-            df = fetch_pykrx_deal_ranking(
-                search_date_str, market, investor, trade_type, top_n,
-            )
-            if df is not None and not df.empty:
-                return df
+          df = fetch_pykrx_deal_ranking(
+              search_date_str,
+              market,
+              investor,
+              trade_type,
+              top_n,
+          )
+      
+          if df is not None and not df.empty:
+              logger.info(
+                  "수급 레이더 성공: source=PyKrx, date=%s, market=%s, investor=%s, trade_type=%s, rows=%s",
+                  search_date_str,
+                  market,
+                  investor,
+                  trade_type,
+                  len(df),
+              )
+              return df
+      
+          logger.warning(
+              "수급 레이더 PyKrx 실패 또는 빈 결과: date=%s, market=%s, investor=%s, trade_type=%s",
+              search_date_str,
+              market,
+              investor,
+              trade_type,
+          )
 
         current_date_obj -= timedelta(days=1)
 
