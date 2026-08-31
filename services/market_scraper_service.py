@@ -1,11 +1,12 @@
 """
 services/market_scraper_service.py
-Global Macro Dashboard 전용 비공식 스크래핑 시세 수집 서비스.
+Global Macro Dashboard 전용 외부 참고 시세 수집 서비스.
 
 주의:
-- TradingView 및 Investing.com의 공개 웹페이지를 파싱합니다.
-- 공식 API가 아니며, 웹페이지 구조·접근 정책 변경 시 수집이 실패할 수 있습니다.
-- 기존 공식/FRED/yfinance 데이터의 대체가 아니라 비교·참고용입니다.
+- TradingView 및 Yahoo Finance의 공개 데이터 응답을 수집합니다.
+- 공식 실시간 시세 API가 아니며, 외부 제공처의 페이지 구조·접근 정책·응답 형식이
+  변경되면 수집에 실패하거나 지연될 수 있습니다.
+- 이 데이터는 기존 FRED/yfinance/공식 데이터의 대체가 아니라 비교·참고용입니다.
 - 요청 부하를 줄이기 위해 Streamlit 캐시는 60초를 사용합니다.
 
 지원 데이터:
@@ -38,6 +39,7 @@ REQUEST_HEADERS = {
     ),
 }
 
+
 SCRAPER_MARKETS = [
     {
         "key": "us02y",
@@ -67,21 +69,17 @@ SCRAPER_MARKETS = [
         "key": "wti",
         "name": "WTI 원유",
         "url": "https://www.tradingview.com/symbols/USOIL/",
-        "provider": "Yahoo Finance",
-        "kind": "yahoo_chart",
-        "symbol": "CL=F",
+        "provider": "TradingView",
+        "kind": "tradingview_usoil",
         "unit": "USD/bbl",
-        "reference_source": "TradingView",
     },
     {
         "key": "brent",
         "name": "브렌트유",
         "url": "https://www.tradingview.com/symbols/UKOIL/",
-        "provider": "Yahoo Finance",
-        "kind": "yahoo_chart",
-        "symbol": "BZ=F",
+        "provider": "TradingView",
+        "kind": "tradingview_ukoil",
         "unit": "USD/bbl",
-        "reference_source": "TradingView",
     },
     {
         "key": "gold_spot",
@@ -110,27 +108,25 @@ SCRAPER_MARKETS = [
     {
         "key": "shanghai",
         "name": "상해종합",
-        "url": "https://www.investing.com/indices/shanghai-composite",
+        "url": "https://finance.yahoo.com/quote/000001.SS/",
         "provider": "Yahoo Finance",
         "kind": "yahoo_chart",
         "symbol": "000001.SS",
         "unit": "pt",
-        "reference_source": "Investing.com",
     },
     {
         "key": "hang_seng",
         "name": "항셍",
         "url": "https://www.tradingview.com/symbols/TVC-HSI/",
-        "provider": "Yahoo Finance",
-        "kind": "yahoo_chart",
-        "symbol": "^HSI",
+        "provider": "TradingView",
+        "kind": "tradingview_hsi",
         "unit": "pt",
-        "reference_source": "TradingView",
     },
 ]
 
 
-def _to_float(value) -> float | None:
+def _to_float(value: str | float | int | None) -> float | None:
+    """쉼표·공백·좁은 공백 등이 포함된 숫자 문자열을 float으로 변환합니다."""
     if value is None:
         return None
 
@@ -139,6 +135,7 @@ def _to_float(value) -> float | None:
             str(value)
             .replace(",", "")
             .replace("\u202f", "")
+            .replace("\xa0", "")
             .replace(" ", "")
             .strip()
         )
@@ -147,7 +144,17 @@ def _to_float(value) -> float | None:
         return None
 
 
+def _is_in_range(
+    value: float | None,
+    lower: float,
+    upper: float,
+) -> bool:
+    """오매칭 숫자를 제거하기 위한 현실적 가격 범위 검증입니다."""
+    return value is not None and lower <= value <= upper
+
+
 def _fetch_html(url: str) -> str:
+    """TradingView 공개 페이지 HTML을 수집합니다."""
     response = requests.get(
         url,
         headers=REQUEST_HEADERS,
@@ -161,10 +168,10 @@ def _fetch_yahoo_chart(
     symbol: str,
 ) -> tuple[float | None, float | None]:
     """
-    Yahoo Finance chart endpoint에서 최근 종가와 전일 종가를 읽습니다.
+    Yahoo Finance chart JSON에서 최근 종가와 직전 거래일 종가를 읽습니다.
 
-    반환값:
-      (최근 종가, 직전 거래일 종가)
+    반환:
+        (최근 종가, 직전 거래일 종가)
     """
     url = (
         "https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -179,9 +186,20 @@ def _fetch_yahoo_chart(
     response.raise_for_status()
 
     payload = response.json()
-    result = payload["chart"]["result"][0]
-    closes = result["indicators"]["quote"][0]["close"]
+    chart = payload.get("chart", {})
+    results = chart.get("result", [])
 
+    if not results:
+        return None, None
+
+    result = results[0]
+    indicators = result.get("indicators", {})
+    quote_rows = indicators.get("quote", [])
+
+    if not quote_rows:
+        return None, None
+
+    closes = quote_rows[0].get("close", [])
     valid_closes = [
         float(close)
         for close in closes
@@ -192,24 +210,20 @@ def _fetch_yahoo_chart(
         return None, None
 
     current = valid_closes[-1]
-    previous = (
-        valid_closes[-2]
-        if len(valid_closes) >= 2
-        else None
-    )
+    previous = valid_closes[-2] if len(valid_closes) >= 2 else None
 
     return current, previous
 
 
 def _extract_previous_close(text: str) -> float | None:
     """
-    TradingView의 Previous close 값 추출.
+    TradingView의 Previous close 값을 추출합니다.
     페이지 언어·레이아웃 차이를 고려해 여러 패턴을 시도합니다.
     """
     patterns = [
-        r"Previous\s+close\s*[\n\r\s]*([\d,]+(?:\.\d+)?)",
-        r"Previous\s+Close\s*[\n\r\s]*([\d,]+(?:\.\d+)?)",
-        r"전일\s*종가\s*[\n\r\s]*([\d,]+(?:\.\d+)?)",
+        r"Previous\s+close\s*[\\n\\r\\s]*([\\d,]+(?:\\.\\d+)?)",
+        r"Previous\s+Close\s*[\\n\\r\\s]*([\\d,]+(?:\\.\\d+)?)",
+        r"전일\s*종가\s*[\\n\\r\\s]*([\\d,]+(?:\\.\\d+)?)",
     ]
 
     for pattern in patterns:
@@ -226,60 +240,13 @@ def _extract_previous_close(text: str) -> float | None:
     return None
 
 
-def _extract_tradingview_current_price(
-    text: str,
-    kind: str,
-) -> float | None:
-    """
-    TradingView의 실제 공개 텍스트 형식을 처리합니다.
-
-    실제 확인 형식:
-    - 미국채: 4.736R%
-    - WTI: 85.06RUSD / BLL
-    - 금 현물: 4,602.990RUSD
-    - 코스피: 6,912.95RPOINT
-    - 닛케이: 66,016.14RJPY
-    """
-    if kind == "tradingview_yield":
-        patterns = [
-            # Market closed\n4.736R%
-            r"Market\s+(?:open|closed)\s*[\n\r\s]+([\d,]+(?:\.\d+)?)R?%",
-            # 4.736R%
-            r"([\d,]+(?:\.\d+)?)R%",
-            # 보조: 텍스트 기반 yield 값
-            r"(?:yield|Yield).*?([\d,]+(?:\.\d+)?)%",
-        ]
-    else:
-        patterns = [
-            # Market open\n85.06RUSD / BLL
-            r"Market\s+(?:open|closed)\s*[\n\r\s]+([\d,]+(?:\.\d+)?)R?(?:USD|JPY|POINT|CNY)",
-            # 85.06RUSD / BLL
-            r"([\d,]+(?:\.\d+)?)R(?:USD|JPY|POINT|CNY)",
-            # 85.06 USD / BLL
-            r"([\d,]+(?:\.\d+)?)\s*(?:USD|JPY|POINT|CNY)\s*/?",
-        ]
-
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-        if match:
-            value = _to_float(match.group(1))
-            if value is not None:
-                return value
-
-    return None
-
-
 def _extract_tradingview_change(
     text: str,
 ) -> tuple[float | None, float | None]:
     """
     TradingView 가격/변동 텍스트에서 절대 변화와 변화율을 추출합니다.
 
-    예시:
+    예:
     - −0.096 −1.82%
     - +1.35 +1.55%
     - −200.43 −0.30%
@@ -310,13 +277,182 @@ def _extract_tradingview_change(
     return change, change_pct
 
 
+def _parse_tradingview_oil(
+    text: str,
+) -> tuple[float | None, float | None]:
+    """
+    TradingView USOIL/UKOIL 전용 파서입니다.
+
+    TradingView 응답 예:
+        Market open
+        85.35USD / BLLR
+        ...
+        Previous close
+        83.45 USD
+
+    WTI/브렌트유 실제 가격 범위(20~250 USD/bbl)를 검증하여,
+    페이지 내 다른 숫자(예: 2,000)를 가격으로 오인하는 문제를 차단합니다.
+    """
+    current_patterns = [
+        r"Market\s+(?:open|closed)\s+"
+        r"([0-9][0-9,\.\s]*)\s*R?USD\s*/\s*BLLR?",
+
+        r"\n([0-9][0-9,\.\s]*)R?USD\s*/\s*BLL\s*\n",
+
+        r"\b([0-9]{2,3}(?:\.\d+)?)R?USD\s*/\s*BLLR?\b",
+    ]
+
+    current = None
+    for pattern in current_patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if match:
+            candidate = _to_float(match.group(1))
+            if _is_in_range(candidate, 20.0, 250.0):
+                current = candidate
+                break
+
+    previous_patterns = [
+        r"Previous\s+close\s+([0-9][0-9,\.\s]*)\s*USD",
+        r"Previous\s+Close\s+([0-9][0-9,\.\s]*)\s*USD",
+    ]
+
+    previous = None
+    for pattern in previous_patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            candidate = _to_float(match.group(1))
+            if _is_in_range(candidate, 20.0, 250.0):
+                previous = candidate
+                break
+
+    return current, previous
+
+
+def _parse_tradingview_hsi(
+    text: str,
+) -> tuple[float | None, float | None]:
+    """
+    TradingView HSI 전용 파서입니다.
+
+    HSI 페이지는 메인 시세 블록에 'No trades'가 나올 수 있어,
+    TradingView FAQ/설명 문장에 포함되는 아래 형태를 보조적으로 사용합니다.
+
+        The current value of Hang Seng Index is 25,884.44 HKD
+
+    항셍 지수의 합리적 범위(10,000~50,000pt)를 적용하여,
+    문서 속 다른 숫자를 현재가로 오인하지 않도록 합니다.
+
+    TradingView HSI 페이지에는 전일 종가가 항상 노출되지 않으므로,
+    전일 종가를 읽지 못하면 None으로 유지합니다.
+    """
+    current_patterns = [
+        r"current\s+value\s+of\s+Hang\s+Seng\s+Index\s+is\s+"
+        r"([0-9][0-9,\.\s]*)\s*HKD",
+
+        r"Hang\s+Seng\s+Index\s+is\s+"
+        r"([0-9][0-9,\.\s]*)\s*HKD",
+
+        r"Market\s+(?:open|closed)\s+"
+        r"([0-9][0-9,\.\s]*)\s*R?HKD",
+    ]
+
+    current = None
+    for pattern in current_patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            candidate = _to_float(match.group(1))
+            if _is_in_range(candidate, 10_000.0, 50_000.0):
+                current = candidate
+                break
+
+    previous_patterns = [
+        r"Previous\s+close\s+([0-9][0-9,\.\s]*)\s*HKD",
+        r"Previous\s+Close\s+([0-9][0-9,\.\s]*)\s*HKD",
+    ]
+
+    previous = None
+    for pattern in previous_patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            candidate = _to_float(match.group(1))
+            if _is_in_range(candidate, 10_000.0, 50_000.0):
+                previous = candidate
+                break
+
+    return current, previous
+
+
+def _extract_tradingview_current_price(
+    text: str,
+    kind: str,
+) -> float | None:
+    """
+    일반 TradingView 공개 텍스트 형식에서 현재가를 추출합니다.
+
+    예:
+    - 미국채: 4.736R%
+    - 금 현물: 4,602.990RUSD
+    - 코스피: 6,912.95RPOINT
+    - 닛케이: 66,016.14RJPY
+    """
+    if kind == "tradingview_yield":
+        patterns = [
+            r"Market\s+(?:open|closed)\s*[\n\r\s]+"
+            r"([\d,]+(?:\.\d+)?)R?%",
+
+            r"([\d,]+(?:\.\d+)?)R%",
+
+            r"(?:yield|Yield).*?([\d,]+(?:\.\d+)?)%",
+        ]
+    else:
+        patterns = [
+            r"Market\s+(?:open|closed)\s*[\n\r\s]+"
+            r"([\d,]+(?:\.\d+)?)R?(?:USD|JPY|POINT|CNY)",
+
+            r"([\d,]+(?:\.\d+)?)R(?:USD|JPY|POINT|CNY)",
+
+            r"([\d,]+(?:\.\d+)?)\s*(?:USD|JPY|POINT|CNY)\s*/?",
+        ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if match:
+            value = _to_float(match.group(1))
+            if value is not None:
+                return value
+
+    return None
+
+
 def _parse_tradingview(
     text: str,
     kind: str,
 ) -> tuple[float | None, float | None, float | None, float | None]:
     """
+    일반 TradingView 페이지 파서.
+
     반환:
-      current_price, previous_close, change, change_pct
+        (현재가, 전일 종가, 절대 등락폭, 등락률)
     """
     current = _extract_tradingview_current_price(
         text,
@@ -363,102 +499,73 @@ def _parse_investing(
     """
     Investing.com 공개 페이지에서 현재가, 전일 종가,
     등락폭 및 등락률을 추출합니다.
-
-    지원 형식:
-    - 영문:
-      Shanghai Composite live stock price is 3,897.31.
-      Currency in CNY
-      3,897.31
-      -7.90(-0.20%)
-      Prev. Close
-      3,905.2
-
-    - 한국어:
-      상해종합의 실시간 지수를 확인해 보세요. 3,905.20에 마감된 ...
-      전일 종가
-      3,903.72
     """
     current_patterns = [
-        # 영문 Investing.com FAQ 문구
-        r"(?:live\s+(?:stock\s+)?price\s+is)\s*([\d,]+(?:\.\d+)?)",
+        r"(?:live\s+(?:stock\s+)?price\s+is)\s*"
+        r"([\d,]+(?:\.\d+)?)",
 
-        # 영문 페이지의 Currency in CNY 다음 현재가
-        r"Currency\s+in\s+[A-Z]{3}\s*[\n\r\s]+([\d,]+(?:\.\d+)?)",
+        r"Currency\s+in\s+[A-Z]{3}\s*[\n\r\s]+"
+        r"([\d,]+(?:\.\d+)?)",
 
-        # 한국어 Investing.com 문구
-        r"실시간\s*(?:지수|주가).*?([\d,]+(?:\.\d+)?)에\s*(?:마감|거래|닫음)",
+        r"실시간\s*(?:지수|주가).*?"
+        r"([\d,]+(?:\.\d+)?)에\s*(?:마감|거래|닫음)",
 
-        # 한국어 통화 다음 현재가
-        r"통화\s+\w+\s*[\n\r\s]+([\d,]+(?:\.\d+)?)",
+        r"통화\s+\w+\s*[\n\r\s]+"
+        r"([\d,]+(?:\.\d+)?)",
 
-        # 현재값 바로 다음에 변동값이 표시되는 일반 패턴
-        r"\n([\d,]+(?:\.\d+)?)\s*\n[+\-−]\s*[\d,]+(?:\.\d+)?\s*\(",
+        r"\n([\d,]+(?:\.\d+)?)\s*\n"
+        r"[+\-−]\s*[\d,]+(?:\.\d+)?\s*\(",
     ]
 
     current = None
-
     for pattern in current_patterns:
         match = re.search(
             pattern,
             text,
             flags=re.IGNORECASE | re.DOTALL,
         )
-
         if match:
             current = _to_float(match.group(1))
-
             if current is not None:
                 break
 
     previous_patterns = [
-        # 영문 Investing.com
-        r"Prev\.?\s*Close\s*[\n\r\s\-\*]*([\d,]+(?:\.\d+)?)",
+        r"Prev\.?\s*Close\s*[\n\r\s\-\*]*"
+        r"([\d,]+(?:\.\d+)?)",
 
-        # 영문 전체 표기
-        r"Previous\s+Close\s*[\n\r\s\-\*]*([\d,]+(?:\.\d+)?)",
+        r"Previous\s+Close\s*[\n\r\s\-\*]*"
+        r"([\d,]+(?:\.\d+)?)",
 
-        # 한국어 Investing.com
-        r"전일\s*종가\s*[\n\r\s\-\*]*([\d,]+(?:\.\d+)?)",
+        r"전일\s*종가\s*[\n\r\s\-\*]*"
+        r"([\d,]+(?:\.\d+)?)",
     ]
 
     previous = None
-
     for pattern in previous_patterns:
         match = re.search(
             pattern,
             text,
             flags=re.IGNORECASE,
         )
-
         if match:
             previous = _to_float(match.group(1))
-
             if previous is not None:
                 break
 
-    change_patterns = [
-        # -7.90(-0.20%)
+    change_pattern = (
         r"([+\-−])\s*([\d,]+(?:\.\d+)?)\s*"
-        r"\(\s*([+\-−])?\s*([\d,]+(?:\.\d+)?)%\s*\)",
-
-        # +1.48(+0.04%)
-        r"([+\-−])\s*([\d,]+(?:\.\d+)?)\s*"
-        r"\(\s*([+\-−])?\s*([\d,]+(?:\.\d+)?)%\s*\)",
-    ]
+        r"\(\s*([+\-−])?\s*([\d,]+(?:\.\d+)?)%\s*\)"
+    )
 
     change = None
     change_pct = None
 
-    for pattern in change_patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.MULTILINE,
-        )
-
-        if not match:
-            continue
-
+    match = re.search(
+        change_pattern,
+        text,
+        flags=re.MULTILINE,
+    )
+    if match:
         change = _to_float(match.group(2))
         change_pct = _to_float(match.group(4))
 
@@ -473,8 +580,6 @@ def _parse_investing(
             and match.group(3) in ["-", "−"]
         ):
             change_pct = -change_pct
-
-        break
 
     # 전일 종가를 직접 읽지 못했지만 변화율은 있을 경우 역산
     if (
@@ -509,6 +614,7 @@ def _parse_investing(
 
 
 def _collect_one_market(config: dict) -> dict:
+    """시장 하나를 수집하고 표준 결과 딕셔너리로 반환합니다."""
     result = {
         "key": config["key"],
         "name": config["name"],
@@ -530,14 +636,12 @@ def _collect_one_market(config: dict) -> dict:
             price, previous_close = _fetch_yahoo_chart(
                 config["symbol"]
             )
-
             change = (
                 price - previous_close
                 if price is not None
                 and previous_close is not None
                 else None
             )
-
             change_pct = (
                 (change / previous_close) * 100
                 if change is not None
@@ -548,7 +652,41 @@ def _collect_one_market(config: dict) -> dict:
         else:
             html = _fetch_html(config["url"])
 
-            if kind.startswith("tradingview"):
+            if kind in {"tradingview_usoil", "tradingview_ukoil"}:
+                price, previous_close = _parse_tradingview_oil(
+                    html
+                )
+                change = (
+                    price - previous_close
+                    if price is not None
+                    and previous_close is not None
+                    else None
+                )
+                change_pct = (
+                    (change / previous_close) * 100
+                    if change is not None
+                    and previous_close not in (None, 0)
+                    else None
+                )
+
+            elif kind == "tradingview_hsi":
+                price, previous_close = _parse_tradingview_hsi(
+                    html
+                )
+                change = (
+                    price - previous_close
+                    if price is not None
+                    and previous_close is not None
+                    else None
+                )
+                change_pct = (
+                    (change / previous_close) * 100
+                    if change is not None
+                    and previous_close not in (None, 0)
+                    else None
+                )
+
+            elif kind.startswith("tradingview"):
                 (
                     price,
                     previous_close,
@@ -587,17 +725,15 @@ def _collect_one_market(config: dict) -> dict:
             "change": change,
             "change_pct": change_pct,
         })
-
         return result
 
     except Exception as e:
         logger.warning(
-            "비공식 시세 수집 실패 (%s / %s): %s",
+            "외부 참고 시세 수집 실패 (%s / %s): %s",
             config["name"],
             config["provider"],
             e,
         )
-
         result["error"] = str(e)
         return result
 
@@ -605,7 +741,7 @@ def _collect_one_market(config: dict) -> dict:
 @st.cache_data(ttl=60, show_spinner=False)
 def get_scraped_macro_markets() -> dict:
     """
-    비공식 스크래핑 시세를 병렬 수집합니다.
+    외부 참고 시세를 병렬 수집합니다.
 
     반환:
     {
