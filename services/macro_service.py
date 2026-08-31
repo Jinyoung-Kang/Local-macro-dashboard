@@ -244,13 +244,18 @@ def get_collected_macro_data():
                 if "JPY/KRW" in name and curr < 50:
                     curr, prev, delta = curr * 100, prev * 100, delta * 100
         
-                # [수정] last_ts_str을 실제로 계산하는 코드 추가
+                # [수정] 원본 타임존을 명시적으로 KST(Asia/Seoul)로 변환
                 last_timestamp = df.index[-1]
-                last_ts_str = (
-                    last_timestamp.strftime("%H:%M:%S")
-                    if hasattr(last_timestamp, "strftime")
-                    else "N/A"
-                )
+                try:
+                    if hasattr(last_timestamp, "tzinfo") and last_timestamp.tzinfo is not None:
+                        last_ts_kst = last_timestamp.astimezone(ZoneInfo("Asia/Seoul"))
+                    elif hasattr(last_timestamp, "tz_localize"):
+                        last_ts_kst = last_timestamp.tz_localize("UTC").astimezone(ZoneInfo("Asia/Seoul"))
+                    else:
+                        last_ts_kst = None
+                    last_ts_str = last_ts_kst.strftime("%H:%M:%S KST") if last_ts_kst is not None else "N/A"
+                except Exception:
+                    last_ts_str = "N/A"
         
                 collected[cat_name].append({
                     "name": name,
@@ -267,16 +272,21 @@ def get_collected_macro_data():
                     rate_10y_curr, rate_10y_prev = curr, prev
                 elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
                     rate_2y_curr, rate_2y_prev = curr, prev
+        
             elif df is not None and isinstance(df, pd.DataFrame) and len(df) == 1:
                 curr = float(df['Close'].iloc[-1])
         
-                # [수정] len(df)==1인 경로에도 동일하게 추가 (없으면 이 분기에서도 같은 오류 발생)
                 last_timestamp = df.index[-1]
-                last_ts_str = (
-                    last_timestamp.strftime("%H:%M:%S")
-                    if hasattr(last_timestamp, "strftime")
-                    else "N/A"
-                )
+                try:
+                    if hasattr(last_timestamp, "tzinfo") and last_timestamp.tzinfo is not None:
+                        last_ts_kst = last_timestamp.astimezone(ZoneInfo("Asia/Seoul"))
+                    elif hasattr(last_timestamp, "tz_localize"):
+                        last_ts_kst = last_timestamp.tz_localize("UTC").astimezone(ZoneInfo("Asia/Seoul"))
+                    else:
+                        last_ts_kst = None
+                    last_ts_str = last_ts_kst.strftime("%H:%M:%S KST") if last_ts_kst is not None else "N/A"
+                except Exception:
+                    last_ts_str = "N/A"
         
                 collected[cat_name].append({
                     "name": name,
