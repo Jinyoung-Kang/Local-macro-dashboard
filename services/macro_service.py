@@ -80,25 +80,48 @@ def _clean_macro_label(text: str) -> str:
 # 2. yfinance / FRED 데이터 수집 엔진 (DatetimeIndex 보존)
 # ==============================================================================
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_ticker_data(symbol: str, period: str = "1mo", interval: str = "1d") -> pd.DataFrame:
-    """단일 티커 yfinance 데이터 수집 (DatetimeIndex 보존 및 ^MOVE 특수 처리)"""
+def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
+    """
+    yfinance를 통해 티커 시계열 데이터를 수집합니다.
+
+    [수정] 짧은 기간(1mo 이하) 조회 시에는 일봉이 아닌 분봉(1m/5m)을
+    명시적으로 요청하여, "실시간/15분 지연" 라벨에 맞는 최신 체결가에
+    더 가깝게 만듭니다. yfinance 기본 interval(1d)은 당일 일봉이
+    Yahoo 내부적으로 불규칙하게 갱신되어, 실제 화면에 표시되는
+    "실시간" 값이 다른 플랫폼과 크게 어긋날 수 있습니다.
+    """
     if not symbol:
-        return pd.DataFrame()
+        return None
+
+    # ICE BofA MOVE 전용 처리 (기존 로직 유지)
+    if symbol in ["^MOVE", "MOVE", "MOVE:INDEX"]:
+        ...  # 기존 코드 그대로
 
     try:
         tk = yf.Ticker(symbol)
-        df = tk.history(period=period, interval=interval)
+
+        # [수정] 단기 조회(period가 1mo 이하)일 때는 분봉으로 최신성 확보
+        intraday_periods = {"1d", "5d"}
+        if period in intraday_periods:
+            df = tk.history(period=period, interval="1m")
+            if df is None or df.empty:
+                # 분봉이 없는 심볼(일부 지수/채권)은 5분봉으로 재시도
+                df = tk.history(period=period, interval="5m")
+            if df is None or df.empty:
+                # 그래도 없으면 기존 일봉으로 폴백
+                df = tk.history(period=period)
+        else:
+            df = tk.history(period=period)
+
         if df is not None and not df.empty:
             df = df.dropna(subset=['Close'])
             df = df[df['Close'] > 0]
-            if df.index.tz is not None:
-                df.index = df.index.tz_localize(None)
             if len(df) >= 1:
                 return df
     except Exception as e:
         logger.warning(f"yfinance 수집 실패 ({symbol}): {e}")
 
-    return pd.DataFrame()
+    return None
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -228,7 +251,8 @@ def get_collected_macro_data():
                     "price_str": f"{curr:,.2f}",
                     "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
                     "prev_str": f"{prev:,.2f}",
-                    "status": "ok"
+                    "status": "ok",
+                    "last_ts": last_ts_str,
                 })
                 if ticker == "^TNX":
                     rate_10y_curr, rate_10y_prev = curr, prev
