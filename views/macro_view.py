@@ -34,15 +34,15 @@ from services.market_scraper_service import (
     get_scraped_macro_markets,
 )
 
-# [수정] 미국채 카테고리 항목명 → 비공식 스크래핑 키 매핑
+# 미국채 카드 항목명 → TradingView 스크래핑 키 매핑
 BOND_SCRAPER_KEY_MAP = {
-    "미국채 2년물 금리(%) :gray[[15분 지연]]": "us02y",
-    "미국채 10년물 금리(%) :gray[[15분 지연]]": "us10y",
-    "미국채 30년물 금리(%) :gray[[15분 지연]]": "us30y",
+    "미국채 2년물 수익률(%) :gray[[TradingView 참고]]": "us02y",
+    "미국채 10년물 수익률(%) :gray[[TradingView 참고]]": "us10y",
+    "미국채 30년물 수익률(%) :gray[[TradingView 참고]]": "us30y",
 }
 
-# [수정] "미국 국채 금리" 카테고리의 정확한 키 문자열 (config.py MACRO_CATEGORIES와 일치)
-BOND_CATEGORY_NAME = "🏛️ 미국 국채 금리 :gray[(15분 지연)]"
+# config.py의 MACRO_CATEGORIES 키와 반드시 완전히 일치해야 합니다.
+BOND_CATEGORY_NAME = "🏛️ 미국 국채 수익률 :gray[(TradingView 참고 시세)]"
 
 
 @st.cache_data(ttl=60)
@@ -115,38 +115,57 @@ def inject_market_status(name: str) -> str:
         return f"{name} :gray[({status})]"
 
 
-def _override_with_scraper_bond(item: dict, scraper_items_for_bonds: dict) -> dict:
+def _override_with_scraper_bond(
+    item: dict,
+    scraper_items_for_bonds: dict,
+) -> dict:
     """
-    미국채 금리 항목을 TradingView 비공식 스크래핑 값으로 대체합니다.
-    yfinance(^TNX 등)는 분봉을 제공하지 않아 데이터 시각이 일봉 수준으로
-    지연되므로, 실시간성이 더 나은 스크래핑 값으로 교체합니다.
-    스크래핑이 실패한 경우 기존 yfinance 값을 그대로 유지합니다(안전한 폴백).
+    상단 미국채 카드에 TradingView 참고 시세를 적용합니다.
+
+    TradingView 수집이 실패하면 기존 yfinance 값을 그대로 유지합니다.
+    이 함수는 카드 표기용 데이터만 교체하며, 공식 장단기 금리차 계산에는
+    FRED DGS2/DGS10을 별도로 사용합니다.
     """
     scraper_key = BOND_SCRAPER_KEY_MAP.get(item.get("name"))
     if not scraper_key:
         return item
 
     scraped = scraper_items_for_bonds.get(scraper_key)
-    if not scraped or scraped.get("status") != "ok" or scraped.get("price") is None:
+    if not scraped or scraped.get("status") != "ok":
         return item
 
-    price = scraped["price"]
-    prev = scraped.get("previous_close")
+    price = scraped.get("price")
+    previous_close = scraped.get("previous_close")
+
+    if price is None:
+        return item
+
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
-
     new_item = dict(item)
-    new_item["price"] = price
-    new_item["price_str"] = f"{price:,.2f}"
-    new_item["status"] = "ok"
-    new_item["last_ts"] = now_kst.strftime("%H:%M:%S KST") + " (TradingView 비공식)"
 
-    if prev is not None and prev != 0:
-        delta = price - prev
-        pct = (delta / prev) * 100
+    new_item["price"] = float(price)
+    new_item["price_str"] = f"{float(price):,.3f}"
+    new_item["status"] = "ok"
+    new_item["source"] = "TradingView 비공식 참고"
+    new_item["last_ts"] = (
+        now_kst.strftime("%H:%M:%S KST")
+        + " (TradingView 참고)"
+    )
+
+    if previous_close is not None and float(previous_close) != 0:
+        previous_close = float(previous_close)
+        delta = float(price) - previous_close
+        pct = (delta / previous_close) * 100.0
+
         new_item["delta"] = delta
         new_item["pct"] = pct
-        new_item["delta_str"] = f"{delta:+.2f} ({pct:+.2f}%)"
-        new_item["prev_str"] = f"{prev:,.2f}"
+        new_item["prev_str"] = f"{previous_close:,.3f}"
+        new_item["delta_str"] = f"{delta:+.3f} ({pct:+.2f}%)"
+    else:
+        # TradingView 페이지에서 Previous close를 읽지 못할 수 있으므로,
+        # 기존 yfinance 전일값과 섞지 않고 변화율도 표시하지 않습니다.
+        new_item["prev_str"] = "TradingView 전일값 미제공"
+        new_item["delta_str"] = "전일비 미제공"
 
     return new_item
 
@@ -163,6 +182,12 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     hy_df = fetch_fred_series("BAMLH0A0HYM2", period_years=3)
     stlfsi_df = fetch_fred_series("STLFSI4", period_years=3)
     cp_spread_df = fetch_fred_cp_spread()
+    
+    # 공식 일별 장단기 금리차 계산용.
+    # DGS2/DGS10은 FRED가 제공하는 미 재무부 Constant Maturity Treasury
+    # 일별 수익률이며, TradingView 참고 시세와 의도적으로 분리합니다.
+    dgs2_df = fetch_fred_series("DGS2", period_years=10)
+    dgs10_df = fetch_fred_series("DGS10", period_years=10)
 
     risk_data = {
         "VIX": vix_hist,
@@ -482,75 +507,185 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     st.divider()
 
     # ==========================================================================
-    # 2. 10Y-2Y 장단기 금리차
+    # 2. 공식 일별 10Y-2Y 장단기 금리차
     # ==========================================================================
-    st.subheader("📊 10Y-2Y 장단기 금리차의 핵심 해석 모델")
-    st.markdown("미국채 10년물(장기 금리)에서 2년물(단기 금리)을 뺀 값은 채권 시장에서 가장 주목하는 **경기 선행 지표**입니다.")
-    st.code("스프레드(Spread) = 장기 금리(미래 경기 전망) - 단기 금리(현재 통화 정책)", language="text")
+    st.subheader("📊 공식 일별 10Y−2Y 장단기 금리차 해석")
+    st.caption(
+        "기준: FRED/미 재무부의 최신 영업일 마감 수익률(DGS10 − DGS2)입니다. "
+        "상단의 TradingView 참고 시세와는 데이터 제공처·갱신 시각·산출 기준이 다를 수 있습니다."
+    )
 
-    if rate_10y_curr is not None and rate_2y_curr is not None:
-        curr_spread = rate_10y_curr - rate_2y_curr
-        prev_spread = rate_10y_prev - rate_2y_prev
+    st.code(
+        "공식 10Y−2Y 스프레드 = FRED DGS10(10년물) − FRED DGS2(2년물)",
+        language="text",
+    )
+
+    official_spread_df = pd.DataFrame()
+
+    if (
+        dgs2_df is not None
+        and dgs10_df is not None
+        and not dgs2_df.empty
+        and not dgs10_df.empty
+        and "DGS2" in dgs2_df.columns
+        and "DGS10" in dgs10_df.columns
+    ):
+        official_spread_df = pd.concat(
+            [
+                dgs10_df["DGS10"].rename("DGS10"),
+                dgs2_df["DGS2"].rename("DGS2"),
+            ],
+            axis=1,
+        ).sort_index()
+
+        # FRED 휴장일/발표일 차이를 정리합니다.
+        official_spread_df = (
+            official_spread_df
+            .ffill()
+            .dropna()
+        )
+        official_spread_df["Spread"] = (
+            official_spread_df["DGS10"]
+            - official_spread_df["DGS2"]
+        )
+
+    if len(official_spread_df) >= 2:
+        latest_official = official_spread_df.iloc[-1]
+        previous_official = official_spread_df.iloc[-2]
+
+        official_date = official_spread_df.index[-1]
+        official_date_str = (
+            official_date.strftime("%Y-%m-%d")
+            if hasattr(official_date, "strftime")
+            else str(official_date)[:10]
+        )
+
+        curr_spread = float(latest_official["Spread"])
+        prev_spread = float(previous_official["Spread"])
         spread_delta = curr_spread - prev_spread
+
+        rate_10y_official = float(latest_official["DGS10"])
+        rate_2y_official = float(latest_official["DGS2"])
 
         if curr_spread < 0:
             status_title = "🚨 역전 (Inversion)"
             status_color = "red"
-            status_desc = "현재 인플레이션을 잡기 위해 금리를 급격히 올렸으나, 미래 경기는 침체될 것으로 시장이 확신하고 있습니다. **(역사적으로 1~2년 내 경기 침체 Recession 도래)**"
-        elif 0 <= curr_spread <= 0.2:
+            status_desc = (
+                "2년물 수익률이 10년물보다 높은 역전 상태입니다. "
+                "긴축적 통화정책과 향후 성장 둔화 기대가 동시에 반영될 수 있습니다. "
+                "다만 역전만으로 경기침체 시점이나 자산 가격 방향을 단정할 수는 없습니다."
+            )
+        elif curr_spread <= 0.20:
             status_title = "⚠️ 평탄화 (Flattening)"
             status_color = "orange"
-            status_desc = "미래 경기 성장이 둔화될 것이라는 우려가 커지기 시작했습니다. **(경기 정점 통과 및 둔화 신호)**"
+            status_desc = (
+                "장기와 단기 수익률 차이가 매우 좁은 상태입니다. "
+                "시장 참가자들이 향후 정책금리 인하 또는 성장 둔화를 기대하는지, "
+                "기간프리미엄 변화가 있는지를 함께 점검해야 합니다."
+            )
         else:
-            status_title = "✅ 정상 (Normal)"
+            status_title = "✅ 정상 범위 (Positive Slope)"
             status_color = "green"
-            status_desc = "장기 미래의 불확실성(프리미엄)으로 인해 장기 금리가 더 높은 정상 상태입니다. **(경제의 점진적인 성장 및 확장)**"
+            status_desc = (
+                "10년물 수익률이 2년물보다 높은 우상향 커브입니다. "
+                "단, 스프레드 수준만으로 경기 강도나 주식시장 방향을 판단하지 말고 "
+                "신용스프레드·실질금리·유동성 지표와 함께 해석해야 합니다."
+            )
 
         sc1, sc2 = st.columns([1, 2])
+
         with sc1:
             st.metric(
-                label="현재 10Y - 2Y 스프레드 :gray[[15분 지연]]",
+                label="공식 일별 10Y−2Y 스프레드",
                 value=f"{curr_spread:+.2f} %p",
-                delta=f"{spread_delta:+.2f} %p (전일비)"
+                delta=f"{spread_delta:+.2f} %p (직전 발표일 대비)",
             )
-            st.caption(f"10Y: `{rate_10y_curr:.2f}%` | 2Y: `{rate_2y_curr:.2f}%` (전일: `{prev_spread:+.2f}%p`)")
+            st.caption(
+                f"기준일: `{official_date_str}` | "
+                f"10Y: `{rate_10y_official:.2f}%` | "
+                f"2Y: `{rate_2y_official:.2f}%`"
+            )
+
         with sc2:
-            st.markdown(f"**현재 시장 진단:** :{status_color}[{status_title}]")
-            st.write(status_desc)
-
-    st.dataframe(pd.DataFrame(SPREAD_TABLE_DATA), use_container_width=True, hide_index=True)
-
-    spread_period = st.selectbox("금리차 추이 기간 선택", ["6mo", "1y", "2y", "5y", "max"], index=2, key="spread_period_select")
-    df_10y = fetch_ticker_data("^TNX", period=spread_period)
-    df_2y = fetch_ticker_data("2YY=F", period=spread_period)
-
-    if df_10y is not None and df_2y is not None and not df_10y.empty and not df_2y.empty:
-        s_10y = df_10y['Close'].copy()
-        s_2y = df_2y['Close'].copy()
-        if s_10y.index.tz is not None:
-            s_10y.index = s_10y.index.tz_localize(None)
-        if s_2y.index.tz is not None:
-            s_2y.index = s_2y.index.tz_localize(None)
-        s_10y.index = s_10y.index.normalize()
-        s_2y.index = s_2y.index.normalize()
-
-        df_spread = pd.DataFrame({'10Y': s_10y, '2Y': s_2y}).ffill().dropna()
-        df_spread['Spread'] = df_spread['10Y'] - df_spread['2Y']
-
-        if not df_spread.empty:
-            fig_spread = go.Figure()
-            fig_spread.add_trace(go.Scatter(
-                x=df_spread.index, y=df_spread['Spread'], mode='lines',
-                name='10Y-2Y 스프레드 (%p)', line=dict(color='#E02424', width=2),
-                fill='tozeroy', fillcolor='rgba(224, 36, 36, 0.15)'
-            ))
-            fig_spread.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.8, annotation_text="기준선 (0%p 역전 경계)")
-            fig_spread.update_layout(
-                title=f"미국채 10Y - 2Y 스프레드 과거 추이 ({spread_period})",
-                xaxis_title="일자", yaxis_title="스프레드 (%p)", hovermode="x unified",
-                margin=dict(l=20, r=20, t=40, b=20)
+            st.markdown(
+                f"**공식 일별 커브 진단:** :{status_color}[{status_title}]"
             )
-            st.plotly_chart(fig_spread, use_container_width=True)
+            st.write(status_desc)
+    else:
+        st.warning(
+            "FRED 공식 DGS2/DGS10 데이터를 충분히 가져오지 못해 "
+            "공식 일별 10Y−2Y 스프레드를 계산할 수 없습니다."
+        )
+
+    st.dataframe(
+        pd.DataFrame(SPREAD_TABLE_DATA),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("#### 📈 공식 일별 10Y−2Y 스프레드 과거 추이")
+
+    if not official_spread_df.empty:
+        spread_period = st.selectbox(
+            "금리차 추이 기간 선택",
+            ["6mo", "1y", "2y", "5y", "max"],
+            index=2,
+            key="official_spread_period_select",
+        )
+
+        period_days_map = {
+            "6mo": 183,
+            "1y": 365,
+            "2y": 730,
+            "5y": 1825,
+        }
+
+        chart_spread_df = official_spread_df.copy()
+
+        if spread_period != "max":
+            cutoff_date = (
+                pd.Timestamp.now()
+                - pd.DateOffset(days=period_days_map[spread_period])
+            )
+            chart_spread_df = chart_spread_df[
+                chart_spread_df.index >= cutoff_date
+            ]
+
+        if not chart_spread_df.empty:
+            fig_spread = go.Figure()
+
+            fig_spread.add_trace(
+                go.Scatter(
+                    x=chart_spread_df.index,
+                    y=chart_spread_df["Spread"],
+                    mode="lines",
+                    name="공식 DGS10 − DGS2 (%p)",
+                    line=dict(color="#E02424", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(224, 36, 36, 0.15)",
+                )
+            )
+
+            fig_spread.add_hline(
+                y=0,
+                line_dash="dash",
+                line_color="white",
+                opacity=0.8,
+                annotation_text="역전 경계선 (0%p)",
+            )
+
+            fig_spread.update_layout(
+                title=f"FRED 공식 일별 10Y−2Y 스프레드 추이 ({spread_period})",
+                xaxis_title="기준일",
+                yaxis_title="스프레드 (%p)",
+                hovermode="x unified",
+                margin=dict(l=20, r=20, t=40, b=20),
+            )
+
+            st.plotly_chart(
+                fig_spread,
+                use_container_width=True,
+            )
 
     st.divider()
 
