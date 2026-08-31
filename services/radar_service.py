@@ -625,29 +625,47 @@ def fetch_daum_deal_ranking(
     interval_type: str = "TODAY",
 ) -> pd.DataFrame:
     """
-    Daum 금융 외국인 매매종목 JSON API에서 데이터를 가져옵니다.
+    Daum 금융 외국인/기관 매매종목 JSON API에서 시장 전체 Top N을 조회합니다.
 
-    실제 API: finance.daum.net/api/trend/investor_purchase/
-    응답 구조는 Playwright 네트워크 캡처로 직접 확인했습니다.
+    실제 확인된 엔드포인트:
+        https://finance.daum.net/api/trend/investor_purchase/
 
-    실제 응답 형태:
-      {
-        "data": {"BUY": [...], "SELL": [...]},
-        "fromDate": "YYYY-MM-DD",
-        "toDate": "YYYY-MM-DD"
-      }
+    실제 확인된 투자주체 파라미터:
+        - 외국인: investorType=FOREIGN
+        - 기관합계: investorType=INSTITUTION
+
+    실제 응답 구조:
+        {
+            "data": {
+                "BUY": [...],
+                "SELL": [...]
+            },
+            "fromDate": "YYYY-MM-DD",
+            "toDate": "YYYY-MM-DD"
+        }
 
     interval_type:
-      "TODAY"    당일
-      "DAYS_5"   5거래일 누적
-      "DAYS_20"  20거래일 누적
+        - TODAY: 당일
+        - DAYS_5: 5거래일
+        - DAYS_20: 20거래일
 
-    주의: investorType="FOREIGN"(외국인)만 확인됐습니다.
+    주의:
+        - 기관합계는 현재 당일(TODAY) 조회를 우선 지원합니다.
+        - 세부 기관 주체(투신, 은행, 보험, 종금, 기금 등)는 이 API의
+          시장 전체 Top N 지원 여부가 검증되지 않았으므로 빈 DataFrame을 반환합니다.
+        - Daum API는 공식 API가 아닌 웹사이트 내부 JSON 요청이므로,
+          응답 구조나 파라미터가 변경될 수 있습니다.
     """
-    if investor != "외국인":
+    investor_type_map = {
+        "외국인": "FOREIGN",
+        "기관": "INSTITUTION",
+    }
+
+    investor_type = investor_type_map.get(investor)
+    if investor_type is None:
         logger.warning(
-            "Daum investor_purchase API는 외국인만 확인됐습니다: %s "
-            "(Naver/PyKrx로 대체됩니다)",
+            "Daum investor_purchase API 미지원 투자주체: %s "
+            "(지원: 외국인, 기관)",
             investor,
         )
         return pd.DataFrame()
@@ -655,7 +673,17 @@ def fetch_daum_deal_ranking(
     valid_intervals = {"TODAY", "DAYS_5", "DAYS_20"}
     if interval_type not in valid_intervals:
         logger.warning(
-            "지원하지 않는 interval_type: %s (TODAY로 대체)",
+            "Daum 지원하지 않는 interval_type=%s. TODAY로 변경합니다.",
+            interval_type,
+        )
+        interval_type = "TODAY"
+
+    # 현재 기관합계의 기간별 누적(5일/20일) API 응답은 별도 검증하지 않았으므로,
+    # 잘못된 기간별 값을 보여주지 않도록 기관은 당일만 허용합니다.
+    if investor == "기관" and interval_type != "TODAY":
+        logger.warning(
+            "Daum 기관합계는 현재 당일(TODAY) 시장 전체 Top N만 지원합니다. "
+            "요청 interval=%s를 TODAY로 변경합니다.",
             interval_type,
         )
         interval_type = "TODAY"
@@ -667,6 +695,8 @@ def fetch_daum_deal_ranking(
     )
 
     url = "https://finance.daum.net/api/trend/investor_purchase/"
+
+    # DevTools에서 실제 확인된 기본 요청 파라미터와 일치시킵니다.
     params = {
         "buyFieldName": "straightPurchasePrice",
         "buyOrder": "desc",
@@ -674,78 +704,212 @@ def fetch_daum_deal_ranking(
         "sellOrder": "asc",
         "limit": top_n,
         "market": market_param,
-        "investorType": "FOREIGN",
-        "intervalType": interval_type,
+        "investorType": investor_type,
     }
+
+    # 캡처된 당일 요청에는 intervalType이 없었습니다.
+    # 기간별 조회일 때만 intervalType을 추가합니다.
+    if interval_type != "TODAY":
+        params["intervalType"] = interval_type
+
     headers = {
-        **COMMON_HEADERS,
-        "Referer": "https://finance.daum.net/domestic/influential_investors",
-        "Accept": "application/json, text/plain, */*",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/18.0 Safari/605.1.15"
+        ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": (
+            "https://finance.daum.net/domestic/"
+            f"influential_investors?market={market_param}"
+        ),
+        "X-Requested-With": "XMLHttpRequest",
     }
 
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
 
-        if resp.status_code != 200:
+        if response.status_code != 200:
             logger.warning(
-                "Daum investor_purchase API 실패: HTTP %s",
-                resp.status_code,
+                "Daum investor_purchase API HTTP 실패: status=%s, "
+                "market=%s, investor=%s, interval=%s",
+                response.status_code,
+                market_param,
+                investor,
+                interval_type,
             )
             return pd.DataFrame()
 
-        payload = resp.json()
+        payload = response.json()
         data = payload.get("data", {})
 
-        target_list = data.get("BUY" if trade_type == "순매수" else "SELL", [])
+        list_key = "BUY" if trade_type == "순매수" else "SELL"
+        target_list = data.get(list_key, [])
 
-        if not target_list:
+        if not isinstance(target_list, list) or not target_list:
             logger.warning(
-                "Daum investor_purchase API: %s 결과가 비어 있습니다 "
-                "(interval=%s)",
+                "Daum investor_purchase API 빈 결과: "
+                "market=%s, investor=%s(%s), direction=%s, interval=%s, "
+                "payload_keys=%s, data_keys=%s",
+                market_param,
+                investor,
+                investor_type,
                 trade_type,
                 interval_type,
+                list(payload.keys()) if isinstance(payload, dict) else [],
+                list(data.keys()) if isinstance(data, dict) else [],
             )
             return pd.DataFrame()
 
         from_date = payload.get("fromDate", "")
         to_date = payload.get("toDate", target_date)
-        period_label = (
-            f"{from_date}~{to_date}" if interval_type != "TODAY" else to_date
-        )
+
+        if interval_type == "TODAY":
+            period_label = to_date or target_date
+        elif from_date and to_date:
+            period_label = f"{from_date}~{to_date}"
+        else:
+            period_label = target_date
 
         records = []
 
         for row in target_list[:top_n]:
-            code = str(row.get("symbolCode", "")).replace("A", "")
-            name = row.get("name", "")
-            price = float(row.get("tradePrice", 0) or 0)
-            change_pct = float(row.get("changeRate", 0) or 0) * 100.0
-            amt_raw = float(row.get("straightPurchasePrice", 0) or 0)
-            amt_eok = round(amt_raw / 100000000.0, 1)
+            if not isinstance(row, dict):
+                continue
 
-            if not name or not code:
+            raw_code = str(row.get("symbolCode", "")).strip()
+            stock_code = (
+                raw_code[1:]
+                if raw_code.startswith("A")
+                else raw_code
+            )
+
+            stock_name = str(row.get("name", "")).strip()
+
+            try:
+                price = float(row.get("tradePrice", 0) or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+
+            try:
+                change_rate = float(row.get("changeRate", 0) or 0)
+            except (TypeError, ValueError):
+                change_rate = 0.0
+
+            # Daum changeRate는 0.0238 = 2.38% 형태의 소수 비율입니다.
+            change_pct = round(change_rate * 100.0, 2)
+
+            try:
+                purchase_price = float(
+                    row.get("straightPurchasePrice", 0) or 0
+                )
+            except (TypeError, ValueError):
+                purchase_price = 0.0
+
+            # straightPurchasePrice는 원 단위.
+            # BUY는 양수, SELL은 음수 형태를 그대로 유지합니다.
+            net_amount_eok = round(
+                purchase_price / 100_000_000.0,
+                1,
+            )
+
+            # API 응답에 매도 값의 부호가 비정상적으로 양수로 올 경우를 방어합니다.
+            if trade_type == "순매도" and net_amount_eok > 0:
+                net_amount_eok = -abs(net_amount_eok)
+
+            # API 응답에 매수 값의 부호가 비정상적으로 음수로 올 경우를 방어합니다.
+            if trade_type == "순매수" and net_amount_eok < 0:
+                net_amount_eok = abs(net_amount_eok)
+
+            try:
+                rank = int(row.get("rank", 0) or 0)
+            except (TypeError, ValueError):
+                rank = 0
+
+            if not stock_name or not stock_code:
                 continue
 
             records.append({
-                "순위": row.get("rank", 0),
-                "종목코드": code,
-                "종목명": name,
+                "순위": rank if rank > 0 else len(records) + 1,
+                "종목코드": stock_code,
+                "종목명": stock_name,
                 "현재가": price,
-                "등락률(%)": round(change_pct, 2),
-                "순매수대금(억)": amt_eok,
+                "등락률(%)": change_pct,
+                "순매수대금(억)": net_amount_eok,
                 "시가총액_가중": max(price * 1000, 500),
                 "데이터_출처": (
-                    f"Daum API "
-                    f"({INTERVAL_LABELS.get(interval_type, interval_type)}, "
+                    f"Daum API ({investor}, "
+                    f"{INTERVAL_LABELS.get(interval_type, interval_type)}, "
                     f"{period_label})"
                 ),
+                "수집시각": datetime.now(
+                    ZoneInfo("Asia/Seoul")
+                ).strftime("%Y-%m-%d %H:%M:%S KST"),
             })
 
-        if records:
-            return pd.DataFrame(records)
+        if not records:
+            logger.warning(
+                "Daum API 응답은 있으나 유효 레코드가 없습니다: "
+                "market=%s, investor=%s, trade_type=%s",
+                market_param,
+                investor,
+                trade_type,
+            )
+            return pd.DataFrame()
 
+        result_df = pd.DataFrame(records)
+
+        # 순위 필드가 비정상적이거나 중복된 경우 표시 순서를 금액 기준으로 재정렬합니다.
+        result_df = result_df.sort_values(
+            "순매수대금(억)",
+            ascending=(trade_type == "순매도"),
+        ).head(top_n).reset_index(drop=True)
+
+        result_df["순위"] = range(1, len(result_df) + 1)
+
+        logger.info(
+            "Daum investor_purchase API 성공: market=%s, investor=%s(%s), "
+            "trade_type=%s, interval=%s, rows=%s",
+            market_param,
+            investor,
+            investor_type,
+            trade_type,
+            interval_type,
+            len(result_df),
+        )
+
+        return result_df
+
+    except ValueError as e:
+        logger.warning(
+            "Daum investor_purchase API JSON 파싱 실패: "
+            "market=%s, investor=%s, error=%s",
+            market_param,
+            investor,
+            e,
+        )
+    except requests.RequestException as e:
+        logger.warning(
+            "Daum investor_purchase API 통신 실패: "
+            "market=%s, investor=%s, error=%s",
+            market_param,
+            investor,
+            e,
+        )
     except Exception as e:
-        logger.warning(f"Daum investor_purchase API 실패: {e}")
+        logger.exception(
+            "Daum investor_purchase API 예외: "
+            "market=%s, investor=%s, error=%s",
+            market_param,
+            investor,
+            e,
+        )
 
     return pd.DataFrame()
 
