@@ -106,10 +106,10 @@ MACRO_CATEGORIES = {
         "달러/엔 (USD/JPY) :gray[[실시간]]": "JPY=X",
         "엔/원 100엔당 (JPY/KRW) :gray[[실시간]]": "JPYKRW=X"
     },
-    "🏛️ 미국 국채 금리 :gray[(15분 지연)]": {
-        "미국채 2년물 금리(%) :gray[[15분 지연]]": "2YY=F",
-        "미국채 10년물 금리(%) :gray[[15분 지연]]": "^TNX",
-        "미국채 30년물 금리(%) :gray[[15분 지연]]": "^TYX"
+    "🏛️ 미국 국채 수익률 :gray[(TradingView 참고 시세)]": {
+        "미국채 2년물 수익률(%) :gray[[TradingView 참고]]": "2YY=F",
+        "미국채 10년물 수익률(%) :gray[[TradingView 참고]]": "^TNX",
+        "미국채 30년물 수익률(%) :gray[[TradingView 참고]]": "^TYX",
     },
     "🛢️ 원자재 :gray[(15분 지연)]": {
         "WTI 원유 ($) :gray[[15분 지연]]": "CL=F",
