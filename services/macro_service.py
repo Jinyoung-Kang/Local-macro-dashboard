@@ -243,6 +243,15 @@ def get_collected_macro_data():
                 pct = (delta / prev) * 100 if prev != 0 else 0.0
                 if "JPY/KRW" in name and curr < 50:
                     curr, prev, delta = curr * 100, prev * 100, delta * 100
+        
+                # [수정] last_ts_str을 실제로 계산하는 코드 추가
+                last_timestamp = df.index[-1]
+                last_ts_str = (
+                    last_timestamp.strftime("%H:%M:%S")
+                    if hasattr(last_timestamp, "strftime")
+                    else "N/A"
+                )
+        
                 collected[cat_name].append({
                     "name": name,
                     "price": curr,
@@ -260,6 +269,15 @@ def get_collected_macro_data():
                     rate_2y_curr, rate_2y_prev = curr, prev
             elif df is not None and isinstance(df, pd.DataFrame) and len(df) == 1:
                 curr = float(df['Close'].iloc[-1])
+        
+                # [수정] len(df)==1인 경로에도 동일하게 추가 (없으면 이 분기에서도 같은 오류 발생)
+                last_timestamp = df.index[-1]
+                last_ts_str = (
+                    last_timestamp.strftime("%H:%M:%S")
+                    if hasattr(last_timestamp, "strftime")
+                    else "N/A"
+                )
+        
                 collected[cat_name].append({
                     "name": name,
                     "price": curr,
@@ -268,7 +286,8 @@ def get_collected_macro_data():
                     "price_str": f"{curr:,.2f}",
                     "delta_str": "0.00 (0.00%)",
                     "prev_str": f"{curr:,.2f}",
-                    "status": "single"
+                    "status": "single",
+                    "last_ts": last_ts_str,
                 })
                 if ticker == "^TNX":
                     rate_10y_curr, rate_10y_prev = curr, curr
