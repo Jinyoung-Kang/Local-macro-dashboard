@@ -1,22 +1,31 @@
 """
 views/macro_view.py
 거시경제 매크로 지표 대시보드 뷰
+
 장단기 금리차, 하이일드 OAS, 3M CP 스프레드, STLFSI4, 개장 상태 표시 및
 데이터 스냅샷 추출 연동
 
 [수정 사항]
 - 미국채 금리(2년/10년/30년물)는 yfinance(^TNX 등)가 분봉을 제공하지 않아
-  데이터 시각이 일봉 수준으로 지연되므로, "비공식 스크래핑 시세 비교"에
-  이미 있는 TradingView 기반 us02y/us10y/us30y 값으로 화면에서 대체합니다.
+  데이터 시각이 일봉 수준으로 지연되므로, "비공식 스크래핑 시세 비교"에 이미 있는
+  TradingView 기반 us02y/us10y/us30y 값으로 화면에서 대체합니다.
   스크래핑이 실패하면 기존 yfinance 값을 그대로 유지하는 안전한 폴백 구조입니다.
+- [신규] 공식 일별 10Y-2Y 스프레드 옆에 TradingView 실시간(참고) 스프레드를
+  나란히 표시해, FRED 공식치와 실시간 시세 사이의 시차를 한눈에 비교할 수
+  있게 했습니다.
+- [신규] 공식 일별 30Y-2Y 장단기 금리차 해석 섹션을 신규로 추가했습니다.
+  FRED DGS30(30년물) 공식치와 TradingView us30y 실시간 참고치를 함께
+  제공합니다.
 """
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 import pandas as pd
 import plotly.graph_objects as go
 import pytz
 import streamlit as st
 import yfinance as yf
+
 from config import MACRO_CATEGORIES, RISK_MODEL_TABLE, SPREAD_TABLE_DATA
 from services.macro_service import (
     clean_tag_ui,
@@ -33,6 +42,7 @@ from services.dashboard_snapshot_service import (
 from services.market_scraper_service import (
     get_scraped_macro_markets,
 )
+
 
 # 미국채 카드 항목명 → TradingView 스크래핑 키 매핑
 BOND_SCRAPER_KEY_MAP = {
@@ -61,7 +71,6 @@ def inject_market_status(name: str) -> str:
     wd = now.weekday()
     hm = now.hour * 100 + now.minute
     is_weekend = wd >= 5
-
     status = "마감"
 
     # 야간/글로벌 선물 전용 판정 (일반 현물 지수 규칙보다 먼저 체크해야 함)
@@ -74,9 +83,8 @@ def inject_market_status(name: str) -> str:
 
     if is_night_futures_item:
         # 야간선물 거래시간: 18:00 ~ 익일 06:00 (월~금 야간, 금요일 야간은 토요일 06:00까지 연장)
-        is_evening_session = hm >= 1800 and wd in [0, 1, 2, 3, 4]      # 월~금 18:00 이후
+        is_evening_session = hm >= 1800 and wd in [0, 1, 2, 3, 4]  # 월~금 18:00 이후
         is_early_morning_session = hm < 600 and wd in [1, 2, 3, 4, 5]  # 화~토 06:00 이전 (전날 야간 연장)
-
         if is_evening_session or is_early_morning_session:
             status = "개장"
         else:
@@ -121,10 +129,10 @@ def _override_with_scraper_bond(
 ) -> dict:
     """
     상단 미국채 카드에 TradingView 참고 시세를 적용합니다.
-
     TradingView 수집이 실패하면 기존 yfinance 값을 그대로 유지합니다.
+
     이 함수는 카드 표기용 데이터만 교체하며, 공식 장단기 금리차 계산에는
-    FRED DGS2/DGS10을 별도로 사용합니다.
+    FRED DGS2/DGS10/DGS30을 별도로 사용합니다.
     """
     scraper_key = BOND_SCRAPER_KEY_MAP.get(item.get("name"))
     if not scraper_key:
@@ -136,27 +144,23 @@ def _override_with_scraper_bond(
 
     price = scraped.get("price")
     previous_close = scraped.get("previous_close")
-
     if price is None:
         return item
 
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     new_item = dict(item)
-
     new_item["price"] = float(price)
     new_item["price_str"] = f"{float(price):,.3f}"
     new_item["status"] = "ok"
     new_item["source"] = "TradingView 비공식 참고"
     new_item["last_ts"] = (
-        now_kst.strftime("%H:%M:%S KST")
-        + " (TradingView 참고)"
+        now_kst.strftime("%H:%M:%S KST") + " (TradingView 참고)"
     )
 
     if previous_close is not None and float(previous_close) != 0:
         previous_close = float(previous_close)
         delta = float(price) - previous_close
         pct = (delta / previous_close) * 100.0
-
         new_item["delta"] = delta
         new_item["pct"] = pct
         new_item["prev_str"] = f"{previous_close:,.3f}"
@@ -168,6 +172,26 @@ def _override_with_scraper_bond(
         new_item["delta_str"] = "전일비 미제공"
 
     return new_item
+
+
+def _get_realtime_bond_yield(scraper_items_for_bonds: dict, key: str):
+    """
+    TradingView 스크래핑 결과에서 실시간(참고) 국채 수익률과 전일 종가를
+    (현재값, 전일값) 튜플로 반환합니다. 수집 실패 시 (None, None)을 반환합니다.
+    """
+    scraped = scraper_items_for_bonds.get(key)
+    if not scraped or scraped.get("status") != "ok":
+        return None, None
+
+    price = scraped.get("price")
+    previous_close = scraped.get("previous_close")
+
+    if price is None:
+        return None, None
+
+    curr = float(price)
+    prev = float(previous_close) if previous_close is not None else None
+    return curr, prev
 
 
 def render_macro_view(now_str_kst: str, refresh_interval: int):
@@ -182,12 +206,13 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     hy_df = fetch_fred_series("BAMLH0A0HYM2", period_years=3)
     stlfsi_df = fetch_fred_series("STLFSI4", period_years=3)
     cp_spread_df = fetch_fred_cp_spread()
-    
+
     # 공식 일별 장단기 금리차 계산용.
-    # DGS2/DGS10은 FRED가 제공하는 미 재무부 Constant Maturity Treasury
+    # DGS2/DGS10/DGS30은 FRED가 제공하는 미 재무부 Constant Maturity Treasury
     # 일별 수익률이며, TradingView 참고 시세와 의도적으로 분리합니다.
     dgs2_df = fetch_fred_series("DGS2", period_years=10)
     dgs10_df = fetch_fred_series("DGS10", period_years=10)
+    dgs30_df = fetch_fred_series("DGS30", period_years=10)
 
     risk_data = {
         "VIX": vix_hist,
@@ -210,7 +235,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     with header_left:
         st.title("📊 Global Macro Dashboard")
         st.caption(f"최근 데이터 갱신 시각: {now_str_kst} (KST) | 갱신 주기: {refresh_interval}초")
-
     with header_right:
         st.write("")
         with st.popover("📋 매크로 텍스트 브리핑 보기 / 복사", use_container_width=True):
@@ -221,7 +245,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             )
             st.code(report_text, language="text")
 
-        st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
         with st.popover(
             "📚 전체 대시보드 원본 데이터 보기 / 복사",
@@ -232,7 +256,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                 "거시·리스크·유동성·섹터·자산군·COT·KRX·SEC 13F 데이터를 "
                 "수집 시각 및 데이터 출처 성격과 함께 표시합니다."
             )
-
             if "dashboard_raw_snapshot_text" not in st.session_state:
                 st.session_state.dashboard_raw_snapshot_text = ""
 
@@ -248,7 +271,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                     )
 
             raw_text = st.session_state.dashboard_raw_snapshot_text
-
             if raw_text:
                 st.code(raw_text, language="text")
             else:
@@ -258,8 +280,8 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     # ==========================================================================
     # 1. 기존 공식/최근 시세 요약 카드
-    # 한 카테고리에 항목이 많으면 한 행 최대 4개씩 줄바꿈합니다.
-    # [수정] "미국 국채 금리" 카테고리는 비공식 스크래핑 값으로 대체합니다.
+    #    한 카테고리에 항목이 많으면 한 행 최대 4개씩 줄바꿈합니다.
+    #    [수정] "미국 국채 금리" 카테고리는 비공식 스크래핑 값으로 대체합니다.
     # ==========================================================================
     st.subheader("실시간/최근 시세 요약")
     st.info(
@@ -268,21 +290,18 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         icon="ℹ️",
     )
 
-    # [수정] 미국채 스크래핑 값을 미리 조회 (카드 반복문에서 재사용)
+    # [수정] 미국채 스크래핑 값을 미리 조회 (카드 반복문 및 공식 스프레드 섹션에서 재사용)
     scraper_result_for_bonds = get_scraped_macro_markets()
     scraper_items_for_bonds = {
         item["key"]: item for item in scraper_result_for_bonds.get("items", [])
     }
 
     MAX_COLS_PER_ROW = 4
-
     for cat_name, items in collected_data.items():
         st.markdown(f"#### {cat_name}")
-
         for row_start in range(0, len(items), MAX_COLS_PER_ROW):
             row_items = items[row_start: row_start + MAX_COLS_PER_ROW]
             cols = st.columns(MAX_COLS_PER_ROW)
-
             for idx, item in enumerate(row_items):
                 # [수정] 미국채 금리 카테고리만 스크래핑 값으로 교체
                 if cat_name == BOND_CATEGORY_NAME:
@@ -290,7 +309,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
                 display_name = inject_market_status(item["name"])
                 col = cols[idx]
-
                 if item["status"] == "ok":
                     col.metric(
                         label=display_name,
@@ -298,7 +316,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                         delta=item["delta_str"],
                         help=f"직전 거래일 종가: {item['prev_str']}"
                     )
-
                     extra_caption_parts = [f"전일 종가: `{item['prev_str']}`"]
                     if item.get("contract_month"):
                         extra_caption_parts.append(f"월물: `{item['contract_month']}`")
@@ -306,9 +323,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                         extra_caption_parts.append(f"출처: `{item['source']}`")
                     if item.get("last_ts"):
                         extra_caption_parts.append(f"데이터 시각: `{item['last_ts']}`")
-
                     col.caption(" | ".join(extra_caption_parts))
-
                 elif item["status"] == "single":
                     col.metric(label=display_name, value=item["price_str"])
                     col.caption("전일 데이터 없음")
@@ -321,23 +336,23 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                         fail_caption_parts.append(f"출처: `{item['source']}`")
                     if fail_caption_parts:
                         col.caption(" | ".join(fail_caption_parts))
-
             for idx in range(len(row_items), MAX_COLS_PER_ROW):
                 cols[idx].empty()
 
     # ==========================================================================
     # 1-1. 비공식 웹 스크래핑 시세 비교 구역
-    # 기존 공식/yfinance/FRED 데이터와 완전히 분리된 참고용 영역입니다.
+    #      기존 공식/yfinance/FRED 데이터와 완전히 분리된 참고용 영역입니다.
     # ==========================================================================
-    st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     st.divider()
     st.subheader("🔎 비공식 스크래핑 시세 비교")
     st.caption(
         "TradingView·Investing.com 공개 웹페이지를 비공식적으로 수집한 "
         "참고용 데이터입니다. 기존 공식/FRED/yfinance 데이터를 대체하지 않으며, "
         "웹페이지 구조·접근 정책 변경에 따라 수집 실패 또는 지연될 수 있습니다.\n\n"
-        "💡 미국채 2년물/10년물/30년물은 위 '실시간/최근 시세 요약' 카드에서 "
-        "이 스크래핑 값을 실제로 사용하고 있습니다 (yfinance 일봉 지연 문제 회피)."
+        "💡 미국채 2년물/10년물/30년물은 위 '실시간/최근 시세 요약' 카드 및 아래 "
+        "'공식 일별 장단기 금리차' 섹션의 실시간 비교 카드에서 이 스크래핑 값을 "
+        "실제로 사용하고 있습니다 (yfinance 일봉 지연 문제 회피)."
     )
 
     scraper_result = get_scraped_macro_markets()
@@ -346,14 +361,12 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         "updated_at",
         "알 수 없음",
     )
-
     st.caption(
         f"수집 시각: `{scraper_updated_at}` | "
         "수집 데이터는 60초 동안 캐시됩니다."
     )
 
     SCRAPER_COLS_PER_ROW = 5
-
     for row_start in range(
         0, len(scraper_items), SCRAPER_COLS_PER_ROW,
     ):
@@ -361,7 +374,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             row_start: row_start + SCRAPER_COLS_PER_ROW
         ]
         cols = st.columns(SCRAPER_COLS_PER_ROW)
-
         for idx, item in enumerate(row_items):
             col = cols[idx]
             name = item.get("name", "알 수 없음")
@@ -434,8 +446,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                             f"{previous_close:,.2f}"
                         )
                     caption_parts.insert(
-                        1,
-                        f"전일 종가: `{previous_text}`",
+                        1, f"전일 종가: `{previous_text}`",
                     )
                 col.caption(" | ".join(caption_parts))
             else:
@@ -444,14 +455,12 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                     value="수집 실패",
                 )
                 error_text = item.get(
-                    "error",
-                    "페이지 구조 변경 또는 접속 지연",
+                    "error", "페이지 구조 변경 또는 접속 지연",
                 )
                 col.caption(
                     "비공식 소스 오류: "
                     f"`{str(error_text)[:70]}`"
                 )
-
         for empty_idx in range(
             len(row_items), SCRAPER_COLS_PER_ROW,
         ):
@@ -508,13 +517,14 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     # ==========================================================================
     # 2. 공식 일별 10Y-2Y 장단기 금리차
+    #    [수정] TradingView 실시간(참고) 스프레드 카드를 옆에 나란히 추가
     # ==========================================================================
     st.subheader("📊 공식 일별 10Y−2Y 장단기 금리차 해석")
     st.caption(
         "기준: FRED/미 재무부의 최신 영업일 마감 수익률(DGS10 − DGS2)입니다. "
-        "상단의 TradingView 참고 시세와는 데이터 제공처·갱신 시각·산출 기준이 다를 수 있습니다."
+        "오른쪽 실시간 카드는 상단 TradingView 참고 시세와 동일한 소스(us10y, us02y)로 "
+        "계산하며, 데이터 제공처·갱신 시각·산출 기준이 공식치와 다를 수 있습니다."
     )
-
     st.code(
         "공식 10Y−2Y 스프레드 = FRED DGS10(10년물) − FRED DGS2(2년물)",
         language="text",
@@ -545,14 +555,12 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             .dropna()
         )
         official_spread_df["Spread"] = (
-            official_spread_df["DGS10"]
-            - official_spread_df["DGS2"]
+            official_spread_df["DGS10"] - official_spread_df["DGS2"]
         )
 
     if len(official_spread_df) >= 2:
         latest_official = official_spread_df.iloc[-1]
         previous_official = official_spread_df.iloc[-2]
-
         official_date = official_spread_df.index[-1]
         official_date_str = (
             official_date.strftime("%Y-%m-%d")
@@ -563,7 +571,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         curr_spread = float(latest_official["Spread"])
         prev_spread = float(previous_official["Spread"])
         spread_delta = curr_spread - prev_spread
-
         rate_10y_official = float(latest_official["DGS10"])
         rate_2y_official = float(latest_official["DGS2"])
 
@@ -592,7 +599,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                 "신용스프레드·실질금리·유동성 지표와 함께 해석해야 합니다."
             )
 
-        sc1, sc2 = st.columns([1, 2])
+        sc1, sc2, sc3 = st.columns([1, 1, 2])
 
         with sc1:
             st.metric(
@@ -607,6 +614,35 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             )
 
         with sc2:
+            rt_10y_curr, rt_10y_prev = _get_realtime_bond_yield(
+                scraper_items_for_bonds, "us10y",
+            )
+            rt_2y_curr, rt_2y_prev = _get_realtime_bond_yield(
+                scraper_items_for_bonds, "us02y",
+            )
+
+            if rt_10y_curr is not None and rt_2y_curr is not None:
+                rt_spread = rt_10y_curr - rt_2y_curr
+                if rt_10y_prev is not None and rt_2y_prev is not None:
+                    rt_spread_prev = rt_10y_prev - rt_2y_prev
+                    rt_delta_str = f"{rt_spread - rt_spread_prev:+.2f} %p (전일비)"
+                else:
+                    rt_delta_str = None
+
+                st.metric(
+                    label="실시간 10Y−2Y 스프레드 :gray[[TradingView 참고]]",
+                    value=f"{rt_spread:+.2f} %p",
+                    delta=rt_delta_str,
+                )
+                st.caption(
+                    f"10Y(us10y): `{rt_10y_curr:.2f}%` | "
+                    f"2Y(us02y): `{rt_2y_curr:.2f}%`"
+                )
+            else:
+                st.metric("실시간 10Y−2Y 스프레드", "수집 실패")
+                st.caption("TradingView 참고 시세 수집에 실패했습니다.")
+
+        with sc3:
             st.markdown(
                 f"**공식 일별 커브 진단:** :{status_color}[{status_title}]"
             )
@@ -641,7 +677,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         }
 
         chart_spread_df = official_spread_df.copy()
-
         if spread_period != "max":
             cutoff_date = (
                 pd.Timestamp.now()
@@ -653,7 +688,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
         if not chart_spread_df.empty:
             fig_spread = go.Figure()
-
             fig_spread.add_trace(
                 go.Scatter(
                     x=chart_spread_df.index,
@@ -665,7 +699,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                     fillcolor="rgba(224, 36, 36, 0.15)",
                 )
             )
-
             fig_spread.add_hline(
                 y=0,
                 line_dash="dash",
@@ -673,7 +706,6 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                 opacity=0.8,
                 annotation_text="역전 경계선 (0%p)",
             )
-
             fig_spread.update_layout(
                 title=f"FRED 공식 일별 10Y−2Y 스프레드 추이 ({spread_period})",
                 xaxis_title="기준일",
@@ -681,9 +713,208 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                 hovermode="x unified",
                 margin=dict(l=20, r=20, t=40, b=20),
             )
-
             st.plotly_chart(
                 fig_spread,
+                use_container_width=True,
+            )
+
+    st.divider()
+
+    # ==========================================================================
+    # 2-2. [신규] 공식 일별 30Y-2Y 장단기 금리차
+    # ==========================================================================
+    st.subheader("📊 공식 일별 30Y−2Y 장단기 금리차 해석")
+    st.caption(
+        "기준: FRED/미 재무부의 최신 영업일 마감 수익률(DGS30 − DGS2)입니다. "
+        "10Y-2Y보다 더 긴 구간의 성장·인플레이션 기대를 반영하며, "
+        "오른쪽 실시간 카드는 TradingView 참고 시세(us30y, us02y)로 계산합니다."
+    )
+    st.code(
+        "공식 30Y−2Y 스프레드 = FRED DGS30(30년물) − FRED DGS2(2년물)",
+        language="text",
+    )
+
+    official_spread_30_df = pd.DataFrame()
+
+    if (
+        dgs2_df is not None
+        and dgs30_df is not None
+        and not dgs2_df.empty
+        and not dgs30_df.empty
+        and "DGS2" in dgs2_df.columns
+        and "DGS30" in dgs30_df.columns
+    ):
+        official_spread_30_df = pd.concat(
+            [
+                dgs30_df["DGS30"].rename("DGS30"),
+                dgs2_df["DGS2"].rename("DGS2"),
+            ],
+            axis=1,
+        ).sort_index()
+
+        official_spread_30_df = (
+            official_spread_30_df
+            .ffill()
+            .dropna()
+        )
+        official_spread_30_df["Spread"] = (
+            official_spread_30_df["DGS30"] - official_spread_30_df["DGS2"]
+        )
+
+    if len(official_spread_30_df) >= 2:
+        latest_official_30 = official_spread_30_df.iloc[-1]
+        previous_official_30 = official_spread_30_df.iloc[-2]
+        official_date_30 = official_spread_30_df.index[-1]
+        official_date_30_str = (
+            official_date_30.strftime("%Y-%m-%d")
+            if hasattr(official_date_30, "strftime")
+            else str(official_date_30)[:10]
+        )
+
+        curr_spread_30 = float(latest_official_30["Spread"])
+        prev_spread_30 = float(previous_official_30["Spread"])
+        spread_delta_30 = curr_spread_30 - prev_spread_30
+        rate_30y_official = float(latest_official_30["DGS30"])
+        rate_2y_official_30 = float(latest_official_30["DGS2"])
+
+        if curr_spread_30 < 0:
+            status_title_30 = "🚨 역전 (Inversion)"
+            status_color_30 = "red"
+            status_desc_30 = (
+                "초장기(30년) 수익률마저 단기(2년) 수익률보다 낮아진 상태입니다. "
+                "시장이 매우 강한 장기 성장 둔화 또는 통화정책 정상화 기대를 "
+                "반영하고 있을 수 있으나, 이 구간의 역전은 10Y-2Y보다 드물게 "
+                "발생하므로 다른 지표와 함께 신중하게 해석해야 합니다."
+            )
+        elif curr_spread_30 <= 0.30:
+            status_title_30 = "⚠️ 평탄화 (Flattening)"
+            status_color_30 = "orange"
+            status_desc_30 = (
+                "초장기 구간에서도 성장·인플레이션 기대가 둔화되고 있음을 "
+                "시사할 수 있습니다. 기간프리미엄 축소나 장기 저성장 기대를 "
+                "함께 점검해야 합니다."
+            )
+        else:
+            status_title_30 = "✅ 정상 범위 (Positive Slope)"
+            status_color_30 = "green"
+            status_desc_30 = (
+                "30년물 수익률이 2년물보다 높은 우상향 커브입니다. "
+                "장기 성장·인플레이션 기대가 유지되는 정상적인 상태로 해석되지만, "
+                "재정적자·국채 발행 물량 등 수급 요인의 영향도 함께 고려해야 합니다."
+            )
+
+        sc1_30, sc2_30, sc3_30 = st.columns([1, 1, 2])
+
+        with sc1_30:
+            st.metric(
+                label="공식 일별 30Y−2Y 스프레드",
+                value=f"{curr_spread_30:+.2f} %p",
+                delta=f"{spread_delta_30:+.2f} %p (직전 발표일 대비)",
+            )
+            st.caption(
+                f"기준일: `{official_date_30_str}` | "
+                f"30Y: `{rate_30y_official:.2f}%` | "
+                f"2Y: `{rate_2y_official_30:.2f}%`"
+            )
+
+        with sc2_30:
+            rt_30y_curr, rt_30y_prev = _get_realtime_bond_yield(
+                scraper_items_for_bonds, "us30y",
+            )
+            rt_2y_curr_30, rt_2y_prev_30 = _get_realtime_bond_yield(
+                scraper_items_for_bonds, "us02y",
+            )
+
+            if rt_30y_curr is not None and rt_2y_curr_30 is not None:
+                rt_spread_30 = rt_30y_curr - rt_2y_curr_30
+                if rt_30y_prev is not None and rt_2y_prev_30 is not None:
+                    rt_spread_30_prev = rt_30y_prev - rt_2y_prev_30
+                    rt_delta_30_str = (
+                        f"{rt_spread_30 - rt_spread_30_prev:+.2f} %p (전일비)"
+                    )
+                else:
+                    rt_delta_30_str = None
+
+                st.metric(
+                    label="실시간 30Y−2Y 스프레드 :gray[[TradingView 참고]]",
+                    value=f"{rt_spread_30:+.2f} %p",
+                    delta=rt_delta_30_str,
+                )
+                st.caption(
+                    f"30Y(us30y): `{rt_30y_curr:.2f}%` | "
+                    f"2Y(us02y): `{rt_2y_curr_30:.2f}%`"
+                )
+            else:
+                st.metric("실시간 30Y−2Y 스프레드", "수집 실패")
+                st.caption("TradingView 참고 시세 수집에 실패했습니다.")
+
+        with sc3_30:
+            st.markdown(
+                f"**공식 일별 커브 진단:** :{status_color_30}[{status_title_30}]"
+            )
+            st.write(status_desc_30)
+    else:
+        st.warning(
+            "FRED 공식 DGS2/DGS30 데이터를 충분히 가져오지 못해 "
+            "공식 일별 30Y−2Y 스프레드를 계산할 수 없습니다."
+        )
+
+    st.markdown("#### 📈 공식 일별 30Y−2Y 스프레드 과거 추이")
+
+    if not official_spread_30_df.empty:
+        spread_period_30 = st.selectbox(
+            "30Y-2Y 금리차 추이 기간 선택",
+            ["6mo", "1y", "2y", "5y", "max"],
+            index=2,
+            key="official_spread_period_select_30y",
+        )
+
+        period_days_map_30 = {
+            "6mo": 183,
+            "1y": 365,
+            "2y": 730,
+            "5y": 1825,
+        }
+
+        chart_spread_30_df = official_spread_30_df.copy()
+        if spread_period_30 != "max":
+            cutoff_date_30 = (
+                pd.Timestamp.now()
+                - pd.DateOffset(days=period_days_map_30[spread_period_30])
+            )
+            chart_spread_30_df = chart_spread_30_df[
+                chart_spread_30_df.index >= cutoff_date_30
+            ]
+
+        if not chart_spread_30_df.empty:
+            fig_spread_30 = go.Figure()
+            fig_spread_30.add_trace(
+                go.Scatter(
+                    x=chart_spread_30_df.index,
+                    y=chart_spread_30_df["Spread"],
+                    mode="lines",
+                    name="공식 DGS30 − DGS2 (%p)",
+                    line=dict(color="#8B5CF6", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(139, 92, 246, 0.15)",
+                )
+            )
+            fig_spread_30.add_hline(
+                y=0,
+                line_dash="dash",
+                line_color="white",
+                opacity=0.8,
+                annotation_text="역전 경계선 (0%p)",
+            )
+            fig_spread_30.update_layout(
+                title=f"FRED 공식 일별 30Y−2Y 스프레드 추이 ({spread_period_30})",
+                xaxis_title="기준일",
+                yaxis_title="스프레드 (%p)",
+                hovermode="x unified",
+                margin=dict(l=20, r=20, t=40, b=20),
+            )
+            st.plotly_chart(
+                fig_spread_30,
                 use_container_width=True,
             )
 
@@ -775,10 +1006,12 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             if m_chart is not None and not m_chart.empty:
                 fig_vol.add_trace(go.Scatter(x=m_chart.index, y=m_chart['Close'], mode='lines', name='MOVE (채권 변동성)', line=dict(color='#3F51B5', width=2), yaxis="y2"))
             fig_vol.update_layout(
-                title=f"VIX 및 MOVE 지수 비교 추이 ({vix_period})", xaxis_title="일자",
+                title=f"VIX 및 MOVE 지수 비교 추이 ({vix_period})",
+                xaxis_title="일자",
                 yaxis=dict(title=dict(text="VIX (pt)", font=dict(color="#FF5722")), tickfont=dict(color="#FF5722")),
                 yaxis2=dict(title=dict(text="MOVE (pt)", font=dict(color="#3F51B5")), tickfont=dict(color="#3F51B5"), overlaying="y", side="right"),
-                hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20),
+                hovermode="x unified",
+                margin=dict(l=20, r=20, t=40, b=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig_vol, use_container_width=True)
@@ -874,9 +1107,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                     y_title = "기준일 대비 누적 변동률 (%)"
                 else:
                     y_title = "실제 수치 / 가격"
-
                 fig_multi.add_trace(go.Scatter(x=m_df.index, y=y_data, mode='lines', name=clean_tag_ui(name), line=dict(width=2)))
-
         fig_multi.update_layout(title=f"다중 지표 비교 추이 ({multi_period} 기준)", xaxis_title="일자", yaxis_title=y_title, hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         if norm_mode == "수익률/변동률(%) 기준":
             fig_multi.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.7)
