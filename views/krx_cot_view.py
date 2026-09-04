@@ -16,7 +16,11 @@ import streamlit as st
 
 from config import get_krx_key
 from services.ai_service import ask_krx_cot_agent
-from services.krx_service import get_krx_futures_history, get_krx_investor_derivatives_summary
+from services.krx_service import (
+    get_krx_futures_history,
+    get_krx_investor_derivatives_summary,
+    fetch_daum_futures_investor_trend,
+)
 
 
 def _get_next_krx_publish_info(data_date_str: str, now_kst: datetime) -> str:
@@ -52,12 +56,12 @@ def render_krx_cot_view():
             </p>
         </div>
 
-        |구분|가격|미결제약정|시장 함의|
+        |국면|가격|OI|해석|
         |--|--|--|--|
-        |신규 롱|상승 ▲|증가 ▲|강한 상승 추세 확산 (스마트머니 롱)|
-        |신규 숏|하락 ▼|증가 ▲|강한 하락 압력 확산 (신규 숏 누적)|
-        |숏 커버링|상승 ▲|감소 ▼|공매도/숏 환매수성 일시적 반등|
-        |롱 청산|하락 ▼|감소 ▼|기존 롱 손절/매도, 바닥 다지기 가능성|
+        |신규 롱|▲|▲|강한 상승 추세 확산|
+        |신규 숏|▼|▲|강한 하락 압력 확산|
+        |숏 커버링|▲|▼|일시적 반등|
+        |롱 청산|▼|▼|기존 롱 손절/바닥 다지기|
         """,
         unsafe_allow_html=True,
     )
@@ -87,7 +91,12 @@ def render_krx_cot_view():
             st.rerun()
 
     df_hist = get_krx_futures_history(days=lookback_days)
-    df_investors = get_krx_investor_derivatives_summary()
+
+    # [수정] Daum 선물 투자주체별 매매동향(실제 데이터)을 우선 사용하고,
+    # 수집에 실패하면 기존 placeholder 데이터로 안전하게 폴백합니다.
+    df_investors = fetch_daum_futures_investor_trend(lookback_days=25)
+    if df_investors is None or df_investors.empty:
+        df_investors = get_krx_investor_derivatives_summary()
 
     if df_hist.empty:
         st.warning("KOSPI 200 선물 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.")
@@ -111,7 +120,6 @@ def render_krx_cot_view():
         else str(latest["Date"])[:10]
     )
 
-    # 다음 KRX 데이터 공시 예정 안내
     publish_notice = _get_next_krx_publish_info(data_date_str, now_kst)
     if publish_notice:
         st.caption(f"ℹ️ {publish_notice}")
@@ -125,7 +133,6 @@ def render_krx_cot_view():
         except Exception:
             return fallback
 
-    # [수정] 실제 컬럼명(Futures_Close 등, 스네이크 케이스)으로 참조합니다.
     fut_close = safe_val(latest.get("Futures_Close"), safe_val(prev.get("Futures_Close"), 365.20))
     chg_pct = safe_val(latest.get("Change_Pct"), 0.0)
 
@@ -200,11 +207,6 @@ def render_krx_cot_view():
 
     # ==========================================================================
     # 차트: KOSPI 200 선물 가격 & 미결제약정(OI) 추이
-    #
-    # 선물 종가(약 300~450pt)와 미결제약정(약 10만~20만 계약)은 스케일 차이가
-    # 커서 같은 y축에 그리면 한쪽이 거의 보이지 않습니다. make_subplots의
-    # specs에 secondary_y=True를 명시하고, add_trace 시 secondary_y 파라미터로
-    # 실제 이중 y축을 구성해 가독성을 확보합니다.
     # ==========================================================================
     st.markdown(f"#### 📈 KOSPI 200 선물 가격 & 미결제약정(OI) 추이{estimate_suffix}")
 
@@ -226,7 +228,6 @@ def render_krx_cot_view():
         ),
     )
 
-    # 선물 종가: 왼쪽(주) y축
     fig.add_trace(
         go.Scatter(
             x=df_hist["Date"],
@@ -240,7 +241,6 @@ def render_krx_cot_view():
         secondary_y=False,
     )
 
-    # 미결제약정: 오른쪽(보조) y축
     fig.add_trace(
         go.Scatter(
             x=df_hist["Date"],
@@ -293,7 +293,6 @@ def render_krx_cot_view():
         hovermode="x unified",
     )
 
-    # 왼쪽 y축: 선물 지수 (row 1, 주 축)
     fig.update_yaxes(
         title_text="선물 지수 (pt)",
         row=1,
@@ -301,7 +300,6 @@ def render_krx_cot_view():
         secondary_y=False,
         gridcolor="#21262D",
     )
-    # 오른쪽 y축: 미결제약정 (row 1, 보조 축) — 그리드선은 겹치지 않도록 숨깁니다.
     fig.update_yaxes(
         title_text="미결제약정 (계약)",
         row=1,
@@ -395,10 +393,15 @@ def render_krx_cot_view():
         if inv_is_placeholder:
             st.warning(
                 "⚠️ 이 표는 KRX 실제 데이터가 아닌 placeholder(예시) 데이터입니다. "
-                "실제 투자자별 파생 수급 데이터가 연동되면 자동으로 교체됩니다."
+                "Daum 실시간 데이터 수집에 실패하여 예시값으로 대체되었습니다."
+            )
+        else:
+            st.caption(
+                "📡 출처: Daum 금융 비공식 API (finance.daum.net/api/investor/future/days). "
+                "KRX 공식 API가 아니므로 페이지 구조 변경 시 수집이 실패할 수 있습니다. "
+                "단위: 계약수."
             )
 
-        # [수정] 실제 한글 컬럼명(투자 주체/당일 순매수/5일 누적/20일 누적/포지션 성향)
         display_cols = [c for c in df_investors.columns if c != "is_placeholder"]
         st.dataframe(
             df_investors[display_cols],
@@ -443,7 +446,7 @@ KOSPI 200 Derivatives Market Data
 - Open Interest (OI): {oi_val:,} contracts (Daily Change: {oi_delta:+,} contracts)
 - Market Phase: {m_phase}
 - COT OI Index: {cot_oi_idx:.1f} (0=Extreme Oversold, 100=Extreme Overbought)
-- Investor Data Quality: {"PLACEHOLDER (EXAMPLE DATA, not real)" if inv_is_placeholder else "REAL"}
+- Investor Data Quality: {"PLACEHOLDER (EXAMPLE DATA, not real)" if inv_is_placeholder else "REAL (Daum unofficial)"}
 
 Analyze the above data according to the KRX_DERIVATIVES_PROMPT rules and output
 the full 4-part structured report with Markdown tables and action playbook.
