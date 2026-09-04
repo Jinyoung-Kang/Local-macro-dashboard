@@ -19,45 +19,39 @@ from services.cot_service import fetch_cftc_cot_legacy, CFTCTransientError, COT_
 
 
 def _get_next_cftc_release_notice(cot_date, now_kst: datetime) -> str:
-    """
-    CFTC는 매주 금요일 15:30 ET(한국시간 익일 새벽 4:30경)에
-    그 전주 화요일 데이터를 발표합니다.
-
-    현재 최신 공시일(cot_date)이 이번 주 화요일보다 오래됐다면,
-    아직 이번 주 금요일 발표가 이루어지지 않은 것이므로
-    다음 발표 예정 시각을 안내 문구로 반환합니다.
-
-    이미 이번 주 화요일 기준 데이터까지 확보된 경우에는
-    빈 문자열을 반환해 별도 안내를 표시하지 않습니다.
-    """
     et = ZoneInfo("America/New_York")
     now_et = now_kst.astimezone(et)
 
-    # 이번 주 월요일 날짜 (weekday(): 월=0 ~ 일=6)
-    this_week_monday = now_et.date() - timedelta(days=now_et.weekday())
-    this_week_tuesday = this_week_monday + timedelta(days=1)
-    this_week_friday = this_week_monday + timedelta(days=4)
+    # 오늘 이전(또는 오늘)에 가장 최근으로 지난 화요일을 구합니다.
+    # weekday(): 월=0, 화=1, ..., 일=6
+    days_since_tuesday = (now_et.weekday() - 1) % 7
+    latest_tuesday = now_et.date() - timedelta(days=days_since_tuesday)
 
-    this_week_friday_release_et = datetime.combine(
-        this_week_friday,
+    latest_friday_release = latest_tuesday + timedelta(days=3)
+    latest_friday_release_et = datetime.combine(
+        latest_friday_release,
         datetime.min.time(),
         tzinfo=et,
     ).replace(hour=15, minute=30)
 
-    this_week_friday_release_kst = this_week_friday_release_et.astimezone(
+    latest_friday_release_kst = latest_friday_release_et.astimezone(
         ZoneInfo("Asia/Seoul")
     )
 
-    if cot_date < this_week_tuesday:
+    # 아직 이번 주기 금요일 발표 시각이 되지 않았다면,
+    # 최신 데이터가 지난 화요일 기준이라도 정상입니다.
+    if now_et < latest_friday_release_et:
+        return ""
+
+    if cot_date < latest_tuesday:
         return (
-            f"다음 CFTC COT 발표 예정: {this_week_friday_release_et.strftime('%Y-%m-%d')} "
-            f"15:30 ET (한국시간 {this_week_friday_release_kst.strftime('%Y-%m-%d %H:%M')} KST) · "
-            f"{this_week_tuesday.strftime('%Y-%m-%d')}(화) 기준 데이터가 아직 공시되지 않았습니다. "
+            f"다음 CFTC COT 발표 예정: {latest_friday_release_et.strftime('%Y-%m-%d')} "
+            f"15:30 ET (한국시간 {latest_friday_release_kst.strftime('%Y-%m-%d %H:%M')} KST) · "
+            f"{latest_tuesday.strftime('%Y-%m-%d')}(화) 기준 데이터가 아직 공시되지 않았습니다. "
             "CFTC COT는 매주 화요일 포지션을 3영업일 뒤인 금요일 오후에 발표하는 "
             "구조적 지연이 있어 정상적인 상태입니다."
         )
     return ""
-
 
 def render_cot_view():
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
