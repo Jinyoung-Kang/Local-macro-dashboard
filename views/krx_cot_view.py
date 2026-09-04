@@ -111,7 +111,7 @@ def render_krx_cot_view():
         else str(latest["Date"])[:10]
     )
 
-    # [신규] 다음 KRX 데이터 공시 예정 안내
+    # 다음 KRX 데이터 공시 예정 안내
     publish_notice = _get_next_krx_publish_info(data_date_str, now_kst)
     if publish_notice:
         st.caption(f"ℹ️ {publish_notice}")
@@ -125,18 +125,19 @@ def render_krx_cot_view():
         except Exception:
             return fallback
 
-    fut_close = safe_val(latest.get("FuturesClose"), safe_val(prev.get("FuturesClose"), 365.20))
-    chg_pct = safe_val(latest.get("ChangePct"), 0.0)
+    # [수정] 실제 컬럼명(Futures_Close 등, 스네이크 케이스)으로 참조합니다.
+    fut_close = safe_val(latest.get("Futures_Close"), safe_val(prev.get("Futures_Close"), 365.20))
+    chg_pct = safe_val(latest.get("Change_Pct"), 0.0)
 
-    raw_basis = latest.get("MarketBasis")
+    raw_basis = latest.get("Market_Basis")
     m_basis = float(raw_basis) if raw_basis is not None and not pd.isna(raw_basis) else np.nan
     basis_is_missing = pd.isna(m_basis)
 
-    oi_val = int(safe_val(latest.get("OpenInterest"), safe_val(prev.get("OpenInterest"), 285000)))
-    oi_prev_val = int(safe_val(prev.get("OpenInterest"), oi_val))
-    oi_delta = int(safe_val(latest.get("OIChange"), oi_val - oi_prev_val))
-    m_phase = str(latest.get("MarketPhase", "Long Accumulation"))
-    cot_oi_idx = safe_val(latest.get("COTOIIndex"), 50.0)
+    oi_val = int(safe_val(latest.get("Open_Interest"), safe_val(prev.get("Open_Interest"), 285000)))
+    oi_prev_val = int(safe_val(prev.get("Open_Interest"), oi_val))
+    oi_delta = int(safe_val(latest.get("OI_Change"), oi_val - oi_prev_val))
+    m_phase = str(latest.get("Market_Phase", "Long Accumulation"))
+    cot_oi_idx = safe_val(latest.get("COT_OI_Index"), 50.0)
 
     estimate_suffix = " (추정)" if hist_is_estimated else ""
 
@@ -147,7 +148,7 @@ def render_krx_cot_view():
                     font-size:0.88rem; color:#8B949E; display:flex;
                     justify-content:space-between; align-items:center;">
             <span>📅 기준일: <strong style="color:#58A6FF;">{data_date_str}{estimate_suffix}</strong></span>
-            <span>🏷️ <strong>{latest.get('ContractName', 'KOSPI 200')}</strong></span>
+            <span>🏷️ <strong>{latest.get('Contract_Name', 'KOSPI 200')}</strong></span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -200,10 +201,10 @@ def render_krx_cot_view():
     # ==========================================================================
     # 차트: KOSPI 200 선물 가격 & 미결제약정(OI) 추이
     #
-    # [수정] 선물 종가(약 300~450pt)와 미결제약정(약 10만~20만 계약)은
-    # 스케일 차이가 커서 같은 y축에 그리면 한쪽이 거의 보이지 않습니다.
-    # make_subplots의 specs에 secondary_y=True를 명시하고, add_trace 시
-    # secondary_y 파라미터로 실제 이중 y축을 구성해 가독성을 확보합니다.
+    # 선물 종가(약 300~450pt)와 미결제약정(약 10만~20만 계약)은 스케일 차이가
+    # 커서 같은 y축에 그리면 한쪽이 거의 보이지 않습니다. make_subplots의
+    # specs에 secondary_y=True를 명시하고, add_trace 시 secondary_y 파라미터로
+    # 실제 이중 y축을 구성해 가독성을 확보합니다.
     # ==========================================================================
     st.markdown(f"#### 📈 KOSPI 200 선물 가격 & 미결제약정(OI) 추이{estimate_suffix}")
 
@@ -229,7 +230,7 @@ def render_krx_cot_view():
     fig.add_trace(
         go.Scatter(
             x=df_hist["Date"],
-            y=df_hist["FuturesClose"].fillna(fut_close),
+            y=df_hist["Futures_Close"].fillna(fut_close),
             name="선물 종가 (pt)",
             line=dict(color="#58A6FF", width=2.5),
             mode="lines+markers",
@@ -243,7 +244,7 @@ def render_krx_cot_view():
     fig.add_trace(
         go.Scatter(
             x=df_hist["Date"],
-            y=df_hist["OpenInterest"].fillna(oi_val),
+            y=df_hist["Open_Interest"].fillna(oi_val),
             name="미결제약정 (OI)",
             line=dict(color="#E3B341", width=2, dash="dot"),
             mode="lines",
@@ -253,7 +254,7 @@ def render_krx_cot_view():
         secondary_y=True,
     )
 
-    basis_series = df_hist["MarketBasis"]
+    basis_series = df_hist["Market_Basis"]
     basis_colors = [
         "#238636" if pd.notna(b) and b >= 0
         else "#DA3633" if pd.notna(b)
@@ -397,17 +398,18 @@ def render_krx_cot_view():
                 "실제 투자자별 파생 수급 데이터가 연동되면 자동으로 교체됩니다."
             )
 
+        # [수정] 실제 한글 컬럼명(투자 주체/당일 순매수/5일 누적/20일 누적/포지션 성향)
         display_cols = [c for c in df_investors.columns if c != "is_placeholder"]
         st.dataframe(
             df_investors[display_cols],
             use_container_width=True,
             hide_index=True,
             column_config={
-                "투자자구분": st.column_config.TextColumn(width="medium"),
+                "투자 주체": st.column_config.TextColumn(width="medium"),
                 "당일 순매수": st.column_config.NumberColumn(format="%d", width="small"),
                 "5일 누적": st.column_config.NumberColumn(format="%d", width="small"),
                 "20일 누적": st.column_config.NumberColumn(format="%d", width="small"),
-                "포지션 상태": st.column_config.TextColumn(width="medium"),
+                "포지션 성향": st.column_config.TextColumn(width="medium"),
             },
         )
 
@@ -435,7 +437,7 @@ KOSPI 200 Derivatives Market Data
 - Date: {data_date_str}
 - Analysis Time: {now_str}
 - Data Quality: {"ESTIMATED/PROXY (not official KRX data)" if hist_is_estimated else "OFFICIAL KRX DATA"}
-- Target: {latest.get('ContractName', 'KOSPI 200')}
+- Target: {latest.get('Contract_Name', 'KOSPI 200')}
 - Futures Close: {fut_close:,.2f} pt ({chg_pct:+.2f}%)
 - Market Basis: {"N/A" if basis_is_missing else f"{m_basis:.2f} pt"}
 - Open Interest (OI): {oi_val:,} contracts (Daily Change: {oi_delta:+,} contracts)
