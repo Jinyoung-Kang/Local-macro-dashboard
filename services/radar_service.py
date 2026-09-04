@@ -15,6 +15,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
+import numpy as np 
 
 from services.ls_service import call_ls_api
 from services.kis_service import call_kis_api
@@ -1493,6 +1494,170 @@ def estimate_flow_by_price_volume_heuristic(stock_code: str, start_date_obj, end
     return pd.DataFrame()
 
 
+# ==============================================================================
+# Daum 종목별 외국인/기관 실제 누적 수급 수집
+# ==============================================================================
+DAUM_STOCK_INVESTOR_URL = "https://finance.daum.net/api/investor/days"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_daum_stock_investor_flow(
+    stock_code: str,
+    start_date_obj,
+    end_date_obj,
+) -> pd.DataFrame:
+    """
+    Daum 금융 종목별 외국인/기관 매매 페이지의 실제 내부 API에서
+    일별 외국인·기관 순매수(수량)와 종가를 가져와 기준일 대비 누적치를
+    직접 계산합니다.
+
+    실제 확인된 엔드포인트:
+        https://finance.daum.net/api/investor/days
+        ?page=1&perPage=30&symbolCode=A005930&pagination=true
+
+    실제 확인된 응답 필드:
+        date, foreignStraightPurchaseVolume, institutionStraightPurchaseVolume,
+        tradePrice, foreignOwnShares, foreignOwnSharesRate
+
+    주의:
+    - 개인(리테일) 순매수는 이 API가 직접 제공하지 않습니다.
+      역산해서 만들어내지 않고, 외국인·기관만 정확하게 표시합니다.
+    - Daum 공식 API가 아닌 웹페이지 내부 요청이므로, 페이지 구조 변경 시
+      실패할 수 있습니다.
+    - 실패 시 빈 DataFrame을 반환하며, 호출부는 반드시 pykrx 등 기존
+      폴백 경로를 유지해야 합니다.
+    """
+    symbol_code = stock_code if stock_code.startswith("A") else f"A{stock_code}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/18.0 Safari/605.1.15"
+        ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": f"https://finance.daum.net/quotes/{symbol_code}",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    lookback_days = (
+        datetime.now(ZoneInfo("Asia/Seoul")).date() - start_date_obj
+    ).days
+    per_page = max(min(int(lookback_days * 1.6) + 10, 300), 60)
+
+    all_rows = []
+    page = 1
+    max_pages = 6
+
+    try:
+        while page <= max_pages:
+            response = requests.get(
+                DAUM_STOCK_INVESTOR_URL,
+                headers=headers,
+                params={
+                    "page": page,
+                    "perPage": per_page,
+                    "symbolCode": symbol_code,
+                    "pagination": "true",
+                },
+                timeout=10,
+            )
+
+            if response.status_code != 200:
+                logger.warning(
+                    "Daum 종목별 투자자 수급 API HTTP 실패: code=%s, status=%s",
+                    symbol_code,
+                    response.status_code,
+                )
+                break
+
+            payload = response.json()
+            rows = payload.get("data", [])
+            if not isinstance(rows, list) or not rows:
+                break
+
+            all_rows.extend(rows)
+
+            oldest_date_str = rows[-1].get("date", "")
+            try:
+                oldest_date = pd.to_datetime(oldest_date_str).date()
+            except Exception:
+                oldest_date = None
+
+            if oldest_date is not None and oldest_date <= start_date_obj:
+                break
+
+            total_pages = payload.get("totalPages", page)
+            if page >= total_pages:
+                break
+
+            page += 1
+
+        if not all_rows:
+            logger.warning(
+                "Daum 종목별 투자자 수급 API 빈 응답: code=%s", symbol_code
+            )
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_rows)
+        df["Date"] = pd.to_datetime(df["date"])
+        df = df.drop_duplicates(subset="Date").sort_values("Date").reset_index(drop=True)
+
+        df = df.rename(columns={
+            "tradePrice": "Close",
+            "foreignStraightPurchaseVolume": "Foreigner",
+            "institutionStraightPurchaseVolume": "Institution",
+        })
+
+        for col in ["Close", "Foreigner", "Institution"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+        mask = (
+            (df["Date"].dt.date >= start_date_obj)
+            & (df["Date"].dt.date <= end_date_obj)
+        )
+        df = df.loc[mask].reset_index(drop=True)
+
+        if df.empty:
+            logger.warning(
+                "Daum 종목별 투자자 수급: 요청 기간 내 데이터 없음. code=%s, %s~%s",
+                symbol_code,
+                start_date_obj,
+                end_date_obj,
+            )
+            return pd.DataFrame()
+
+        df["Foreigner_Cum"] = df["Foreigner"].cumsum()
+        df["Institution_Cum"] = df["Institution"].cumsum()
+        df["Retail_Cum"] = np.nan  # Daum은 개인 순매수를 직접 제공하지 않음
+
+        df["is_estimated"] = False
+        df["cross_validated"] = False
+        df["source"] = "Daum 종목별 외국인/기관 실데이터 (비공식, 개인 미제공)"
+
+        logger.info(
+            "Daum 종목별 투자자 수급 수집 성공: code=%s, rows=%s, %s~%s",
+            symbol_code,
+            len(df),
+            df["Date"].min().date(),
+            df["Date"].max().date(),
+        )
+
+        return df[[
+            "Date", "Close", "Foreigner", "Institution",
+            "Foreigner_Cum", "Institution_Cum", "Retail_Cum",
+            "is_estimated", "cross_validated", "source",
+        ]]
+
+    except Exception as e:
+        logger.warning(
+            "Daum 종목별 투자자 수급 수집 실패: code=%s, error=%s", symbol_code, e
+        )
+        return pd.DataFrame()
+
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
     """
@@ -1506,6 +1671,11 @@ def get_stock_cumulative_flow_from_base(stock_code: str, start_date_obj, end_dat
     3. pykrx 자체가 실패하면 Daum 단독 데이터를 사용(단일 소스로 명시)
     4. 둘 다 실패하면 가격/거래량 기반 추정치(is_estimated=True)로 대체
     """
+
+    daum_df = fetch_daum_stock_investor_flow(stock_code, start_date_obj, end_date_obj)
+    if daum_df is not None and not daum_df.empty:
+        return daum_df
+    
     ticker_code = stock_code.replace('.KS', '').replace('.KQ', '')
     start_str = start_date_obj.strftime("%Y%m%d")
     end_str = end_date_obj.strftime("%Y%m%d")
