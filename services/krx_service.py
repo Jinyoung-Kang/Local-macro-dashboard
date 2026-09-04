@@ -4,24 +4,17 @@ KRX OPEN API를 활용한 국내 파생상품(KOSPI 200 선물) 시세, 미결�
 시장 베이시스 및 투자자별 한국판 COT Index 산출 서비스 모듈
 (직전 영업일 마감 확정치 자동 동기화 & NaN 결측치 원천 차단)
 
-[수정 사항]
-1. get_krx_futures_history()의 반환 DataFrame에 'is_estimated' 컬럼 추가
-   (KODEX 200 프록시 Fallback을 사용한 경우 True로 표시)
-2. get_krx_investor_derivatives_summary()가 하드코딩된 예시 수치를 반환한다는 사실을
-   함수명·docstring·반환 DataFrame의 is_placeholder 플래그로 명확히 표시
-   (실제 KRX 투자자별 선물 데이터 API가 연동되기 전까지의 임시 조치)
-3. 선물 상품명 필터를 "코스피200|KOSPI 200"으로 좁혀 국채/달러선물 등 오탐 차단
-4. 시장 베이시스는 pykrx 웹 스크래핑(불안정) 대신 KRX Open API 지수 엔드포인트
-   (idx/kospi_dd_trd)로 코스피200 현물 지수를 조회해 직접 계산
 """
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+
 from config import get_krx_key, KRX_BASE_URL
 
 logger = logging.getLogger(__name__)
@@ -43,7 +36,7 @@ def fetch_krx_derivatives_daily(date_str: str) -> pd.DataFrame:
     url = f"{KRX_BASE_URL}/drv/fut_bydd_trd"
     headers = {
         "AUTH_KEY": auth_key,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     }
     params = {"basDd": date_str}
 
@@ -82,7 +75,7 @@ def fetch_kospi200_index_close(date_str: str) -> float:
     url = f"{KRX_BASE_URL}/idx/kospi_dd_trd"
     headers = {
         "AUTH_KEY": auth_key,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     }
     params = {"basDd": date_str}
 
@@ -212,7 +205,7 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
                             "Open_Interest": oi_val,
                             "Theory_Price": theo_val,
                             "Market_Basis": basis_val,
-                            "Contract_Name": str(row.get(name_col, "KOSPI 200 선물"))
+                            "Contract_Name": str(row.get(name_col, "KOSPI 200 선물")),
                         })
 
     # KRX 응답 부재 시 Fallback (KODEX 200 및 코스피 200 지수 프록시, is_estimated=True로 명시)
@@ -362,26 +355,158 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 4. 주체별(외인/기관/개인) 선물 수급 요약
+# 4. [신규] Daum 금융 선물(KOSPI 200) 투자주체별 매매동향 실제 데이터 수집
+# ==============================================================================
+DAUM_FUTURES_INVESTOR_URL = "https://finance.daum.net/api/investor/future/days"
+
+# Daum 응답 필드 -> 화면 표시용 (투자 주체, 원본 필드명) 매핑.
+# 순서는 Daum 원본 화면(개인 -> 외국인 -> 기관계 -> 세부기관 -> 기타법인)과
+# 유사하게 배치하되, 스마트머니 관점에서 외국인을 최상단에 둡니다.
+DAUM_FUTURES_CATEGORY_MAP = [
+    ("외국인 (스마트머니)", "foreignSettlement"),
+    ("기관계", "institutionalSettlement"),
+    ("금융투자 (차익거래)", "financialInvestment"),
+    ("보험", "insuranceInvestment"),
+    ("투신", "trustInvestment"),
+    ("은행", "bankInvestment"),
+    ("기타금융", "etcInvestment"),
+    ("연기금등", "pensionFundInvestment"),
+    ("기타법인", "etcCorporationSettlement"),
+    ("개인 (리테일)", "privateSettlement"),
+]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_daum_futures_investor_trend(lookback_days: int = 25) -> pd.DataFrame:
+    """
+    Daum 금융 '투자주체별 매매동향(선물)' 페이지의 내부 JSON API에서
+    KOSPI 200 선물 개인/외국인/기관계(및 세부: 금융투자/보험/투신/은행/
+    기타금융/연기금등)/기타법인의 일자별 순매수(계약수)를 가져와
+    당일/5일 누적/20일 누적을 계산합니다.
+
+    주의:
+    - Daum 공식 API가 아닌 웹페이지 내부 요청이므로, 페이지 구조 변경 시
+      실패할 수 있습니다.
+    - 단위는 계약수(contracts)입니다. 금액 기준이 필요하면 type=PRICE
+      파라미터를 추가로 사용해야 합니다(원 단위로 반환됨).
+    - 실패 시 빈 DataFrame을 반환하며, 호출부는 반드시
+      get_krx_investor_derivatives_summary()로 폴백해야 합니다.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/18.0 Safari/605.1.15"
+        ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://finance.daum.net/domestic/investors/DERIVATIVES",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    params = {
+        "page": 1,
+        "perPage": max(lookback_days, 20),
+        "terms": "days",
+        "pagination": "true",
+    }
+
+    try:
+        response = requests.get(
+            DAUM_FUTURES_INVESTOR_URL,
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
+
+        if response.status_code != 200:
+            logger.warning(
+                "Daum 선물 투자주체별 매매동향 API HTTP 실패: status=%s",
+                response.status_code,
+            )
+            return pd.DataFrame()
+
+        payload = response.json()
+        rows = payload.get("data", [])
+
+        if not isinstance(rows, list) or not rows:
+            logger.warning("Daum 선물 투자주체별 매매동향 API 빈 응답")
+            return pd.DataFrame()
+
+        # 응답은 최신일이 첫 번째(DESC)로 옵니다.
+        parsed_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            parsed_rows.append({
+                "date": row.get("date"),
+                **{
+                    field: row.get(field, 0)
+                    for _, field in DAUM_FUTURES_CATEGORY_MAP
+                },
+            })
+
+        if not parsed_rows:
+            return pd.DataFrame()
+
+        df_raw = pd.DataFrame(parsed_rows)
+
+        today_row = df_raw.iloc[0]
+        cum_5d = df_raw.iloc[: min(5, len(df_raw))].sum(numeric_only=True)
+        cum_20d = df_raw.iloc[: min(20, len(df_raw))].sum(numeric_only=True)
+
+        records = []
+        for label, field in DAUM_FUTURES_CATEGORY_MAP:
+            net_today = int(today_row.get(field, 0) or 0)
+            net_5d = int(cum_5d.get(field, 0) or 0)
+            net_20d = int(cum_20d.get(field, 0) or 0)
+
+            if net_20d > 0:
+                stance = "🟢 매수 우위(Long)"
+            elif net_20d < 0:
+                stance = "🔴 매도 우위(Short)"
+            else:
+                stance = "⚪ 중립"
+
+            records.append({
+                "투자 주체": label,
+                "당일 순매수": net_today,
+                "5일 누적": net_5d,
+                "20일 누적": net_20d,
+                "포지션 성향": stance,
+            })
+
+        df_result = pd.DataFrame(records)
+        df_result["is_placeholder"] = False
+
+        logger.info(
+            "Daum 선물 투자주체별 매매동향 수집 성공: rows=%s, 기준일=%s",
+            len(df_result),
+            today_row.get("date"),
+        )
+
+        return df_result
+
+    except Exception as e:
+        logger.warning("Daum 선물 투자주체별 매매동향 수집 실패: %s", e)
+        return pd.DataFrame()
+
+
+# ==============================================================================
+# 5. 주체별(외인/기관/개인) 선물 수급 요약 — Daum 실데이터 실패 시 폴백 placeholder
 # ==============================================================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_krx_investor_derivatives_summary() -> pd.DataFrame:
     """
-    ⚠️ 중요 안내: 이 함수는 아직 KRX 실제 투자자별 선물 거래 API와 연동되지 않았습니다.
-    아래 수치는 화면 레이아웃 검증을 위한 예시(placeholder) 데이터이며,
-    날짜가 바뀌어도 값이 변하지 않는 고정값입니다. 실제 KRX 공시 투자자별 순매수
-    데이터가 아니므로 투자 판단에 절대 사용하지 마십시오.
+    ⚠️ 중요 안내: 이 함수는 KRX 실제 투자자별 선물 거래 API와 연동되지 않은
+    고정 예시(placeholder) 데이터입니다. fetch_daum_futures_investor_trend()가
+    Daum 실데이터 수집에 실패했을 때의 최종 폴백으로만 사용해야 합니다.
 
     반환 DataFrame에는 'is_placeholder' 컬럼이 항상 True로 포함되며,
     호출하는 화면(views/krx_cot_view.py)은 이 값을 반드시 확인하여
     사용자에게 경고를 표시해야 합니다.
-
-    TODO: KRX Data Marketplace 구독형 데이터 또는 자체 보유 증권사 API(KIS/LS)의
-    투자자별 선물 거래 실적 엔드포인트가 확보되면 이 함수를 실제 데이터 수집
-    로직으로 교체해야 합니다.
     """
     logger.warning(
-        "get_krx_investor_derivatives_summary(): 실제 API 미연동, "
+        "get_krx_investor_derivatives_summary(): Daum 실데이터 수집 실패로 "
         "고정 예시(placeholder) 데이터를 반환합니다."
     )
 
@@ -394,7 +519,7 @@ def get_krx_investor_derivatives_summary() -> pd.DataFrame:
         "🟢 강한 상방(Long)",
         "🔴 매도/차익 헤지",
         "⚪ 중립/분할 헤지",
-        "🔵 하방(Short) 베팅"
+        "🔵 하방(Short) 베팅",
     ]
 
     df = pd.DataFrame({
