@@ -98,7 +98,7 @@ def render_krx_cot_view():
     # 하나의 툴바처럼 보이도록 정돈했습니다.
     # ==========================================================================
     with st.container(border=True):
-        c1, c2, c3 = st.columns([1.3, 2.2, 1])
+        c1, c2, c3, c4 = st.columns([1.2, 1.3, 1.8, 1])
         with c1:
             lookback_days = st.selectbox(
                 "조회 기간 (일)",
@@ -106,12 +106,36 @@ def render_krx_cot_view():
                 index=1,
                 help="최근 며칠간의 KOSPI 200 선물 데이터를 조회할지 선택합니다.",
             )
+    
         with c2:
-            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-            st.caption(f"⏰ 시스템 현재 시각: {now_str}")
+            investor_measure_label = st.radio(
+                "수급 표시 기준",
+                options=["계약수", "금액(억원)"],
+                horizontal=True,
+                index=0,
+                key="krx_investor_measure",
+                help=(
+                    "계약수는 순매수 계약 수량입니다. "
+                    "금액은 Daum 원 단위 응답을 억 원으로 변환한 순매수 금액입니다."
+                ),
+            )
+    
         with c3:
-            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-            if st.button("🔄 최신 데이터 새로고침", use_container_width=True):
+            st.markdown(
+                "<div style='height:28px'></div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(f"⏰ 시스템 현재 시각: {now_str}")
+    
+        with c4:
+            st.markdown(
+                "<div style='height:28px'></div>",
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "🔄 최신 데이터 새로고침",
+                width="stretch",
+            ):
                 st.cache_data.clear()
                 st.rerun()
 
@@ -119,7 +143,16 @@ def render_krx_cot_view():
 
     # Daum 선물 투자주체별 매매동향(실제 데이터)을 우선 사용하고,
     # 수집에 실패하면 기존 placeholder 데이터로 안전하게 폴백합니다.
-    df_investors = fetch_daum_futures_investor_trend(lookback_days=25)
+    investor_measure = (
+        "PRICE"
+        if investor_measure_label == "금액(억원)"
+        else "CONTRACT"
+    )
+    
+    df_investors = fetch_daum_futures_investor_trend(
+        lookback_days=25,
+        measure=investor_measure,
+    )
     if df_investors is None or df_investors.empty:
         df_investors = get_krx_investor_derivatives_summary()
 
@@ -599,7 +632,10 @@ def render_krx_cot_view():
         )
 
     with col_right:
-        st.markdown("#### 🌍 투자자별 파생 수급 (외국인/기관/개인)")
+        st.markdown(
+            f"#### 🌍 투자자별 파생 수급 "
+            f"({investor_measure_label})"
+        )
 
         inv_is_placeholder = (
             bool(df_investors["is_placeholder"].iloc[0])
@@ -612,23 +648,74 @@ def render_krx_cot_view():
                 "Daum 실시간 데이터 수집에 실패하여 예시값으로 대체되었습니다."
             )
         else:
+            if investor_measure == "PRICE":
+                measure_caption = (
+                    "금액 기준: Daum 원 단위 응답을 억 원 단위로 변환해 표시합니다."
+                )
+            else:
+                measure_caption = (
+                    "계약수 기준: 투자주체별 KOSPI 200 선물 순매수 계약 수량입니다."
+                )
+            
             st.caption(
-                "📡 출처: Daum 금융 비공식 API (finance.daum.net/api/investor/future/days). "
-                "KRX 공식 API가 아니므로 페이지 구조 변경 시 수집이 실패할 수 있습니다. "
-                "단위: 계약수."
+                "📡 출처: Daum 금융 비공식 API "
+                "(finance.daum.net/api/investor/future/days). "
+                f"{measure_caption} "
+                "KRX 공식 API가 아니므로 페이지 구조 변경 시 수집이 실패할 수 있습니다."
             )
 
-        display_cols = [c for c in df_investors.columns if c != "is_placeholder"]
+        # data_measure, data_unit, data_date는 화면 표시용 메타데이터이므로 제외합니다.
+        hidden_columns = {
+            "is_placeholder",
+            "data_measure",
+            "data_unit",
+            "data_date",
+        }
+        
+        display_cols = [
+            column
+            for column in df_investors.columns
+            if column not in hidden_columns
+        ]
+        
+        if investor_measure == "PRICE":
+            numeric_format = "%+.1f"
+            unit_suffix = "(억 원)"
+        else:
+            numeric_format = "%+d"
+            unit_suffix = "(계약)"
+        
+        display_df = df_investors[display_cols].copy()
+        
+        display_df = display_df.rename(columns={
+            "당일 순매수": f"당일 순매수 {unit_suffix}",
+            "5일 누적": f"5일 누적 {unit_suffix}",
+            "20일 누적": f"20일 누적 {unit_suffix}",
+        })
+        
         st.dataframe(
-            df_investors[display_cols],
-            use_container_width=True,
+            display_df,
+            width="stretch",
             hide_index=True,
             column_config={
-                "투자 주체": st.column_config.TextColumn(width="medium"),
-                "당일 순매수": st.column_config.NumberColumn(format="%d", width="small"),
-                "5일 누적": st.column_config.NumberColumn(format="%d", width="small"),
-                "20일 누적": st.column_config.NumberColumn(format="%d", width="small"),
-                "포지션 성향": st.column_config.TextColumn(width="medium"),
+                "투자 주체": st.column_config.TextColumn(
+                    width="medium",
+                ),
+                f"당일 순매수 {unit_suffix}": st.column_config.NumberColumn(
+                    format=numeric_format,
+                    width="small",
+                ),
+                f"5일 누적 {unit_suffix}": st.column_config.NumberColumn(
+                    format=numeric_format,
+                    width="small",
+                ),
+                f"20일 누적 {unit_suffix}": st.column_config.NumberColumn(
+                    format=numeric_format,
+                    width="small",
+                ),
+                "포지션 성향": st.column_config.TextColumn(
+                    width="medium",
+                ),
             },
         )
 
