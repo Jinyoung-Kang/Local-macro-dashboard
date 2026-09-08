@@ -43,7 +43,13 @@ def render_krx_cot_view():
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     now_str = now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
 
+    # ==========================================================================
     # 상단 헤더
+    # [수정] 기존에 이 자리에 있던 일반 마크다운 4행 국면표(신규 롱/신규 숏/
+    # 숏 커버링/롱 청산)는 화면 하단의 색상 강조 "OI 4대 국면 해석표"와
+    # 내용이 완전히 중복되어 가독성을 해쳤습니다. 여기서는 한 줄 범례로
+    # 축약하고, 상세 표는 하단에서 한 번만 보여줍니다.
+    # ==========================================================================
     st.markdown(
         """
         <div style="padding: 4px 0 12px 0;">
@@ -55,13 +61,25 @@ def render_krx_cot_view():
                 스마트머니(외국인) 포지션 분석
             </p>
         </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        |국면|가격|OI|해석|
-        |--|--|--|--|
-        |신규 롱|▲|▲|강한 상승 추세 확산|
-        |신규 숏|▼|▲|강한 하락 압력 확산|
-        |숏 커버링|▲|▼|일시적 반등|
-        |롱 청산|▼|▼|기존 롱 손절/바닥 다지기|
+    st.markdown(
+        """
+        <div style="background-color:#161B22; border:1px solid #30363D;
+                    border-radius:8px; padding:10px 16px; margin-bottom:16px;
+                    font-size:0.86rem; color:#8B949E; display:flex;
+                    flex-wrap:wrap; align-items:center; gap:18px;">
+            <span style="color:#F0F6FC; font-weight:600;">📖 국면 요약</span>
+            <span><span style="color:#3FB950;">▲가격 ▲OI</span> 신규 롱</span>
+            <span><span style="color:#F85149;">▼가격 ▲OI</span> 신규 숏</span>
+            <span><span style="color:#D29922;">▲가격 ▼OI</span> 숏 커버링</span>
+            <span><span style="color:#8B949E;">▼가격 ▼OI</span> 롱 청산</span>
+            <span style="margin-left:auto; color:#58A6FF; cursor:default;">
+                ↓ 상세 해석표는 아래 참고
+            </span>
+        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -73,26 +91,32 @@ def render_krx_cot_view():
             "KODEX 200(069500.KS) 프록시 데이터로 대체하여 표시합니다."
         )
 
-    c1, c2, c3 = st.columns([1.5, 2, 1])
-    with c1:
-        lookback_days = st.selectbox(
-            "조회 기간",
-            options=[20, 40, 60, 90],
-            index=1,
-            help="최근 며칠간의 KOSPI 200 선물 데이터를 조회할지 선택합니다.",
-        )
-    with c2:
-        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        st.caption(f"⏰ 시스템 현재 시각: {now_str}")
-    with c3:
-        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        if st.button("🔄 최신 데이터 새로고침", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    # ==========================================================================
+    # 조회 조건
+    # [수정] 카드형 컨테이너로 묶어 조회 기간/현재 시각/새로고침 버튼이
+    # 하나의 툴바처럼 보이도록 정돈했습니다.
+    # ==========================================================================
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([1.3, 2.2, 1])
+        with c1:
+            lookback_days = st.selectbox(
+                "조회 기간 (일)",
+                options=[20, 40, 60, 90],
+                index=1,
+                help="최근 며칠간의 KOSPI 200 선물 데이터를 조회할지 선택합니다.",
+            )
+        with c2:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            st.caption(f"⏰ 시스템 현재 시각: {now_str}")
+        with c3:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if st.button("🔄 최신 데이터 새로고침", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
 
     df_hist = get_krx_futures_history(days=lookback_days)
 
-    # [수정] Daum 선물 투자주체별 매매동향(실제 데이터)을 우선 사용하고,
+    # Daum 선물 투자주체별 매매동향(실제 데이터)을 우선 사용하고,
     # 수집에 실패하면 기존 placeholder 데이터로 안전하게 폴백합니다.
     df_investors = fetch_daum_futures_investor_trend(lookback_days=25)
     if df_investors is None or df_investors.empty:
@@ -104,14 +128,6 @@ def render_krx_cot_view():
 
     hist_is_estimated = bool(df_hist["is_estimated"].iloc[-1]) if "is_estimated" in df_hist.columns else True
 
-    if hist_is_estimated:
-        st.error(
-            "⚠️ KRX OpenAPI 실제 데이터를 가져오지 못해, KODEX 200(069500.KS) "
-            "프록시 추정치를 표시합니다. KOSPI 200 선물의 실제 확정 수급과 다를 수 있습니다."
-        )
-    else:
-        st.caption("✅ KRX OpenAPI 실제 데이터입니다.")
-
     latest = df_hist.iloc[-1]
     prev = df_hist.iloc[-2] if len(df_hist) > 1 else latest
     data_date_str = (
@@ -120,7 +136,40 @@ def render_krx_cot_view():
         else str(latest["Date"])[:10]
     )
 
+    # ==========================================================================
+    # [수정] 데이터 품질 + 기준일 안내를 하나의 상태 바로 통합
+    # 기존에는 "✅/⚠️ 데이터 품질" 캡션과 "📅 기준일" 박스가 따로 떨어져
+    # 있었습니다. 하나의 정보 바로 합쳐 위→아래 스캔 흐름을 줄였습니다.
+    # ==========================================================================
+    estimate_suffix = " (추정)" if hist_is_estimated else ""
+    quality_icon = "⚠️" if hist_is_estimated else "✅"
+    quality_text = (
+        "KRX OpenAPI 실제 데이터를 가져오지 못해 KODEX 200(069500.KS) 프록시 추정치를 표시 중"
+        if hist_is_estimated
+        else "KRX OpenAPI 실제 데이터"
+    )
+    quality_color = "#D29922" if hist_is_estimated else "#3FB950"
+
     publish_notice = _get_next_krx_publish_info(data_date_str, now_kst)
+
+    st.markdown(
+        f"""
+        <div style="background-color:#161B22; border:1px solid #30363D;
+                    border-radius:6px; padding:10px 16px; margin-bottom:14px;
+                    font-size:0.88rem; display:flex; flex-wrap:wrap;
+                    justify-content:space-between; align-items:center; gap:8px;">
+            <span style="color:{quality_color};">
+                {quality_icon} <strong>{quality_text}</strong>
+            </span>
+            <span style="color:#8B949E;">
+                📅 기준일: <strong style="color:#58A6FF;">{data_date_str}{estimate_suffix}</strong>
+                &nbsp;|&nbsp; 🏷️ <strong>{latest.get('Contract_Name', 'KOSPI 200')}</strong>
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     if publish_notice:
         st.caption(f"ℹ️ {publish_notice}")
 
@@ -146,21 +195,9 @@ def render_krx_cot_view():
     m_phase = str(latest.get("Market_Phase", "Long Accumulation"))
     cot_oi_idx = safe_val(latest.get("COT_OI_Index"), 50.0)
 
-    estimate_suffix = " (추정)" if hist_is_estimated else ""
-
-    st.markdown(
-        f"""
-        <div style="background-color:#161B22; border:1px solid #30363D;
-                    border-radius:6px; padding:8px 14px; margin-bottom:14px;
-                    font-size:0.88rem; color:#8B949E; display:flex;
-                    justify-content:space-between; align-items:center;">
-            <span>📅 기준일: <strong style="color:#58A6FF;">{data_date_str}{estimate_suffix}</strong></span>
-            <span>🏷️ <strong>{latest.get('Contract_Name', 'KOSPI 200')}</strong></span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+    # ==========================================================================
+    # 핵심 지표 카드
+    # ==========================================================================
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric(
