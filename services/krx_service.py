@@ -6,19 +6,17 @@ KRX OPEN API를 활용한 국내 파생상품(KOSPI 200 선물) 시세, 미결�
 
 """
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
-
 from config import get_krx_key, KRX_BASE_URL
 
 logger = logging.getLogger(__name__)
-
 
 # ==============================================================================
 # 1. KRX OPEN API 통신 엔진
