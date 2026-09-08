@@ -174,8 +174,7 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
         if close_val <= 0:
             return None
 
-        return {
-            "date_str": d_str,
+        return {            
             "Date": pd.to_datetime(d_str, format="%Y%m%d"),
             "Futures_Close": close_val,
             "Change_Pct": safe_float(row.get("FLUC_RT", 0)),
