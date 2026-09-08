@@ -600,29 +600,138 @@ def render_radar_view():
                         },
                     )
     
-                reason_col1, reason_col2 = st.columns(2)
+                            # --------------------------------------------------------------
+            # 확증 요인 / 주의 요인
+            # 기존 st.success(), st.warning() 반복 표시 대신 한 개의
+            # HTML 카드로 묶어 세로 길이를 줄이고 정보 밀도를 높입니다.
+            # --------------------------------------------------------------
+            reason_col1, reason_col2 = st.columns(2)
+
+            with reason_col1:
+                st.markdown("##### ✅ 확증 요인")
+
+                if confirmation["positive_reasons"]:
+                    positive_items = "".join(
+                        f"""
+                        <div style="
+                            padding:8px 10px;
+                            border-bottom:1px solid rgba(63,185,80,0.18);
+                            color:#7EE787;
+                            font-size:0.90rem;
+                        ">
+                            ✓ {reason}
+                        </div>
+                        """
+                        for reason in confirmation["positive_reasons"]
+                    )
+
+                    st.markdown(
+                        f"""
+                        <div style="
+                            background-color:rgba(35,134,54,0.18);
+                            border:1px solid rgba(63,185,80,0.35);
+                            border-radius:8px;
+                            overflow:hidden;
+                        ">
+                            {positive_items}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption(
+                        "강한 동일 방향 수급 확증 요인이 아직 확인되지 않았습니다."
+                    )
+
+            with reason_col2:
+                st.markdown("##### ⚠️ 주의 요인")
+
+                if confirmation["warning_reasons"]:
+                    warning_items = "".join(
+                        f"""
+                        <div style="
+                            padding:8px 10px;
+                            border-bottom:1px solid rgba(210,153,34,0.18);
+                            color:#D29922;
+                            font-size:0.90rem;
+                        ">
+                            ! {reason}
+                        </div>
+                        """
+                        for reason in confirmation["warning_reasons"]
+                    )
+
+                    st.markdown(
+                        f"""
+                        <div style="
+                            background-color:rgba(210,153,34,0.12);
+                            border:1px solid rgba(210,153,34,0.35);
+                            border-radius:8px;
+                            overflow:hidden;
+                        ">
+                            {warning_items}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        """
+                        <div style="
+                            background-color:#161B22;
+                            border:1px solid #30363D;
+                            border-radius:8px;
+                            padding:12px;
+                            color:#8B949E;
+                            font-size:0.90rem;
+                        ">
+                            현재 확인 가능한 주요 수급 충돌 요인이 없습니다.
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                # --------------------------------------------------------------
+                # 확증 점수 데이터 품질 / 기준일 안내
+                # Daum API가 제공하는 실제 외국인·기관 일자별 수급만 사용했음을
+                # 명확히 밝히고, 개인 수급 미제공도 함께 표시합니다.
+                # --------------------------------------------------------------
+                score_data_date = (
+                    pd.to_datetime(df_cum["Date"].max()).strftime("%Y-%m-%d")
+                    if "Date" in df_cum.columns and not df_cum.empty
+                    else "알 수 없음"
+                )
     
-                with reason_col1:
-                    st.markdown("##### ✅ 확증 요인")
-    
-                    if confirmation["positive_reasons"]:
-                        for reason in confirmation["positive_reasons"]:
-                            st.success(reason)
-                    else:
-                        st.caption(
-                            "강한 동일 방향 수급 확증 요인이 아직 확인되지 않았습니다."
-                        )
-    
-                with reason_col2:
-                    st.markdown("##### ⚠️ 주의 요인")
-    
-                    if confirmation["warning_reasons"]:
-                        for reason in confirmation["warning_reasons"]:
-                            st.warning(reason)
-                    else:
-                        st.caption(
-                            "현재 확인 가능한 주요 수급 충돌 요인이 없습니다."
-                        )
+                st.markdown(
+                    f"""
+                    <div style="
+                        margin-top:14px;
+                        background-color:#161B22;
+                        border:1px solid #30363D;
+                        border-radius:6px;
+                        padding:10px 14px;
+                        color:#8B949E;
+                        font-size:0.82rem;
+                        line-height:1.65;
+                    ">
+                        <div style="color:#58A6FF; font-weight:600;">
+                            📡 수급 확증 점수 데이터 기준
+                        </div>
+                        <div>
+                            출처: <strong style="color:#C9D1D9;">
+                            Daum 종목별 외국인/기관 일자별 수급 데이터</strong>
+                            · 기준일: <strong style="color:#58A6FF;">
+                            {score_data_date} 장 마감 후 집계</strong>
+                        </div>
+                        <div>
+                            외국인·기관 수급, 외국인 보유율 변화, 당일 거래량,
+                            시장 전체 레이더 순위를 결합해 계산합니다.
+                            개인(리테일) 순매수는 Daum이 직접 제공하지 않아 점수에 포함하지 않습니다.
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
     
                 st.caption(
                     "수급 확증 점수는 투자 추천·매매 신호가 아닙니다. "
