@@ -2,18 +2,6 @@
 services/market_scraper_service.py
 Global Macro Dashboard 전용 외부 참고 시세 수집 서비스.
 
-주의:
-- TradingView 및 Yahoo Finance의 공개 데이터 응답을 수집합니다.
-- 공식 실시간 시세 API가 아니며, 외부 제공처의 페이지 구조·접근 정책·응답 형식이
-  변경되면 수집에 실패하거나 지연될 수 있습니다.
-- 이 데이터는 기존 FRED/yfinance/공식 데이터의 대체가 아니라 비교·참고용입니다.
-- 요청 부하를 줄이기 위해 Streamlit 캐시는 60초를 사용합니다.
-
-지원 데이터:
-- 미국채 2년 / 10년 / 30년물
-- WTI / 브렌트유 / 금 현물
-- 코스피 / 닛케이225
-- 상해종합 / 항셍
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -39,6 +27,26 @@ REQUEST_HEADERS = {
     ),
 }
 
+
+
+# ==============================================================================
+# TradingView 미국채 수익률 Curve Scanner
+# ==============================================================================
+# TradingView 공개 Scanner API는 미국채 수익률을 JSON으로 제공합니다.
+# HTML 본문을 정규표현식으로 파싱하는 방식보다 응답 구조가 안정적입니다.
+TRADINGVIEW_BONDS_SCANNER_URL = (
+    "https://scanner.tradingview.com/bonds/scan"
+)
+
+TRADINGVIEW_BONDS_SCANNER_PARAMS = {
+    "label-product": "bonds-yield-curve",
+}
+
+TRADINGVIEW_US_TREASURY_SYMBOLS = {
+    "TVC:US02Y": "us02y",
+    "TVC:US10Y": "us10y",
+    "TVC:US30Y": "us30y",
+}
 
 SCRAPER_MARKETS = [
     {
@@ -215,6 +223,94 @@ def _fetch_yahoo_chart(
     previous = valid_closes[-2] if len(valid_closes) >= 2 else None
 
     return current, previous
+
+
+def _fetch_tradingview_us_treasury_yields() -> dict:
+    """
+    TradingView 공개 bonds scanner에서 미국채 2년·10년·30년 최신 수익률을
+    한 번의 JSON 요청으로 수집합니다.
+
+    실제 확인된 응답 예:
+        {
+            "s": "TVC:US02Y",
+            "d": [1000, 1, 20280831, "P2Y", 4.375, 4.199, 3.49]
+        }
+
+    d[4]는 해당 만기의 최신 수익률(%)입니다.
+    """
+    try:
+        response = requests.get(
+            TRADINGVIEW_BONDS_SCANNER_URL,
+            params=TRADINGVIEW_BONDS_SCANNER_PARAMS,
+            headers=REQUEST_HEADERS,
+            timeout=10,
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        rows = payload.get("data", [])
+
+        if not isinstance(rows, list) or not rows:
+            logger.warning("TradingView bonds scanner 응답 data가 비어 있습니다.")
+            return {}
+
+        result = {}
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            symbol = str(row.get("s", "")).strip()
+            scraper_key = TRADINGVIEW_US_TREASURY_SYMBOLS.get(symbol)
+            if not scraper_key:
+                continue
+
+            values = row.get("d", [])
+            if not isinstance(values, list) or len(values) < 5:
+                logger.warning(
+                    "TradingView bonds scanner 응답 형식이 예상과 다릅니다: "
+                    "symbol=%s, data=%s",
+                    symbol,
+                    values,
+                )
+                continue
+
+            current_yield = _to_float(values[4])
+            if current_yield is None:
+                logger.warning(
+                    "TradingView bonds scanner 수익률 값 파싱 실패: "
+                    "symbol=%s, value=%s",
+                    symbol,
+                    values[4],
+                )
+                continue
+
+            result[scraper_key] = {
+                "price": current_yield,
+                "provider": "TradingView Scanner",
+                "source": "scanner",
+                "symbol": symbol,
+            }
+
+        expected_keys = {"us02y", "us10y", "us30y"}
+        missing_keys = expected_keys - set(result.keys())
+        if missing_keys:
+            logger.warning(
+                "TradingView bonds scanner 일부 만기 수집 실패: missing=%s",
+                sorted(missing_keys),
+            )
+
+        return result
+
+    except requests.RequestException as e:
+        logger.warning("TradingView bonds scanner 통신 실패: %s", e)
+        return {}
+    except ValueError as e:
+        logger.warning("TradingView bonds scanner JSON 파싱 실패: %s", e)
+        return {}
+    except Exception as e:
+        logger.exception("TradingView bonds scanner 예외: %s", e)
+        return {}
 
 
 def _extract_previous_close(text: str) -> float | None:
@@ -837,6 +933,53 @@ def get_scraped_macro_markets() -> dict:
                     "change_pct": None,
                     "error": str(e),
                 })
+
+    # --------------------------------------------------------------------------
+    # 미국채 2Y / 10Y / 30Y는 TradingView HTML 정규표현식 파싱 결과보다
+    # 공개 bonds scanner JSON을 우선 사용합니다.
+    # Scanner 요청이 실패하면 기존 HTML 수집 결과를 그대로 유지합니다.
+    # --------------------------------------------------------------------------
+    scanner_yields = _fetch_tradingview_us_treasury_yields()
+
+    if scanner_yields:
+        for item in results:
+            scraper_key = item.get("key")
+            if scraper_key not in scanner_yields:
+                continue
+
+            scanner_item = scanner_yields[scraper_key]
+            current_price = scanner_item["price"]
+            previous_close = item.get("previous_close")
+
+            item["price"] = current_price
+            item["provider"] = "TradingView Scanner"
+            item["status"] = "ok"
+            item["error"] = None
+            item["reference_source"] = "TradingView bonds-yield-curve"
+            item["scanner_symbol"] = scanner_item["symbol"]
+
+            # Scanner 응답에서 전일 종가 필드는 확정하지 않았으므로,
+            # 기존 HTML 파서가 확보한 전일값이 있을 때만 변화율을 계산합니다.
+            if previous_close is not None and float(previous_close) != 0:
+                previous_close = float(previous_close)
+                change = current_price - previous_close
+                change_pct = (change / previous_close) * 100.0
+
+                item["previous_close"] = previous_close
+                item["change"] = change
+                item["change_pct"] = change_pct
+            else:
+                item["previous_close"] = None
+                item["change"] = None
+                item["change_pct"] = None
+
+            logger.info(
+                "TradingView Scanner 미국채 수익률 적용: "
+                "key=%s, symbol=%s, yield=%.4f",
+                scraper_key,
+                scanner_item["symbol"],
+                current_price,
+            )
 
     sort_order = {
         config["key"]: index
