@@ -18,6 +18,7 @@ import streamlit as st
 from services.radar_service import (
     get_market_radar_scanner,
     get_stock_cumulative_flow_from_base,
+    calculate_stock_flow_confirmation,
     test_kis_connection,
     test_ls_connection,
     test_pykrx_connection,
@@ -423,11 +424,33 @@ def render_radar_view():
             )
 
         if df_cum is not None and not df_cum.empty:
+            # 선택 종목이 현재 레이더 목록에서 몇 위인지 찾습니다.
+            selected_row = df_radar[
+                df_radar["종목코드"].astype(str).str.replace(
+                    "A",
+                    "",
+                    regex=False,
+                ) == selected_code.replace("A", "")
+            ]
+    
+            if selected_row.empty:
+                selected_rank = 0
+            else:
+                selected_rank = int(selected_row.iloc[0]["순위"])
+    
+            # Daum 종목별 실제 수급 데이터일 때만 확증 점수를 계산합니다.
+            confirmation = calculate_stock_flow_confirmation(
+                flow_df=df_cum,
+                rank=selected_rank,
+                top_n=top_n,
+                trade_type=trade_type_sel,
+            )
+            
             is_estimated = bool(df_cum["is_estimated"].iloc[0]) if "is_estimated" in df_cum.columns else True
             cross_validated = bool(df_cum["cross_validated"].iloc[0]) if "cross_validated" in df_cum.columns else False
             source = str(df_cum["source"].iloc[0]) if "source" in df_cum.columns else ""
 
-            # [수정] 소스별로 안내 메시지를 구분합니다.
+            # 소스별로 안내 메시지를 구분합니다.
             # Daum 종목별 실데이터는 개인(리테일)을 제공하지 않으므로 별도 안내를 표시합니다.
             has_retail = (
                 "Retail_Cum" in df_cum.columns
@@ -451,6 +474,163 @@ def render_radar_view():
 
             suffix = "(추정)" if is_estimated else "(확정)" if cross_validated else ""
 
+            # ==============================================================
+            # 종목 수급 확증 점수
+            # ==============================================================
+            st.markdown("#### 🎯 종목 수급 확증 점수")
+    
+            if not confirmation.get("available"):
+                st.info(
+                    "수급 확증 점수는 Daum 종목별 외국인·기관 실데이터가 "
+                    "확보된 경우에만 계산합니다. "
+                    f"현재 상태: {confirmation.get('reason', '데이터 미확인')}"
+                )
+            else:
+                total_score = confirmation["total_score"]
+                grade = confirmation["grade"]
+                grade_color = confirmation["grade_color"]
+    
+                grade_palette = {
+                    "green": "#3FB950",
+                    "blue": "#58A6FF",
+                    "gray": "#8B949E",
+                    "orange": "#D29922",
+                    "red": "#F85149",
+                }
+                accent_color = grade_palette.get(
+                    grade_color,
+                    "#8B949E",
+                )
+    
+                score_col1, score_col2 = st.columns([1, 2])
+    
+                with score_col1:
+                    st.markdown(
+                        f"""
+                        <div style="
+                            background-color:#161B22;
+                            border:1px solid #30363D;
+                            border-top:4px solid {accent_color};
+                            border-radius:8px;
+                            padding:16px;
+                            min-height:132px;
+                        ">
+                            <div style="
+                                color:#8B949E;
+                                font-size:0.82rem;
+                                margin-bottom:6px;
+                            ">
+                                {selected_name} · {trade_type_sel} 관점
+                            </div>
+                            <div style="
+                                color:#F0F6FC;
+                                font-size:2.0rem;
+                                font-weight:700;
+                                line-height:1.1;
+                            ">
+                                {total_score}<span style="
+                                    color:#8B949E;
+                                    font-size:0.95rem;
+                                "> / 100</span>
+                            </div>
+                            <div style="
+                                color:{accent_color};
+                                font-size:0.92rem;
+                                font-weight:600;
+                                margin-top:8px;
+                            ">
+                                {grade}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+    
+                with score_col2:
+                    score_breakdown = pd.DataFrame({
+                        "평가 요소": [
+                            "시장 전체 수급 순위",
+                            "외국인 최근 5거래일",
+                            "기관 최근 5거래일",
+                            "외국인 보유율 변화",
+                            "당일 거래량 대비 수급 강도",
+                        ],
+                        "점수": [
+                            f"{confirmation['rank_score']} / 20",
+                            f"{confirmation['foreign_score']} / 25",
+                            f"{confirmation['institution_score']} / 25",
+                            f"{confirmation['ownership_score']} / 15",
+                            f"{confirmation['intensity_score']} / 15",
+                        ],
+                        "세부 정보": [
+                            f"현재 레이더 {selected_rank}위 / Top {top_n}",
+                            (
+                                f"{confirmation['foreign_5d_sum']:+,.0f}주 · "
+                                f"{confirmation['foreign_aligned_days']}/"
+                                f"{confirmation['sample_days']}일 방향 일치"
+                            ),
+                            (
+                                f"{confirmation['institution_5d_sum']:+,.0f}주 · "
+                                f"{confirmation['institution_aligned_days']}/"
+                                f"{confirmation['sample_days']}일 방향 일치"
+                            ),
+                            (
+                                f"{confirmation['ownership_change_bp']:+.1f}bp"
+                            ),
+                            (
+                                f"{confirmation['flow_intensity_pct']:+.2f}%"
+                            ),
+                        ],
+                    })
+    
+                    st.dataframe(
+                        score_breakdown,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "평가 요소": st.column_config.TextColumn(
+                                width="medium",
+                            ),
+                            "점수": st.column_config.TextColumn(
+                                width="small",
+                            ),
+                            "세부 정보": st.column_config.TextColumn(
+                                width="large",
+                            ),
+                        },
+                    )
+    
+                reason_col1, reason_col2 = st.columns(2)
+    
+                with reason_col1:
+                    st.markdown("##### ✅ 확증 요인")
+    
+                    if confirmation["positive_reasons"]:
+                        for reason in confirmation["positive_reasons"]:
+                            st.success(reason)
+                    else:
+                        st.caption(
+                            "강한 동일 방향 수급 확증 요인이 아직 확인되지 않았습니다."
+                        )
+    
+                with reason_col2:
+                    st.markdown("##### ⚠️ 주의 요인")
+    
+                    if confirmation["warning_reasons"]:
+                        for reason in confirmation["warning_reasons"]:
+                            st.warning(reason)
+                    else:
+                        st.caption(
+                            "현재 확인 가능한 주요 수급 충돌 요인이 없습니다."
+                        )
+    
+                st.caption(
+                    "수급 확증 점수는 투자 추천·매매 신호가 아닙니다. "
+                    "Daum 종목별 외국인·기관 수량 수급, 보유율 변화, "
+                    "시장 전체 레이더 순위를 결합한 참고용 정합성 지표입니다."
+                )
+
+            
             fig_cum = make_subplots(
                 rows=2,
                 cols=1,
@@ -494,7 +674,7 @@ def render_radar_view():
                 col=1,
             )
 
-            # [수정] 개인(리테일) 데이터가 있을 때만 라인을 추가합니다.
+            # 개인(리테일) 데이터가 있을 때만 라인을 추가합니다.
             # Daum 종목별 실데이터는 개인을 제공하지 않으므로 자동으로 생략됩니다.
             if has_retail:
                 fig_cum.add_trace(
