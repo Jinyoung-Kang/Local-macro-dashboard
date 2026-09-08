@@ -576,13 +576,268 @@ def render_krx_cot_view():
     if basis_series.isna().all():
         st.caption("💡 베이시스 데이터는 pykrx 원본에서 확인되지 않아 이번 조회 기간에는 표시되지 않았습니다.")
 
-    with st.expander("📖 베이시스 & Open Interest 해석 가이드", expanded=False):
+    with st.expander(
+        "📖 OI·베이시스 해석 가이드",
+        expanded=False,
+    ):
+        st.caption(
+            "OI와 가격의 방향은 신규 포지션 유입 또는 기존 포지션 청산 가능성을 "
+            "판단하는 참고 기준입니다. 단독 지표만으로 방향성을 확정하지 말고, "
+            "현물 수급·베이시스·거래량·변동성을 함께 확인하세요."
+        )
+    
+        guide_col1, guide_col2 = st.columns([1.45, 1])
+    
+        with guide_col1:
+            st.markdown("##### OI 4대 국면")
+    
+            st.markdown(
+                """
+                <div style="
+                    border:1px solid #30363D;
+                    border-radius:8px;
+                    overflow:hidden;
+                    background-color:#161B22;
+                    font-size:0.88rem;
+                ">
+                    <table style="
+                        width:100%;
+                        border-collapse:collapse;
+                        color:#C9D1D9;
+                    ">
+                        <thead>
+                            <tr style="
+                                background-color:#21262D;
+                                color:#8B949E;
+                            ">
+                                <th style="padding:9px 10px; text-align:left;">국면</th>
+                                <th style="padding:9px 10px; text-align:center;">가격</th>
+                                <th style="padding:9px 10px; text-align:center;">OI</th>
+                                <th style="padding:9px 10px; text-align:left;">해석</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr style="border-top:1px solid #30363D;">
+                                <td style="
+                                    padding:10px;
+                                    color:#3FB950;
+                                    font-weight:700;
+                                ">
+                                    신규 롱
+                                </td>
+                                <td style="
+                                    padding:10px;
+                                    text-align:center;
+                                    color:#3FB950;
+                                    font-weight:700;
+                                ">
+                                    ▲
+                                </td>
+                                <td style="
+                                    padding:10px;
+                                    text-align:center;
+                                    color:#3FB950;
+                                    font-weight:700;
+                                ">
+                                    ▲
+                                </td>
+                                <td style="padding:10px;">
+                                    신규 매수 포지션 유입 가능성 · 상승 추세 확산
+                                </td>
+                            </tr>
+    
+                            <tr style="border-top:1px solid #30363D;">
+                                <td style="
+                                    padding:10px;
+                                    color:#F85149;
+                                    font-weight:700;
+                                ">
+                                    신규 숏
+                                </td>
+                                <td style="
+                                    padding:10px;
+                                    text-align:center;
+                                    color:#F85149;
+                                    font-weight:700;
+                                ">
+                                    ▼
+                                </td>
+                                <td style="
+                                    padding:10px;
+                                    text-align:center;
+                                    color:#3FB950;
+                                    font-weight:700;
+                                ">
+                                    ▲
+                                </td>
+                                <td style="padding:10px;">
+                                    신규 매도 포지션 유입 가능성 · 하락 압력 확대
+                                </td>
+                            </tr>
+    
+                            <tr style="border-top:1px solid #30363D;">
+                                <td style="
+                                    padding:10px;
+                                    color:#D29922;
+                                    font-weight:700;
+                                ">
+                                    숏 커버링
+                                </td>
+                                <td style="
+                                    padding:10px;
+                                    text-align:center;
+                                    color:#3FB950;
+                                    font-weight:700;
+                                ">
+                                    ▲
+                                </td>
+                                <td style="
+                                    padding:10px;
+                                    text-align:center;
+                                    color:#F85149;
+                                    font-weight:700;
+                                ">
+                                    ▼
+                                </td>
+                                <td style="padding:10px;">
+                                    기존 숏 포지션 청산 가능성 · 단기 반등 주의
+                                </td>
+                            </tr>
+    
+                            <tr style="border-top:1px solid #30363D;">
+                                <td style="
+                                    padding:10px;
+                                    color:#8B949E;
+                                    font-weight:700;
+                                ">
+                                    롱 청산
+                                </td>
+                                <td style="
+                                    padding:10px;
+                                    text-align:center;
+                                    color:#F85149;
+                                    font-weight:700;
+                                ">
+                                    ▼
+                                </td>
+                                <td style="
+                                    padding:10px;
+                                    text-align:center;
+                                    color:#F85149;
+                                    font-weight:700;
+                                ">
+                                    ▼
+                                </td>
+                                <td style="padding:10px;">
+                                    기존 롱 포지션 청산 가능성 · 하락 추세 약화 여부 확인
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    
+        with guide_col2:
+            st.markdown("##### 베이시스 해석")
+    
+            st.markdown(
+                """
+                <div style="
+                    background-color:rgba(88,166,255,0.08);
+                    border:1px solid rgba(88,166,255,0.28);
+                    border-left:4px solid #58A6FF;
+                    border-radius:7px;
+                    padding:12px 14px;
+                    margin-bottom:10px;
+                ">
+                    <div style="
+                        color:#58A6FF;
+                        font-size:0.82rem;
+                        font-weight:700;
+                        margin-bottom:5px;
+                    ">
+                        계산식
+                    </div>
+                    <div style="
+                        color:#F0F6FC;
+                        font-size:0.94rem;
+                        font-weight:600;
+                    ">
+                        베이시스 = 선물 가격 − 현물 지수
+                    </div>
+                </div>
+    
+                <div style="
+                    background-color:rgba(63,185,80,0.10);
+                    border:1px solid rgba(63,185,80,0.26);
+                    border-radius:7px;
+                    padding:11px 14px;
+                    margin-bottom:8px;
+                ">
+                    <div style="
+                        color:#3FB950;
+                        font-size:0.88rem;
+                        font-weight:700;
+                    ">
+                        ▲ 양수 베이시스: 콘탱고
+                    </div>
+                    <div style="
+                        color:#C9D1D9;
+                        font-size:0.83rem;
+                        margin-top:4px;
+                    ">
+                        선물이 현물보다 높은 상태입니다. 선물 프리미엄,
+                        금리·배당·수급·만기 구조의 영향을 함께 봐야 합니다.
+                    </div>
+                </div>
+    
+                <div style="
+                    background-color:rgba(248,81,73,0.10);
+                    border:1px solid rgba(248,81,73,0.26);
+                    border-radius:7px;
+                    padding:11px 14px;
+                ">
+                    <div style="
+                        color:#F85149;
+                        font-size:0.88rem;
+                        font-weight:700;
+                    ">
+                        ▼ 음수 베이시스: 백워데이션
+                    </div>
+                    <div style="
+                        color:#C9D1D9;
+                        font-size:0.83rem;
+                        margin-top:4px;
+                    ">
+                        선물이 현물보다 낮은 상태입니다. 선물 디스카운트,
+                        헤지 수요·매도 압력·배당 기대를 함께 점검해야 합니다.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    
         st.markdown(
-            "미결제약정(OI)이 증가하면서 가격이 오르면 신규 매수(롱) 유입, "
-            "가격이 내리면 신규 매도(숏) 유입으로 해석합니다. "
-            "OI가 감소하면서 가격이 변하면 기존 포지션 청산으로 봅니다. "
-            "Basis(선물-현물)가 양수(콘탱고)면 선물 프리미엄, 음수(백워데이션)면 "
-            "선물 디스카운트 상태입니다."
+            """
+            <div style="
+                margin-top:12px;
+                background-color:#161B22;
+                border:1px solid #30363D;
+                border-radius:6px;
+                padding:10px 14px;
+                color:#8B949E;
+                font-size:0.82rem;
+                line-height:1.55;
+            ">
+                <strong style="color:#D29922;">⚠️ 해석 유의사항:</strong>
+                OI 증감은 가격 방향과 함께 봐야 하며, 만기 교체(롤오버), 옵션 헤지,
+                차익거래, 장중 포지션 조정 등으로 인해 단일 구간만으로 투자자 의도를
+                단정할 수 없습니다.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
     col_left, col_right = st.columns([1.1, 1])
