@@ -386,10 +386,20 @@ def get_collected_macro_data():
             if df is not None and isinstance(df, pd.DataFrame) and len(df) >= 2:
                 curr = float(df['Close'].iloc[-1])
                 prev = float(df['Close'].iloc[-2])
-                delta = curr - prev
-                pct = (delta / prev) * 100 if prev != 0 else 0.0
                 if "JPY/KRW" in name and curr < 50:
-                    curr, prev, delta = curr * 100, prev * 100, delta * 100
+                    curr, prev = curr * 100, prev * 100
+
+                # [수정] 최근 2개 봉의 종가가 완전히 동일하면(휴장·야간시간대에
+                # 마지막 봉이 그대로 복제되는 경우 포함), 등락률을
+                # "변화 없음(0.00%)"으로 위장하지 않고 신뢰할 수 없는 값으로
+                # 간주해 N/A 처리합니다. 실제 무변동인지, 데이터 정체인지
+                # 구분할 수 없기 때문입니다.
+                if curr == prev:
+                    delta = None
+                    pct = None
+                else:
+                    delta = curr - prev
+                    pct = (delta / prev) * 100 if prev != 0 else 0.0
 
                 last_timestamp = df.index[-1]
                 is_intraday = bool(df.attrs.get("is_intraday", False))
@@ -415,21 +425,26 @@ def get_collected_macro_data():
                 except Exception:
                     last_ts_str = "N/A"
 
+                delta_str = (
+                    f"{delta:+,.2f} ({pct:+.2f}%)"
+                    if delta is not None and pct is not None
+                    else "N/A"
+                )
                 collected[cat_name].append({
                     "name": name,
                     "price": curr,
                     "delta": delta,
                     "pct": pct,
                     "price_str": f"{curr:,.2f}",
-                    "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
-                    "prev_str": f"{prev:,.2f}",
+                    "delta_str": delta_str,
+                    "prev_str": f"{prev:,.2f}" if delta is not None else "N/A",
                     "status": "ok",
                     "last_ts": last_ts_str,
                 })
                 if ticker == "^TNX":
-                    rate_10y_curr, rate_10y_prev = curr, prev
+                    rate_10y_curr, rate_10y_prev = curr, (prev if delta is not None else None)
                 elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
-                    rate_2y_curr, rate_2y_prev = curr, prev
+                    rate_2y_curr, rate_2y_prev = curr, (prev if delta is not None else None)
 
             elif df is not None and isinstance(df, pd.DataFrame) and len(df) == 1:
                 curr = float(df['Close'].iloc[-1])
