@@ -38,6 +38,10 @@ TRADINGVIEW_BONDS_SCANNER_URL = (
     "https://scanner.tradingview.com/bonds/scan"
 )
 
+TRADINGVIEW_SYMBOL_SCANNER_URL = (
+    "https://scanner.tradingview.com/symbol"
+)
+
 TRADINGVIEW_BONDS_SCANNER_PARAMS = {
     "label-product": "bonds-yield-curve",
 }
@@ -103,9 +107,11 @@ SCRAPER_MARKETS = [
         "key": "kospi",
         "name": "코스피",
         "url": "https://www.tradingview.com/symbols/KRX-KOSPI/",
-        "provider": "TradingView",
-        "kind": "tradingview_price",
+        "provider": "TradingView Scanner",
+        "kind": "tradingview_scanner_symbol",
+        "symbol": "KRX:KOSPI",
         "unit": "pt",
+        "reference_source": "TradingView Scanner Symbol API",
     },
     {
         "key": "nikkei",
@@ -223,6 +229,70 @@ def _fetch_yahoo_chart(
     previous = valid_closes[-2] if len(valid_closes) >= 2 else None
 
     return current, previous
+
+
+def _fetch_tradingview_symbol_snapshot(
+    symbol: str,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """
+    TradingView Symbol Scanner에서 현재가와 등락 정보를 JSON으로 수집합니다.
+
+    반환:
+        current_price, previous_close, change, change_pct
+    """
+    params = {
+        "symbol": symbol,
+        "fields": "close,change,change_abs",
+        "no_404": "true",
+        "label-product": "symbols-performance",
+    }
+
+    try:
+        response = requests.get(
+            TRADINGVIEW_SYMBOL_SCANNER_URL,
+            params=params,
+            headers=REQUEST_HEADERS,
+            timeout=10,
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        current_price = _to_float(payload.get("close"))
+        change_pct = _to_float(payload.get("change"))
+        change = _to_float(payload.get("change_abs"))
+
+        if current_price is None:
+            logger.warning(
+                "TradingView Symbol Scanner 현재가 파싱 실패: "
+                "symbol=%s, payload=%s",
+                symbol,
+                payload,
+            )
+            return None, None, None, None
+
+        previous_close = None
+        if change is not None:
+            previous_close = current_price - change
+        elif change_pct is not None and change_pct != -100:
+            previous_close = current_price / (1 + change_pct / 100)
+            change = current_price - previous_close
+
+        return current_price, previous_close, change, change_pct
+
+    except requests.RequestException as e:
+        logger.warning(
+            "TradingView Symbol Scanner 통신 실패: symbol=%s, error=%s",
+            symbol,
+            e,
+        )
+        return None, None, None, None
+    except ValueError as e:
+        logger.warning(
+            "TradingView Symbol Scanner JSON 파싱 실패: symbol=%s, error=%s",
+            symbol,
+            e,
+        )
+        return None, None, None, None
 
 
 def _fetch_tradingview_us_treasury_yields() -> dict:
@@ -786,7 +856,17 @@ def _collect_one_market(config: dict) -> dict:
     try:
         kind = config["kind"]
 
-        if kind == "yahoo_chart":
+        if kind == "tradingview_scanner_symbol":
+            (
+                price,
+                previous_close,
+                change,
+                change_pct,
+            ) = _fetch_tradingview_symbol_snapshot(
+                config["symbol"]
+            )
+
+        elif kind == "yahoo_chart":
             price, previous_close = _fetch_yahoo_chart(
                 config["symbol"]
             )
