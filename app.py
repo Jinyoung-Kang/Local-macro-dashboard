@@ -215,7 +215,6 @@ live_clock_src = (
 st.iframe(
     src=live_clock_src,
     height=45,
-    scrolling=False,
 )
 
 if menu_selection == "📊 거시경제 매크로 지표":
