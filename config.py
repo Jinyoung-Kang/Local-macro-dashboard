@@ -107,7 +107,7 @@ MACRO_CATEGORIES = {
         "엔/원 100엔당 (JPY/KRW) :gray[[실시간]]": "JPYKRW=X"
     },
     "🏛️ 미국 국채 수익률 :gray[(TradingView 참고 시세)]": {
-        "미국채 2년물 수익률(%) :gray[[TradingView 참고]]": "2YY=F",
+        "미국채 2년물 수익률(%) :gray[[TradingView 참고]]": "ZT=F",
         "미국채 10년물 수익률(%) :gray[[TradingView 참고]]": "^TNX",
         "미국채 30년물 수익률(%) :gray[[TradingView 참고]]": "^TYX",
     },
