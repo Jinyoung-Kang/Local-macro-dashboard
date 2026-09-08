@@ -2,7 +2,6 @@
 services/macro_service.py
 거시경제 지표, 금리, 환율, 원자재 데이터 수집 엔진
 ThreadPoolExecutor 기반 I/O 병렬 처리, 원본 로직 완벽 보존 및 전 지표 출력 포맷터 탑재
-
 """
 import io
 import logging
@@ -11,14 +10,16 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+
 from config import MACRO_CATEGORIES
 
 logger = logging.getLogger(__name__)
-
 
 # ==============================================================================
 # 0. FRED API Key 안전 로더
@@ -245,6 +246,116 @@ def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
 
 
 # ==============================================================================
+# 2-1. TradingView Scanner 기반 미국채 수익률 보정
+# ==============================================================================
+# config.py의 미국채 2년물 티커는 "ZT=F"(CBOT 2년 국채 선물 가격, ~100pt대)로
+# 지정되어 있어 "수익률(%)" 라벨과 단위가 맞지 않습니다. ^TNX/^TYX는 Yahoo가
+# 실제 수익률(%)을 제공하므로 정상이지만, 2년물만 선물 가격을 수익률처럼
+# 잘못 표시하는 문제가 있습니다.
+#
+# 화면 카드(views/macro_view.py)는 자체적으로 market_scraper_service의
+# TradingView Scanner 결과로 이 값을 덮어써서 정상으로 보이지만, 이 함수가
+# 반환하는 collected_data / rate_2y_curr / rate_2y_prev 자체는 보정되지
+# 않은 원시값이었습니다. 그 결과 "AI 분석 없이 수집한 전체 대시보드 최신
+# 원본 데이터" 텍스트와 10Y-2Y 스프레드 계산에는 잘못된 선물가격이 그대로
+# 사용되는 불일치가 발생했습니다.
+#
+# 아래 보정은 데이터 "수집" 시점에 한 번만 적용하여, 이후 이 데이터를
+# 참조하는 모든 화면·텍스트·계산이 항상 같은 값을 보도록 통일합니다.
+BOND_SCRAPER_KEY_MAP = {
+    "미국채 2년물 수익률(%) :gray[[TradingView 참고]]": "us02y",
+    "미국채 10년물 수익률(%) :gray[[TradingView 참고]]": "us10y",
+    "미국채 30년물 수익률(%) :gray[[TradingView 참고]]": "us30y",
+}
+
+
+def _apply_bond_scanner_override(
+    collected: dict,
+    rate_10y_curr,
+    rate_10y_prev,
+    rate_2y_curr,
+    rate_2y_prev,
+):
+    """
+    TradingView Scanner(us02y/us10y/us30y)의 실제 수익률로 collected_data와
+    10Y/2Y 스프레드 계산용 변수를 함께 덮어씁니다.
+
+    Scanner 조회가 실패하면 원본 값을 그대로 유지하여 데이터 공백을
+    만들지 않습니다.
+    """
+    try:
+        from services.market_scraper_service import get_scraped_macro_markets
+    except Exception as e:
+        logger.warning(f"market_scraper_service 임포트 실패로 국채 보정을 건너뜁니다: {e}")
+        return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
+
+    try:
+        scraper_result = get_scraped_macro_markets()
+        scraper_items = {
+            item.get("key"): item
+            for item in scraper_result.get("items", [])
+            if isinstance(item, dict)
+        }
+    except Exception as e:
+        logger.warning(f"TradingView Scanner 국채 보정 조회 실패: {e}")
+        return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
+
+    if not scraper_items:
+        return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
+
+    for items in collected.values():
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            scraper_key = BOND_SCRAPER_KEY_MAP.get(item.get("name"))
+            if not scraper_key:
+                continue
+
+            scraped = scraper_items.get(scraper_key)
+            if not scraped or scraped.get("status") != "ok":
+                continue
+
+            price = scraped.get("price")
+            if price is None:
+                continue
+
+            price = float(price)
+            previous_close = scraped.get("previous_close")
+
+            item["price"] = price
+            item["price_str"] = f"{price:,.3f}"
+            item["status"] = "ok"
+            item["source"] = scraped.get("provider", "TradingView Scanner")
+
+            if previous_close is not None and float(previous_close) != 0:
+                previous_close = float(previous_close)
+                delta = price - previous_close
+                pct = (delta / previous_close) * 100.0
+                item["delta"] = delta
+                item["pct"] = pct
+                item["prev_str"] = f"{previous_close:,.3f}"
+                item["delta_str"] = f"{delta:+,.3f} ({pct:+.2f}%)"
+            else:
+                # Scanner는 현재 최신 수익률만 신뢰도 있게 제공하므로,
+                # 전일 종가가 없을 때 "변화 없음(0.00%)"으로 위장하지 않고
+                # 명시적으로 N/A 처리합니다.
+                item["delta"] = None
+                item["pct"] = None
+                item["prev_str"] = "N/A"
+                item["delta_str"] = "N/A"
+
+            if scraper_key == "us10y":
+                rate_10y_curr = price
+                rate_10y_prev = previous_close if previous_close else rate_10y_prev
+            elif scraper_key == "us02y":
+                rate_2y_curr = price
+                rate_2y_prev = previous_close if previous_close else rate_2y_prev
+
+    return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
+
+
+# ==============================================================================
 # 3. 실시간 매크로 전 지표 수집 및 텍스트 브리핑 생성
 # ==============================================================================
 @st.cache_data(ttl=30, show_spinner=False)
@@ -279,10 +390,10 @@ def get_collected_macro_data():
                 pct = (delta / prev) * 100 if prev != 0 else 0.0
                 if "JPY/KRW" in name and curr < 50:
                     curr, prev, delta = curr * 100, prev * 100, delta * 100
-        
+
                 last_timestamp = df.index[-1]
                 is_intraday = bool(df.attrs.get("is_intraday", False))
-                
+
                 try:
                     if is_intraday and hasattr(last_timestamp, "tzinfo") and last_timestamp.tzinfo is not None:
                         # 분봉 + 타임존 정보 있음 → KST 시각으로 정확히 변환
@@ -302,8 +413,8 @@ def get_collected_macro_data():
                         )
                         last_ts_str = f"{trading_date} 일봉 기준"
                 except Exception:
-                    last_ts_str = "N/A"    
-        
+                    last_ts_str = "N/A"
+
                 collected[cat_name].append({
                     "name": name,
                     "price": curr,
@@ -319,13 +430,13 @@ def get_collected_macro_data():
                     rate_10y_curr, rate_10y_prev = curr, prev
                 elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
                     rate_2y_curr, rate_2y_prev = curr, prev
-        
+
             elif df is not None and isinstance(df, pd.DataFrame) and len(df) == 1:
                 curr = float(df['Close'].iloc[-1])
-            
+
                 last_timestamp = df.index[-1]
                 is_intraday = bool(df.attrs.get("is_intraday", False))
-            
+
                 try:
                     if is_intraday and hasattr(last_timestamp, "tzinfo") and last_timestamp.tzinfo is not None:
                         last_ts_kst = last_timestamp.astimezone(ZoneInfo("Asia/Seoul"))
@@ -342,22 +453,25 @@ def get_collected_macro_data():
                         last_ts_str = f"{trading_date} 일봉 기준"
                 except Exception:
                     last_ts_str = "N/A"
-            
+
+                # [수정] 데이터가 1개뿐이면 직전값을 알 수 없으므로, curr를
+                # prev처럼 위장해 "변화 없음(0.00%)"으로 표시하지 않고
+                # delta/pct를 명시적으로 None(N/A)으로 남깁니다.
                 collected[cat_name].append({
                     "name": name,
                     "price": curr,
-                    "delta": 0.0,
-                    "pct": 0.0,
+                    "delta": None,
+                    "pct": None,
                     "price_str": f"{curr:,.2f}",
-                    "delta_str": "0.00 (0.00%)",
-                    "prev_str": f"{curr:,.2f}",
+                    "delta_str": "N/A",
+                    "prev_str": "N/A",
                     "status": "single",
                     "last_ts": last_ts_str,
                 })
                 if ticker == "^TNX":
-                    rate_10y_curr, rate_10y_prev = curr, curr
+                    rate_10y_curr, rate_10y_prev = curr, None
                 elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
-                    rate_2y_curr, rate_2y_prev = curr, curr
+                    rate_2y_curr, rate_2y_prev = curr, None
             else:
                 collected[cat_name].append({"name": name, "status": "fail"})
 
@@ -423,8 +537,24 @@ def get_collected_macro_data():
     except Exception as e:
         logger.warning(f"항셍 선물 스크래핑 주입 실패: {e}")
 
+    # [핵심 수정] ZT=F(2년 국채 선물 가격)를 "수익률(%)"로 잘못 표시하던
+    # 문제를 TradingView Scanner의 실제 수익률(us02y/us10y/us30y)로
+    # 여기서 한 번에 보정합니다. 이후 반환되는 collected_data와
+    # rate_2y_curr/rate_2y_prev를 참조하는 모든 화면·텍스트·스프레드 계산이
+    # 항상 동일하게 보정된 값을 사용하게 됩니다.
+    collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev = (
+        _apply_bond_scanner_override(
+            collected,
+            rate_10y_curr,
+            rate_10y_prev,
+            rate_2y_curr,
+            rate_2y_prev,
+        )
+    )
+
     return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
-    
+
+
 # ==============================================================================
 # 4. 리스크 지표 요약 헬퍼 및 전체 매크로 원본 텍스트 생성기
 # ==============================================================================
@@ -503,6 +633,12 @@ def generate_full_macro_text(
     """
     거시경제 매크로 메뉴에 표시된 모든 지표의 최신 원본값을
     카테고리 단위로 복사용 텍스트로 변환합니다.
+
+    [수정] collected_data와 rate_2y_curr/rate_2y_prev는 이미
+    get_collected_macro_data() 단계에서 TradingView Scanner로 보정된
+    값이 전달되므로, 이 함수는 별도 보정 없이 그대로 출력만 담당합니다.
+    카드 화면과 이 원본 텍스트가 항상 동일한 값을 보이도록 하기 위한
+    구조입니다.
     """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S KST")
 
