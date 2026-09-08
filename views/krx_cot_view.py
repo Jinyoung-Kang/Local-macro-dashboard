@@ -149,12 +149,24 @@ def render_krx_cot_view():
         else "CONTRACT"
     )
     
+    # 화면에 실제로 표시되는 데이터의 단위입니다.
+    # Daum 호출 성공 시 사용자가 선택한 단위와 같고,
+    # placeholder 폴백 시에는 계약수 예시 데이터임을 강제합니다.
+    display_measure = investor_measure
+    display_measure_label = investor_measure_label
+    
     df_investors = fetch_daum_futures_investor_trend(
         lookback_days=25,
         measure=investor_measure,
     )
+    
     if df_investors is None or df_investors.empty:
         df_investors = get_krx_investor_derivatives_summary()
+    
+        # placeholder 함수의 값은 계약수 기준 고정 예시값입니다.
+        # 금액(억원) 선택 상태라도 계약수로 잘못 표기하지 않도록 강제합니다.
+        display_measure = "CONTRACT"
+        display_measure_label = "계약수 (예시 데이터)"
 
     intraday_flow = fetch_daum_futures_intraday_acceleration(lookback_minutes=30)
     
@@ -634,7 +646,7 @@ def render_krx_cot_view():
     with col_right:
         st.markdown(
             f"#### 🌍 투자자별 파생 수급 "
-            f"({investor_measure_label})"
+            f"({display_measure_label})"
         )
 
         inv_is_placeholder = (
@@ -644,11 +656,18 @@ def render_krx_cot_view():
         )
         if inv_is_placeholder:
             st.warning(
-                "⚠️ 이 표는 KRX 실제 데이터가 아닌 placeholder(예시) 데이터입니다. "
-                "Daum 실시간 데이터 수집에 실패하여 예시값으로 대체되었습니다."
+                "⚠️ Daum 실제 투자주체별 선물 수급 데이터를 가져오지 못했습니다. "
+                "현재 표는 계약수 기준 placeholder(예시) 데이터입니다. "
+                "금액(억원) 모드를 선택했더라도 실제 금액 데이터가 아니므로 "
+                "계약수 기준으로 표시됩니다."
             )
         else:
-            if investor_measure == "PRICE":
+            if inv_is_placeholder:
+                measure_caption = (
+                    "현재 표시값은 계약수 기준 placeholder(예시) 데이터입니다. "
+                    "Daum 실제 데이터를 가져오지 못해 금액 기준 조회는 제공할 수 없습니다."
+                )
+            elif display_measure == "PRICE":
                 measure_caption = (
                     "금액 기준: Daum 원 단위 응답을 억 원 단위로 변환해 표시합니다."
                 )
@@ -678,7 +697,7 @@ def render_krx_cot_view():
             if column not in hidden_columns
         ]
         
-        if investor_measure == "PRICE":
+        if display_measure == "PRICE":
             numeric_format = "%+.1f"
             unit_suffix = "(억 원)"
         else:
