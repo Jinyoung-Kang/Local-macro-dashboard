@@ -571,3 +571,320 @@ def get_krx_investor_derivatives_summary() -> pd.DataFrame:
         "is_placeholder": [True] * len(categories),
     })
     return df
+
+# ==============================================================================
+# 6. Daum 선물 시간별 투자자 수급 가속도
+# ==============================================================================
+DAUM_FUTURES_INVESTOR_TIMES_URL = (
+    "https://finance.daum.net/api/investor/future/times"
+)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_daum_futures_intraday_acceleration(
+    lookback_minutes: int = 30,
+) -> dict:
+    """
+    Daum 금융의 KOSPI 200 선물 시간별 투자주체 수급 API를 사용하여
+    외국인·기관계의 최신 누적 순매수와 최근 N분 수급 변화량을 계산합니다.
+
+    실제 확인된 API:
+        https://finance.daum.net/api/investor/future/times
+        ?page=1&perPage=10&terms=times&pagination=true
+
+    주요 원본 필드:
+        privateSettlement       : 개인 누적 순매수 계약수
+        foreignSettlement       : 외국인 누적 순매수 계약수
+        institutionalSettlement : 기관계 누적 순매수 계약수
+        financialInvestment     : 금융투자 누적 순매수 계약수
+        insuranceInvestment     : 보험 누적 순매수 계약수
+        trustInvestment         : 투신 누적 순매수 계약수
+        bankInvestment          : 은행 누적 순매수 계약수
+        etcInvestment           : 기타금융 누적 순매수 계약수
+        pensionFundInvestment   : 연기금등 누적 순매수 계약수
+
+    반환:
+        {
+            "available": bool,
+            "data_date": "YYYY-MM-DD",
+            "latest_time": "HH:MM:SS",
+            "reference_time": "HH:MM:SS",
+            "lookback_minutes": int,
+            "foreign_current": int,
+            "foreign_change": int,
+            "institution_current": int,
+            "institution_change": int,
+            "private_current": int,
+            "private_change": int,
+            "financial_current": int,
+            "financial_change": int,
+            "pension_current": int,
+            "pension_change": int,
+            "flow_status": str,
+            "flow_status_color": str,
+            "source": str,
+            "error": str | None,
+        }
+
+    주의:
+    - 이 데이터는 장중 시간별 누적 수급이며, 장 마감 후 정산/집계 갱신에 따라
+      값이 달라질 수 있습니다.
+    - Daum 웹사이트 내부 API 기반 비공식 데이터입니다.
+    - N분 전 정확히 같은 시각이 없을 수 있으므로, 기준시각 이전의 가장 가까운
+      수집값을 사용합니다.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/18.0 Safari/605.1.15"
+        ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": (
+            "https://finance.daum.net/domestic/investors/DERIVATIVES"
+        ),
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    # 시간별 API는 일반적으로 장중 수백 건의 행을 반환합니다.
+    # 최근 30~60분 분석에 충분한 범위를 한 번에 가져옵니다.
+    params = {
+        "page": 1,
+        "perPage": 500,
+        "terms": "times",
+        "pagination": "true",
+    }
+
+    default_result = {
+        "available": False,
+        "data_date": None,
+        "latest_time": None,
+        "reference_time": None,
+        "lookback_minutes": lookback_minutes,
+        "foreign_current": None,
+        "foreign_change": None,
+        "institution_current": None,
+        "institution_change": None,
+        "private_current": None,
+        "private_change": None,
+        "financial_current": None,
+        "financial_change": None,
+        "pension_current": None,
+        "pension_change": None,
+        "flow_status": "시간별 수급 데이터 미제공",
+        "flow_status_color": "gray",
+        "source": "Daum 금융 시간별 선물 수급 (비공식)",
+        "error": None,
+    }
+
+    try:
+        response = requests.get(
+            DAUM_FUTURES_INVESTOR_TIMES_URL,
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
+
+        if response.status_code != 200:
+            default_result["error"] = (
+                f"Daum API HTTP {response.status_code}"
+            )
+            logger.warning(
+                "Daum 선물 시간별 수급 API HTTP 실패: status=%s",
+                response.status_code,
+            )
+            return default_result
+
+        payload = response.json()
+        rows = payload.get("data", [])
+
+        if not isinstance(rows, list) or not rows:
+            default_result["error"] = "응답 data가 비어 있습니다."
+            logger.warning("Daum 선물 시간별 수급 API 빈 응답")
+            return default_result
+
+        df = pd.DataFrame(rows)
+
+        if "date" not in df.columns:
+            default_result["error"] = "응답에 date 필드가 없습니다."
+            logger.warning(
+                "Daum 선물 시간별 수급 API date 필드 없음: columns=%s",
+                list(df.columns),
+            )
+            return default_result
+
+        df["DateTime"] = pd.to_datetime(
+            df["date"],
+            errors="coerce",
+        )
+        df = df.dropna(subset=["DateTime"]).copy()
+
+        if df.empty:
+            default_result["error"] = "유효한 시간 데이터가 없습니다."
+            return default_result
+
+        numeric_columns = [
+            "privateSettlement",
+            "foreignSettlement",
+            "institutionalSettlement",
+            "financialInvestment",
+            "insuranceInvestment",
+            "trustInvestment",
+            "bankInvestment",
+            "etcInvestment",
+            "pensionFundInvestment",
+        ]
+
+        for column in numeric_columns:
+            if column not in df.columns:
+                df[column] = 0
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            ).fillna(0.0)
+
+        # API 응답은 최신 시점부터 DESC로 오지만, 시간 계산과 기준행 선택을 위해
+        # 과거 -> 최신 오름차순으로 정렬합니다.
+        df = (
+            df.sort_values("DateTime")
+            .drop_duplicates(subset=["DateTime"], keep="last")
+            .reset_index(drop=True)
+        )
+
+        latest_dt = df["DateTime"].iloc[-1]
+        latest_day = latest_dt.date()
+
+        # 최신 날짜의 장중 데이터만 분석합니다.
+        # 페이지 경계를 넘어 전일 데이터가 함께 들어와도 섞이지 않게 막습니다.
+        intraday_df = df[
+            df["DateTime"].dt.date == latest_day
+        ].copy()
+
+        if intraday_df.empty:
+            default_result["error"] = "최신 거래일 시간별 데이터가 없습니다."
+            return default_result
+
+        latest_row = intraday_df.iloc[-1]
+        reference_target_dt = latest_dt - pd.Timedelta(
+            minutes=lookback_minutes
+        )
+
+        # 정확히 N분 전 시점이 없을 경우, 기준시각보다 이전인 가장 가까운 데이터를 사용합니다.
+        reference_candidates = intraday_df[
+            intraday_df["DateTime"] <= reference_target_dt
+        ]
+
+        # 장 시작 직후처럼 N분 이전 데이터가 없으면, 가장 오래된 유효 시점을 사용합니다.
+        if reference_candidates.empty:
+            reference_row = intraday_df.iloc[0]
+        else:
+            reference_row = reference_candidates.iloc[-1]
+
+        def to_int(value) -> int:
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return 0
+
+        foreign_current = to_int(
+            latest_row["foreignSettlement"]
+        )
+        foreign_change = (
+            foreign_current
+            - to_int(reference_row["foreignSettlement"])
+        )
+
+        institution_current = to_int(
+            latest_row["institutionalSettlement"]
+        )
+        institution_change = (
+            institution_current
+            - to_int(reference_row["institutionalSettlement"])
+        )
+
+        private_current = to_int(
+            latest_row["privateSettlement"]
+        )
+        private_change = (
+            private_current
+            - to_int(reference_row["privateSettlement"])
+        )
+
+        financial_current = to_int(
+            latest_row["financialInvestment"]
+        )
+        financial_change = (
+            financial_current
+            - to_int(reference_row["financialInvestment"])
+        )
+
+        pension_current = to_int(
+            latest_row["pensionFundInvestment"]
+        )
+        pension_change = (
+            pension_current
+            - to_int(reference_row["pensionFundInvestment"])
+        )
+
+        # 외국인과 기관계의 최근 N분 변화 방향을 비교합니다.
+        if foreign_change > 0 and institution_change > 0:
+            flow_status = "외국인·기관 동반 매수"
+            flow_status_color = "green"
+        elif foreign_change < 0 and institution_change < 0:
+            flow_status = "외국인·기관 동반 매도"
+            flow_status_color = "red"
+        elif foreign_change > 0 and institution_change < 0:
+            flow_status = "외국인 매수 · 기관 매도"
+            flow_status_color = "blue"
+        elif foreign_change < 0 and institution_change > 0:
+            flow_status = "외국인 매도 · 기관 매수"
+            flow_status_color = "orange"
+        else:
+            flow_status = "수급 방향 중립 또는 혼조"
+            flow_status_color = "gray"
+
+        result = {
+            "available": True,
+            "data_date": latest_dt.strftime("%Y-%m-%d"),
+            "latest_time": latest_dt.strftime("%H:%M:%S"),
+            "reference_time": reference_row["DateTime"].strftime(
+                "%H:%M:%S"
+            ),
+            "lookback_minutes": lookback_minutes,
+            "foreign_current": foreign_current,
+            "foreign_change": foreign_change,
+            "institution_current": institution_current,
+            "institution_change": institution_change,
+            "private_current": private_current,
+            "private_change": private_change,
+            "financial_current": financial_current,
+            "financial_change": financial_change,
+            "pension_current": pension_current,
+            "pension_change": pension_change,
+            "flow_status": flow_status,
+            "flow_status_color": flow_status_color,
+            "source": "Daum 금융 시간별 선물 수급 (비공식)",
+            "error": None,
+        }
+
+        logger.info(
+            "Daum 선물 시간별 수급 가속도 수집 성공: "
+            "date=%s, latest=%s, reference=%s, "
+            "foreign_change=%s, institution_change=%s",
+            result["data_date"],
+            result["latest_time"],
+            result["reference_time"],
+            result["foreign_change"],
+            result["institution_change"],
+        )
+
+        return result
+
+    except Exception as e:
+        logger.warning(
+            "Daum 선물 시간별 수급 가속도 수집 실패: %s",
+            e,
+        )
+        default_result["error"] = str(e)
+        return default_result
