@@ -245,22 +245,39 @@ def render_krx_cot_view():
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     # ==========================================================================
-    # [신규] 선물 장중 수급 가속도
+    # 선물 장중/장마감 수급 가속도
     # ==========================================================================
-    st.markdown("#### ⚡ 선물 장중 수급 가속도")
-    
-    st.caption(
-        "Daum 금융의 시간별 누적 순매수 계약 데이터를 기준으로, "
-        "최신 시점과 최근 30분 전 기준 시점의 차이를 계산합니다. "
-        "장중 수급은 정산·집계 시점에 따라 변동될 수 있는 비공식 참고 데이터입니다."
+    is_market_hours = (
+        now_kst.weekday() < 5
+        and dt_time(9, 0) <= now_kst.time() <= dt_time(15, 40)
     )
-    
+
+    acceleration_title = (
+        "#### ⚡ 선물 장중 수급 가속도"
+        if is_market_hours
+        else "#### ⚡ 선물 장마감 수급 변화"
+    )
+    st.markdown(acceleration_title)
+
+    if is_market_hours:
+        st.caption(
+            "Daum 금융의 시간별 누적 순매수 계약 데이터를 기준으로, "
+            "최신 시점과 최근 30분 전 기준 시점의 차이를 계산합니다. "
+            "장중 수급은 정산·집계 시점에 따라 변동될 수 있는 비공식 참고 데이터입니다."
+        )
+    else:
+        st.caption(
+            "장 마감 후 마지막 시간별 누적 순매수 계약 데이터를 기준으로, "
+            "마감 전 최근 30분 수급 변화를 계산합니다. "
+            "Daum 금융의 비공식 참고 데이터이며, 정산·집계 시점에 따라 변경될 수 있습니다."
+        )
+
     if intraday_flow.get("available"):
         latest_time = intraday_flow["latest_time"]
         reference_time = intraday_flow["reference_time"]
         data_date = intraday_flow["data_date"]
         lookback_minutes = intraday_flow["lookback_minutes"]
-    
+
         st.markdown(
             f"""
             <div style="
@@ -289,71 +306,90 @@ def render_krx_cot_view():
                     · 최신:
                     <strong style="color:#F0F6FC;">{latest_time}</strong>
                     · 비교:
-                    <strong style="color:#F0F6FC;">
-                        {reference_time}
-                    </strong>
+                    <strong style="color:#F0F6FC;">{reference_time}</strong>
                     ({lookback_minutes}분 전 또는 가장 가까운 이전 시점)
                 </span>
             </div>
             """,
             unsafe_allow_html=True,
         )
-    
+
+        def acceleration_delta(change: int) -> tuple[str, str]:
+            """Streamlit metric의 부호·색상을 변화량과 일치시킵니다."""
+            if change > 0:
+                return f"+{change:,} 계약", "normal"
+            if change < 0:
+                return f"{change:,} 계약", "normal"
+            return "0 계약", "off"
+
+        foreign_delta, foreign_delta_color = acceleration_delta(
+            intraday_flow["foreign_change"]
+        )
+        institution_delta, institution_delta_color = acceleration_delta(
+            intraday_flow["institution_change"]
+        )
+        financial_delta, financial_delta_color = acceleration_delta(
+            intraday_flow["financial_change"]
+        )
+        pension_delta, pension_delta_color = acceleration_delta(
+            intraday_flow["pension_change"]
+        )
+
         acc_col1, acc_col2, acc_col3, acc_col4 = st.columns(4)
-    
+
         with acc_col1:
             st.metric(
                 label="외국인 장중 누적 순매수",
                 value=f"{intraday_flow['foreign_current']:+,} 계약",
-                delta=(
-                    f"최근 {lookback_minutes}분 "
-                    f"{intraday_flow['foreign_change']:+,} 계약"
-                ),
-                delta_color="normal",
+                delta=foreign_delta,
+                delta_color=foreign_delta_color,
             )
-    
+
         with acc_col2:
             st.metric(
                 label="기관계 장중 누적 순매수",
                 value=f"{intraday_flow['institution_current']:+,} 계약",
-                delta=(
-                    f"최근 {lookback_minutes}분 "
-                    f"{intraday_flow['institution_change']:+,} 계약"
-                ),
-                delta_color="normal",
+                delta=institution_delta,
+                delta_color=institution_delta_color,
             )
-    
+
         with acc_col3:
             st.metric(
                 label="금융투자 장중 누적 순매수",
                 value=f"{intraday_flow['financial_current']:+,} 계약",
-                delta=(
-                    f"최근 {lookback_minutes}분 "
-                    f"{intraday_flow['financial_change']:+,} 계약"
-                ),
-                delta_color="normal",
+                delta=financial_delta,
+                delta_color=financial_delta_color,
             )
-    
+
         with acc_col4:
             st.metric(
                 label="연기금등 장중 누적 순매수",
                 value=f"{intraday_flow['pension_current']:+,} 계약",
-                delta=(
-                    f"최근 {lookback_minutes}분 "
-                    f"{intraday_flow['pension_change']:+,} 계약"
-                ),
-                delta_color="normal",
+                delta=pension_delta,
+                delta_color=pension_delta_color,
             )
-    
+
+        st.caption(
+            f"각 변화량은 최신 {latest_time} 기준, {reference_time} 대비 "
+            f"{lookback_minutes}분 변화입니다."
+        )
+
         flow_status = intraday_flow["flow_status"]
         flow_color = intraday_flow["flow_status_color"]
-    
+        status_border_color = {
+            "green": "#3FB950",
+            "red": "#F85149",
+            "blue": "#58A6FF",
+            "orange": "#D29922",
+            "gray": "#8B949E",
+        }.get(flow_color, "#8B949E")
+
         st.markdown(
             f"""
             <div style="
                 margin-top:10px;
                 padding:10px 14px;
-                border-left:4px solid {'#3FB950' if flow_color == 'green' else '#F85149' if flow_color == 'red' else '#58A6FF' if flow_color == 'blue' else '#D29922' if flow_color == 'orange' else '#8B949E'};
+                border-left:4px solid {status_border_color};
                 background-color:#161B22;
                 border-radius:4px;
             ">
@@ -375,14 +411,14 @@ def render_krx_cot_view():
             """,
             unsafe_allow_html=True,
         )
-    
+
     else:
         st.info(
             "현재 Daum 시간별 선물 수급 데이터를 가져오지 못했습니다. "
             "장 마감·주말·공휴일 또는 Daum 내부 API 응답 지연일 수 있습니다. "
             f"세부 오류: {intraday_flow.get('error', '알 수 없음')}"
         )
-    
+
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
     # ==========================================================================
