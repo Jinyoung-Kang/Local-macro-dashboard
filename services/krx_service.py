@@ -123,9 +123,6 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
     최근 N영업일 동안의 KOSPI 200 선물 최근월물 종가, 거래량, 미결제약정 시계열을 수집.
     미확정/야간 데이터는 자동으로 직전 영업일 마감 확정치로 정제.
 
-    반환 DataFrame에는 'is_estimated' 컬럼이 포함됩니다.
-    - False: KRX OpenAPI에서 수집한 실제 확정치
-    - True : KRX OpenAPI 응답 부재로 KODEX 200 프록시 추정치를 사용함
     """
     today = datetime.now(ZoneInfo("Asia/Seoul"))
     date_list = []
@@ -136,77 +133,123 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
             date_list.append(curr.strftime("%Y%m%d"))
         curr -= timedelta(days=1)
 
+    def safe_float(val):
+        try:
+            v = float(str(val).replace(",", "").strip())
+            return v if not np.isnan(v) else 0.0
+        except Exception:
+            return 0.0
+
+    def parse_one_day(d_str: str, df_day: pd.DataFrame):
+        """단일 날짜의 선물 일별매매정보를 파싱합니다. (네트워크 호출 없음)"""
+        if df_day is None or df_day.empty:
+            return None
+
+        cols = {col.upper(): col for col in df_day.columns}
+        name_col = cols.get("ISU_NM", cols.get("PROD_NM", ""))
+        if not name_col or name_col not in df_day.columns:
+            return None
+
+        k200_futs = df_day[
+            df_day[name_col].str.contains("코스피200|KOSPI 200", na=False, regex=True)
+        ]
+        k200_futs = k200_futs[
+            ~k200_futs[name_col].str.contains("국채|달러|미니|위클리", na=False)
+        ]
+
+        if k200_futs.empty:
+            return None
+
+        if len(k200_futs) > 1:
+            vol_col = cols.get("ACC_TRDVOL", cols.get("TRDVOL", ""))
+            if vol_col and vol_col in k200_futs.columns:
+                k200_futs = k200_futs.copy()
+                k200_futs["_vol_sort"] = pd.to_numeric(
+                    k200_futs[vol_col].astype(str).str.replace(",", ""),
+                    errors="coerce",
+                ).fillna(0)
+                k200_futs = k200_futs.sort_values("_vol_sort", ascending=False)
+
+        row = k200_futs.iloc[0]
+
+        close_val = safe_float(row.get("TDD_CLSPRC", row.get("CLSPRC", 0)))
+        if close_val <= 0:
+            return None
+
+        return {
+            "date_str": d_str,
+            "Date": pd.to_datetime(d_str, format="%Y%m%d"),
+            "Futures_Close": close_val,
+            "Change_Pct": safe_float(row.get("FLUC_RT", 0)),
+            "Volume": safe_float(row.get("ACC_TRDVOL", row.get("TRDVOL", 0))),
+            "Open_Interest": safe_float(row.get("ACC_OPNINT_QTY", row.get("OPNINT_QTY", 0))),
+            "Contract_Name": str(row.get(name_col, "KOSPI 200 선물")),
+        }
+
+    # ------------------------------------------------------------------
+    # 1단계: 날짜별 선물 일별매매정보를 병렬로 조회
+    # ------------------------------------------------------------------
+    parsed_records = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_map = {
+            executor.submit(fetch_krx_derivatives_daily, d_str): d_str
+            for d_str in date_list
+        }
+        for future in as_completed(future_map):
+            d_str = future_map[future]
+            try:
+                df_day = future.result()
+            except Exception as e:
+                logger.warning(f"KRX 선물 일별매매정보 병렬 조회 실패 ({d_str}): {e}")
+                continue
+
+            parsed = parse_one_day(d_str, df_day)
+            if parsed is not None:
+                parsed_records[d_str] = parsed
+
+    # ------------------------------------------------------------------
+    # 2단계: 유효한 날짜에 한해 코스피200 현물 지수를 병렬로 조회
+    # (베이시스 = 선물 종가 - 현물 지수 계산용)
+    # ------------------------------------------------------------------
+    spot_closes = {}
+    if parsed_records:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_map = {
+                executor.submit(fetch_kospi200_index_close, d_str): d_str
+                for d_str in parsed_records.keys()
+            }
+            for future in as_completed(future_map):
+                d_str = future_map[future]
+                try:
+                    spot_closes[d_str] = future.result()
+                except Exception as e:
+                    logger.warning(f"KRX 코스피200 현물 지수 병렬 조회 실패 ({d_str}): {e}")
+                    spot_closes[d_str] = None
+
+    # ------------------------------------------------------------------
+    # 3단계: 병합 및 베이시스 계산 (네트워크 호출 없음, 순수 연산)
+    # ------------------------------------------------------------------
     records = []
+    for d_str, rec in parsed_records.items():
+        spot_close = spot_closes.get(d_str)
+        theo_val = np.nan
+        basis_val = np.nan
+        if spot_close is not None and spot_close > 0:
+            basis_val = round(rec["Futures_Close"] - spot_close, 2)
+            theo_val = spot_close
+        else:
+            logger.warning(f"KRX Open API 코스피200 현물 지수 조회 실패 ({d_str})")
 
-    for d_str in date_list:
-        df_day = fetch_krx_derivatives_daily(d_str)
-        if not df_day.empty:
-            cols = {col.upper(): col for col in df_day.columns}
-
-            name_col = cols.get("ISU_NM", cols.get("PROD_NM", ""))
-            if name_col and name_col in df_day.columns:
-                # "F 20" 패턴 제거: 계약월 표기는 모든 선물 상품에 공통으로
-                # 들어가므로 코스피200선물만 정확히 매칭
-                k200_futs = df_day[
-                    df_day[name_col].str.contains("코스피200|KOSPI 200", na=False, regex=True)
-                ]
-
-                # 국채/달러/미니/위클리 등 다른 선물이 우연히 겹치는 것을 배제
-                k200_futs = k200_futs[
-                    ~k200_futs[name_col].str.contains("국채|달러|미니|위클리", na=False)
-                ]
-
-                if not k200_futs.empty:
-                    # 여러 계약월(최근월/차근월)이 동시에 잡히면 거래량이
-                    # 가장 큰 실질적인 최근월물을 선택
-                    if len(k200_futs) > 1:
-                        vol_col = cols.get("ACC_TRDVOL", cols.get("TRDVOL", ""))
-                        if vol_col and vol_col in k200_futs.columns:
-                            k200_futs = k200_futs.copy()
-                            k200_futs["_vol_sort"] = pd.to_numeric(
-                                k200_futs[vol_col].astype(str).str.replace(",", ""),
-                                errors="coerce",
-                            ).fillna(0)
-                            k200_futs = k200_futs.sort_values("_vol_sort", ascending=False)
-
-                    row = k200_futs.iloc[0]
-
-                    def safe_float(val):
-                        try:
-                            v = float(str(val).replace(",", "").strip())
-                            return v if not np.isnan(v) else 0.0
-                        except Exception:
-                            return 0.0
-
-                    close_val = safe_float(row.get("TDD_CLSPRC", row.get("CLSPRC", 0)))
-                    fluc_val = safe_float(row.get("FLUC_RT", 0))
-                    vol_val = safe_float(row.get("ACC_TRDVOL", row.get("TRDVOL", 0)))
-                    oi_val = safe_float(row.get("ACC_OPNINT_QTY", row.get("OPNINT_QTY", 0)))
-
-                    # KRX fut_bydd_trd API는 BASIS 필드를 제공하지 않으므로,
-                    # Open API 지수 엔드포인트로 같은 날짜 현물 지수를 조회해
-                    # 베이시스(선물 종가 - 현물 지수)를 직접 계산합니다.
-                    theo_val = np.nan
-                    basis_val = np.nan
-                    if close_val > 0:
-                        spot_close = fetch_kospi200_index_close(d_str)
-                        if spot_close is not None and spot_close > 0:
-                            basis_val = round(close_val - spot_close, 2)
-                            theo_val = spot_close
-                        else:
-                            logger.warning(f"KRX Open API 코스피200 현물 지수 조회 실패 ({d_str})")
-
-                    if close_val > 0:
-                        records.append({
-                            "Date": pd.to_datetime(d_str, format="%Y%m%d"),
-                            "Futures_Close": close_val,
-                            "Change_Pct": fluc_val,
-                            "Volume": vol_val,
-                            "Open_Interest": oi_val,
-                            "Theory_Price": theo_val,
-                            "Market_Basis": basis_val,
-                            "Contract_Name": str(row.get(name_col, "KOSPI 200 선물")),
-                        })
+        records.append({
+            "Date": rec["Date"],
+            "Futures_Close": rec["Futures_Close"],
+            "Change_Pct": rec["Change_Pct"],
+            "Volume": rec["Volume"],
+            "Open_Interest": rec["Open_Interest"],
+            "Theory_Price": theo_val,
+            "Market_Basis": basis_val,
+            "Contract_Name": rec["Contract_Name"],
+        })
 
     # KRX 응답 부재 시 Fallback (KODEX 200 및 코스피 200 지수 프록시, is_estimated=True로 명시)
     if len(records) < 5:
