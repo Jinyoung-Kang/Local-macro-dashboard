@@ -1651,10 +1651,24 @@ def fetch_daum_stock_investor_flow(
             "tradePrice": "Close",
             "foreignStraightPurchaseVolume": "Foreigner",
             "institutionStraightPurchaseVolume": "Institution",
+            "foreignOwnSharesRate": "ForeignOwnershipRate",
+            "accTradeVolume": "AccTradeVolume",
         })
 
-        for col in ["Close", "Foreigner", "Institution"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        for col in [
+            "Close",
+            "Foreigner",
+            "Institution",
+            "ForeignOwnershipRate",
+            "AccTradeVolume",
+        ]:
+            if col not in df.columns:
+                df[col] = 0.0
+        
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce",
+            ).fillna(0.0)
 
         mask = (
             (df["Date"].dt.date >= start_date_obj)
@@ -1683,15 +1697,345 @@ def fetch_daum_stock_investor_flow(
         )
 
         return df[[
-            "Date", "Close", "Foreigner", "Institution",
-            "Foreigner_Cum", "Institution_Cum", "Retail_Cum",
-            "is_estimated", "cross_validated", "source",
+            "Date",
+            "Close",
+            "Foreigner",
+            "Institution",
+            "ForeignOwnershipRate",
+            "AccTradeVolume",
+            "Foreigner_Cum",
+            "Institution_Cum",
+            "Retail_Cum",
+            "is_estimated",
+            "cross_validated",
+            "source",
         ]]
 
     except Exception as e:
         logger.warning("Daum 종목별 투자자 수급 수집 실패: code=%s, error=%s", symbol_code, e)
         return pd.DataFrame()
 
+
+# ==============================================================================
+# 종목 수급 확증 점수
+# ==============================================================================
+def calculate_stock_flow_confirmation(
+    flow_df: pd.DataFrame,
+    rank: int,
+    top_n: int,
+    trade_type: str,
+) -> dict:
+    """
+    선택 종목의 Daum 실제 외국인/기관 수급 시계열과 시장 전체 레이더 순위를
+    결합하여 수급 확증 점수(0~100)를 계산합니다.
+
+    점수 구성:
+    - 시장 전체 순매수/순매도 랭킹: 최대 20점
+    - 외국인 최근 5거래일 방향 일치: 최대 25점
+    - 기관 최근 5거래일 방향 일치: 최대 25점
+    - 외국인 보유율 변화: 최대 15점
+    - 당일 거래량 대비 외국인+기관 수급 강도: 최대 15점
+
+    주의:
+    - 실제 Daum 종목별 수급 데이터일 때만 점수를 계산합니다.
+    - 개인 수급은 Daum 종목별 API가 직접 제공하지 않으므로 점수에 사용하지 않습니다.
+    - 순매수/순매도 화면 모두 동일한 규칙을 사용하도록 direction 계수를 적용합니다.
+    """
+    unavailable = {
+        "available": False,
+        "total_score": None,
+        "grade": "평가 불가",
+        "grade_color": "gray",
+        "reason": "",
+        "rank_score": 0,
+        "foreign_score": 0,
+        "institution_score": 0,
+        "ownership_score": 0,
+        "intensity_score": 0,
+        "foreign_5d_sum": 0,
+        "institution_5d_sum": 0,
+        "foreign_aligned_days": 0,
+        "institution_aligned_days": 0,
+        "sample_days": 0,
+        "ownership_change_bp": 0.0,
+        "flow_intensity_pct": 0.0,
+        "positive_reasons": [],
+        "warning_reasons": [],
+    }
+
+    if flow_df is None or flow_df.empty:
+        unavailable["reason"] = "종목별 수급 데이터가 없습니다."
+        return unavailable
+
+    source = str(
+        flow_df["source"].iloc[0]
+        if "source" in flow_df.columns
+        else ""
+    )
+    is_estimated = bool(
+        flow_df["is_estimated"].iloc[0]
+        if "is_estimated" in flow_df.columns
+        else True
+    )
+
+    # Daum 실데이터가 아니거나 통계적 추정치이면 점수를 산출하지 않습니다.
+    if is_estimated or "Daum 종목별" not in source:
+        unavailable["reason"] = (
+            "수급 확증 점수는 Daum 종목별 외국인·기관 실데이터가 "
+            "확보된 경우에만 계산합니다."
+        )
+        return unavailable
+
+    required_columns = {
+        "Date",
+        "Foreigner",
+        "Institution",
+        "ForeignOwnershipRate",
+        "AccTradeVolume",
+    }
+
+    missing_columns = required_columns - set(flow_df.columns)
+    if missing_columns:
+        unavailable["reason"] = (
+            "확증 점수 계산에 필요한 데이터가 부족합니다: "
+            + ", ".join(sorted(missing_columns))
+        )
+        return unavailable
+
+    df = (
+        flow_df.copy()
+        .sort_values("Date")
+        .drop_duplicates(subset=["Date"])
+        .reset_index(drop=True)
+    )
+
+    recent_5d = df.tail(5).copy()
+    sample_days = len(recent_5d)
+
+    if sample_days < 2:
+        unavailable["reason"] = (
+            "최근 수급 데이터가 2거래일 미만이라 확증 점수를 계산할 수 없습니다."
+        )
+        return unavailable
+
+    # 순매수 화면은 +1, 순매도 화면은 -1 방향을 확증 방향으로 사용합니다.
+    direction = 1 if trade_type == "순매수" else -1
+
+    foreign_5d_sum = float(recent_5d["Foreigner"].sum())
+    institution_5d_sum = float(recent_5d["Institution"].sum())
+
+    foreign_aligned_days = int(
+        (direction * recent_5d["Foreigner"] > 0).sum()
+    )
+    institution_aligned_days = int(
+        (direction * recent_5d["Institution"] > 0).sum()
+    )
+
+    # ------------------------------------------------------------------
+    # 1. 시장 전체 레이더 순위 점수: 최대 20점
+    # ------------------------------------------------------------------
+    if top_n > 0 and rank > 0:
+        rank_score = round(
+            max(0.0, (top_n - rank + 1) / top_n) * 20
+        )
+    else:
+        rank_score = 0
+
+    # ------------------------------------------------------------------
+    # 2. 5거래일 수급 일치 점수: 최대 25점
+    # ------------------------------------------------------------------
+    def directional_flow_score(
+        flow_sum: float,
+        aligned_days: int,
+        max_score: int = 25,
+    ) -> int:
+        """
+        누적 수급 방향이 레이더 방향과 일치해야 기본 점수를 얻고,
+        같은 방향이었던 거래일 비율로 점수를 세분화합니다.
+        """
+        aligned_flow_sum = direction * flow_sum
+
+        # 최근 5일 누적 방향이 레이더 방향과 반대면 확증 점수는 0점입니다.
+        if aligned_flow_sum <= 0:
+            return 0
+
+        consistency = aligned_days / sample_days
+
+        if consistency >= 0.8:
+            return max_score
+        if consistency >= 0.6:
+            return round(max_score * 0.7)
+        if consistency >= 0.4:
+            return round(max_score * 0.4)
+
+        return round(max_score * 0.2)
+
+    foreign_score = directional_flow_score(
+        foreign_5d_sum,
+        foreign_aligned_days,
+    )
+    institution_score = directional_flow_score(
+        institution_5d_sum,
+        institution_aligned_days,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. 외국인 보유율 변화 점수: 최대 15점
+    # Daum은 비율을 소수로 제공: 0.467 = 46.7%
+    # 1bp = 0.01%p이므로 10,000을 곱합니다.
+    # ------------------------------------------------------------------
+    ownership_start = float(
+        recent_5d["ForeignOwnershipRate"].iloc[0]
+    )
+    ownership_end = float(
+        recent_5d["ForeignOwnershipRate"].iloc[-1]
+    )
+    ownership_change_bp = (
+        ownership_end - ownership_start
+    ) * 10_000
+
+    aligned_ownership_bp = direction * ownership_change_bp
+
+    if aligned_ownership_bp >= 10:
+        ownership_score = 15
+    elif aligned_ownership_bp >= 5:
+        ownership_score = 10
+    elif aligned_ownership_bp > 0:
+        ownership_score = 5
+    else:
+        ownership_score = 0
+
+    # ------------------------------------------------------------------
+    # 4. 당일 거래량 대비 수급 강도: 최대 15점
+    # 외국인+기관의 당일 순매수 수량 / 당일 전체 거래량
+    # ------------------------------------------------------------------
+    latest = recent_5d.iloc[-1]
+    acc_trade_volume = float(latest["AccTradeVolume"])
+
+    today_flow_volume = (
+        float(latest["Foreigner"])
+        + float(latest["Institution"])
+    )
+
+    if acc_trade_volume > 0:
+        flow_intensity_pct = (
+            direction
+            * today_flow_volume
+            / acc_trade_volume
+            * 100
+        )
+    else:
+        flow_intensity_pct = 0.0
+
+    if flow_intensity_pct >= 3.0:
+        intensity_score = 15
+    elif flow_intensity_pct >= 1.5:
+        intensity_score = 10
+    elif flow_intensity_pct > 0:
+        intensity_score = 5
+    else:
+        intensity_score = 0
+
+    total_score = int(
+        rank_score
+        + foreign_score
+        + institution_score
+        + ownership_score
+        + intensity_score
+    )
+
+    # ------------------------------------------------------------------
+    # 5. 점수 등급
+    # ------------------------------------------------------------------
+    if total_score >= 80:
+        grade = "강한 수급 확증"
+        grade_color = "green"
+    elif total_score >= 60:
+        grade = "수급 확증 우위"
+        grade_color = "blue"
+    elif total_score >= 40:
+        grade = "수급 혼조"
+        grade_color = "gray"
+    elif total_score >= 20:
+        grade = "약한 수급 확증"
+        grade_color = "orange"
+    else:
+        grade = "반대 수급 우세"
+        grade_color = "red"
+
+    positive_reasons = []
+    warning_reasons = []
+
+    if rank_score >= 15:
+        positive_reasons.append(
+            f"시장 전체 {trade_type} 상위 {rank}위"
+        )
+    elif rank_score <= 5:
+        warning_reasons.append(
+            f"시장 전체 순위가 {rank}위로 상대적으로 낮음"
+        )
+
+    if foreign_score >= 18:
+        positive_reasons.append(
+            f"외국인 최근 {sample_days}거래일 수급이 "
+            f"{foreign_aligned_days}일 동일 방향"
+        )
+    elif foreign_score == 0:
+        warning_reasons.append(
+            "외국인 최근 누적 수급이 당일 레이더 방향과 반대"
+        )
+
+    if institution_score >= 18:
+        positive_reasons.append(
+            f"기관 최근 {sample_days}거래일 수급이 "
+            f"{institution_aligned_days}일 동일 방향"
+        )
+    elif institution_score == 0:
+        warning_reasons.append(
+            "기관 최근 누적 수급이 당일 레이더 방향과 반대"
+        )
+
+    if ownership_score >= 10:
+        positive_reasons.append(
+            f"외국인 보유율 {ownership_change_bp:+.1f}bp 변화"
+        )
+    elif ownership_score == 0:
+        warning_reasons.append(
+            f"외국인 보유율 변화가 레이더 방향과 불일치 "
+            f"({ownership_change_bp:+.1f}bp)"
+        )
+
+    if intensity_score >= 10:
+        positive_reasons.append(
+            f"거래량 대비 수급 강도 {flow_intensity_pct:+.2f}%"
+        )
+    elif intensity_score == 0:
+        warning_reasons.append(
+            f"당일 거래량 대비 수급 강도가 약함 "
+            f"({flow_intensity_pct:+.2f}%)"
+        )
+
+    return {
+        "available": True,
+        "total_score": total_score,
+        "grade": grade,
+        "grade_color": grade_color,
+        "reason": "",
+        "rank_score": rank_score,
+        "foreign_score": foreign_score,
+        "institution_score": institution_score,
+        "ownership_score": ownership_score,
+        "intensity_score": intensity_score,
+        "foreign_5d_sum": foreign_5d_sum,
+        "institution_5d_sum": institution_5d_sum,
+        "foreign_aligned_days": foreign_aligned_days,
+        "institution_aligned_days": institution_aligned_days,
+        "sample_days": sample_days,
+        "ownership_change_bp": ownership_change_bp,
+        "flow_intensity_pct": flow_intensity_pct,
+        "positive_reasons": positive_reasons,
+        "warning_reasons": warning_reasons,
+    }
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
