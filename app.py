@@ -206,12 +206,15 @@ st.sidebar.caption("© 2026 Macro Web Dashboard v2.3")
 # ==========================================
 kst_tz = ZoneInfo("Asia/Seoul")
 now_kst = datetime.now(kst_tz)
-now_str_kst = now_kst.strftime('%Y-%m-%d %H:%M:%S')
+now_str_kst = now_kst.strftime("%Y-%m-%d %H:%M:%S")
 
 live_clock_src = (
-    "data:text/html;base64,"
-    + base64.b64encode(LIVE_CLOCK_HTML.encode("utf-8")).decode("ascii")
+    "data:text/html;charset=utf-8;base64,"
+    + base64.b64encode(
+        LIVE_CLOCK_HTML.encode("utf-8")
+    ).decode("ascii")
 )
+
 st.iframe(
     src=live_clock_src,
     height=45,
