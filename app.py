@@ -1,6 +1,6 @@
 # app.py
 import streamlit as st
-import streamlit.components.v1 as components
+import base64
 import urllib3
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -117,7 +117,7 @@ def check_password():
             st.caption("인가된 사용자만 접근할 수 있는 시스템입니다.")
             pwd_input = st.text_input("접속 비밀번호를 입력하세요", type="password", placeholder="Enter Password...")
             
-            if st.button("로그인", type="primary", use_container_width=True):
+            if st.button("로그인", type="primary", width="stretch"):
                 if pwd_input == correct_password:
                     st.session_state.authenticated = True
                     st.rerun()
@@ -157,7 +157,7 @@ menu_selection = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.markdown("#### 🔄 데이터 갱신 설정")
 
-if st.sidebar.button("데이터 수동 새로고침 🚀", use_container_width=True):
+if st.sidebar.button("데이터 수동 새로고침 🚀", width="stretch"):
     st.cache_data.clear()
     st.rerun()
 
@@ -174,7 +174,7 @@ if auto_refresh_enabled:
 
 st.sidebar.divider()
 
-if st.sidebar.button("로그아웃", use_container_width=True):
+if st.sidebar.button("로그아웃", width="stretch"):
     st.session_state.authenticated = False
     st.rerun()
 
@@ -182,7 +182,7 @@ st.sidebar.divider()
 
 if st.sidebar.button(
     "🛑 앱 서버 종료",
-    use_container_width=True,
+    width="stretch",
     type="primary",
 ):
     st.session_state["shutdown_requested"] = True
@@ -208,7 +208,15 @@ kst_tz = ZoneInfo("Asia/Seoul")
 now_kst = datetime.now(kst_tz)
 now_str_kst = now_kst.strftime('%Y-%m-%d %H:%M:%S')
 
-components.html(LIVE_CLOCK_HTML, height=45)
+live_clock_src = (
+    "data:text/html;base64,"
+    + base64.b64encode(LIVE_CLOCK_HTML.encode("utf-8")).decode("ascii")
+)
+st.iframe(
+    src=live_clock_src,
+    height=45,
+    scrolling=False,
+)
 
 if menu_selection == "📊 거시경제 매크로 지표":
     render_macro_view(now_str_kst, refresh_interval)
