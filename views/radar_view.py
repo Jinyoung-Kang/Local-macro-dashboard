@@ -733,11 +733,168 @@ def render_radar_view():
                     unsafe_allow_html=True,
                 )
     
-                st.caption(
-                    "수급 확증 점수는 투자 추천·매매 신호가 아닙니다. "
-                    "Daum 종목별 외국인·기관 수량 수급, 보유율 변화, "
-                    "시장 전체 레이더 순위를 결합한 참고용 정합성 지표입니다."
-                )
+with st.expander(
+    "📖 종목 수급 확증 점수 해석 가이드",
+    expanded=False,
+):
+    st.caption(
+        "수급 확증 점수는 당일 레이더 수급 방향과 최근 외국인·기관 수급의 "
+        "정합성을 0~100점으로 요약한 참고 지표입니다. "
+        "실제 Daum 종목별 수급 데이터가 있을 때만 계산됩니다."
+    )
+
+    guide_col1, guide_col2 = st.columns([1.05, 1.95])
+
+    with guide_col1:
+        st.markdown("##### 점수 등급")
+
+        st.markdown(
+            """
+            <div style="
+                border:1px solid #30363D;
+                border-radius:8px;
+                overflow:hidden;
+                background-color:#161B22;
+                font-size:0.87rem;
+            ">
+                <div style="
+                    padding:9px 12px;
+                    border-left:4px solid #3FB950;
+                    border-bottom:1px solid #30363D;
+                    color:#C9D1D9;
+                ">
+                    <strong style="color:#3FB950;">80~100점</strong>
+                    · 강한 수급 확증
+                </div>
+                <div style="
+                    padding:9px 12px;
+                    border-left:4px solid #58A6FF;
+                    border-bottom:1px solid #30363D;
+                    color:#C9D1D9;
+                ">
+                    <strong style="color:#58A6FF;">60~79점</strong>
+                    · 수급 확증 우위
+                </div>
+                <div style="
+                    padding:9px 12px;
+                    border-left:4px solid #8B949E;
+                    border-bottom:1px solid #30363D;
+                    color:#C9D1D9;
+                ">
+                    <strong style="color:#8B949E;">40~59점</strong>
+                    · 수급 혼조
+                </div>
+                <div style="
+                    padding:9px 12px;
+                    border-left:4px solid #D29922;
+                    border-bottom:1px solid #30363D;
+                    color:#C9D1D9;
+                ">
+                    <strong style="color:#D29922;">20~39점</strong>
+                    · 약한 수급 확증
+                </div>
+                <div style="
+                    padding:9px 12px;
+                    border-left:4px solid #F85149;
+                    color:#C9D1D9;
+                ">
+                    <strong style="color:#F85149;">0~19점</strong>
+                    · 반대 수급 우세
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with guide_col2:
+            st.markdown("##### 평가 요소와 배점")
+    
+            score_guide_df = pd.DataFrame({
+                "평가 요소": [
+                    "시장 전체 수급 순위",
+                    "외국인 최근 5거래일 수급",
+                    "기관 최근 5거래일 수급",
+                    "외국인 보유율 변화",
+                    "당일 거래량 대비 수급 강도",
+                ],
+                "최대 점수": [
+                    "20점",
+                    "25점",
+                    "25점",
+                    "15점",
+                    "15점",
+                ],
+                "확증 판단 기준": [
+                    "현재 시장 전체 Top N에서 상위권일수록 높은 점수",
+                    "최근 5거래일 누적 방향 및 일별 방향 일치 여부",
+                    "최근 5거래일 누적 방향 및 일별 방향 일치 여부",
+                    "외국인 보유율이 레이더 수급 방향과 같은 방향으로 변화",
+                    "외국인+기관 당일 순매수량이 거래량에서 차지하는 비중",
+                ],
+            })
+    
+            st.dataframe(
+                score_guide_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "평가 요소": st.column_config.TextColumn(
+                        width="medium",
+                    ),
+                    "최대 점수": st.column_config.TextColumn(
+                        width="small",
+                    ),
+                    "확증 판단 기준": st.column_config.TextColumn(
+                        width="large",
+                    ),
+                },
+            )
+    
+        st.markdown(
+            """
+            <div style="
+                margin-top:12px;
+                background-color:rgba(88,166,255,0.08);
+                border:1px solid rgba(88,166,255,0.25);
+                border-left:4px solid #58A6FF;
+                border-radius:6px;
+                padding:11px 14px;
+                color:#C9D1D9;
+                font-size:0.84rem;
+                line-height:1.65;
+            ">
+                <strong style="color:#58A6FF;">점수 해석 예시:</strong><br>
+                순매수 레이더에서 외국인·기관의 최근 5거래일 누적 수급이 모두 순매수이고,
+                외국인 보유율까지 상승하며 시장 전체 순위가 높다면 높은 점수가 부여됩니다.
+                반대로 당일 순매수 상위 종목이더라도 최근 5거래일 외국인 또는 기관 수급이
+                반대 방향이면 확증 점수가 낮아집니다.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    
+        st.markdown(
+            """
+            <div style="
+                margin-top:8px;
+                background-color:rgba(210,153,34,0.10);
+                border:1px solid rgba(210,153,34,0.28);
+                border-left:4px solid #D29922;
+                border-radius:6px;
+                padding:11px 14px;
+                color:#C9D1D9;
+                font-size:0.84rem;
+                line-height:1.65;
+            ">
+                <strong style="color:#D29922;">⚠️ 해석 유의사항:</strong><br>
+                이 점수는 미래 가격 상승·하락을 예측하거나 매수·매도를 추천하는 신호가 아닙니다.
+                단기 수급은 ETF 설정·환매, 프로그램 매매, 차익거래, 대차·결제 시차,
+                블록딜 등으로 왜곡될 수 있습니다. 실적·밸류에이션·시장 환경·변동성·뉴스와
+                함께 사용하세요.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
             
             fig_cum = make_subplots(
