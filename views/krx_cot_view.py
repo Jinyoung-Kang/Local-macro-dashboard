@@ -20,6 +20,7 @@ from services.krx_service import (
     get_krx_futures_history,
     get_krx_investor_derivatives_summary,
     fetch_daum_futures_investor_trend,
+    fetch_daum_futures_intraday_acceleration,
 )
 
 
@@ -122,6 +123,8 @@ def render_krx_cot_view():
     if df_investors is None or df_investors.empty:
         df_investors = get_krx_investor_derivatives_summary()
 
+    intraday_flow = fetch_daum_futures_intraday_acceleration(lookback_minutes=30)
+    
     if df_hist.empty:
         st.warning("KOSPI 200 선물 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.")
         return
@@ -240,6 +243,146 @@ def render_krx_cot_view():
         )
         st.caption("80 이상=과열, 20 이하=침체")
 
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    # ==========================================================================
+    # [신규] 선물 장중 수급 가속도
+    # ==========================================================================
+    st.markdown("#### ⚡ 선물 장중 수급 가속도")
+    
+    st.caption(
+        "Daum 금융의 시간별 누적 순매수 계약 데이터를 기준으로, "
+        "최신 시점과 최근 30분 전 기준 시점의 차이를 계산합니다. "
+        "장중 수급은 정산·집계 시점에 따라 변동될 수 있는 비공식 참고 데이터입니다."
+    )
+    
+    if intraday_flow.get("available"):
+        latest_time = intraday_flow["latest_time"]
+        reference_time = intraday_flow["reference_time"]
+        data_date = intraday_flow["data_date"]
+        lookback_minutes = intraday_flow["lookback_minutes"]
+    
+        st.markdown(
+            f"""
+            <div style="
+                background-color:#161B22;
+                border:1px solid #30363D;
+                border-radius:6px;
+                padding:8px 14px;
+                margin-bottom:12px;
+                font-size:0.84rem;
+                color:#8B949E;
+                display:flex;
+                justify-content:space-between;
+                align-items:center;
+                flex-wrap:wrap;
+                gap:8px;
+            ">
+                <span>
+                    📡 출처:
+                    <strong style="color:#58A6FF;">
+                        Daum 금융 시간별 선물 수급
+                    </strong>
+                </span>
+                <span>
+                    기준일:
+                    <strong style="color:#F0F6FC;">{data_date}</strong>
+                    · 최신:
+                    <strong style="color:#F0F6FC;">{latest_time}</strong>
+                    · 비교:
+                    <strong style="color:#F0F6FC;">
+                        {reference_time}
+                    </strong>
+                    ({lookback_minutes}분 전 또는 가장 가까운 이전 시점)
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    
+        acc_col1, acc_col2, acc_col3, acc_col4 = st.columns(4)
+    
+        with acc_col1:
+            st.metric(
+                label="외국인 장중 누적 순매수",
+                value=f"{intraday_flow['foreign_current']:+,} 계약",
+                delta=(
+                    f"최근 {lookback_minutes}분 "
+                    f"{intraday_flow['foreign_change']:+,} 계약"
+                ),
+                delta_color="normal",
+            )
+    
+        with acc_col2:
+            st.metric(
+                label="기관계 장중 누적 순매수",
+                value=f"{intraday_flow['institution_current']:+,} 계약",
+                delta=(
+                    f"최근 {lookback_minutes}분 "
+                    f"{intraday_flow['institution_change']:+,} 계약"
+                ),
+                delta_color="normal",
+            )
+    
+        with acc_col3:
+            st.metric(
+                label="금융투자 장중 누적 순매수",
+                value=f"{intraday_flow['financial_current']:+,} 계약",
+                delta=(
+                    f"최근 {lookback_minutes}분 "
+                    f"{intraday_flow['financial_change']:+,} 계약"
+                ),
+                delta_color="normal",
+            )
+    
+        with acc_col4:
+            st.metric(
+                label="연기금등 장중 누적 순매수",
+                value=f"{intraday_flow['pension_current']:+,} 계약",
+                delta=(
+                    f"최근 {lookback_minutes}분 "
+                    f"{intraday_flow['pension_change']:+,} 계약"
+                ),
+                delta_color="normal",
+            )
+    
+        flow_status = intraday_flow["flow_status"]
+        flow_color = intraday_flow["flow_status_color"]
+    
+        st.markdown(
+            f"""
+            <div style="
+                margin-top:10px;
+                padding:10px 14px;
+                border-left:4px solid {'#3FB950' if flow_color == 'green' else '#F85149' if flow_color == 'red' else '#58A6FF' if flow_color == 'blue' else '#D29922' if flow_color == 'orange' else '#8B949E'};
+                background-color:#161B22;
+                border-radius:4px;
+            ">
+                <div style="
+                    color:#8B949E;
+                    font-size:0.82rem;
+                    margin-bottom:3px;
+                ">
+                    외국인·기관계 최근 {lookback_minutes}분 수급 진단
+                </div>
+                <div style="
+                    color:#F0F6FC;
+                    font-size:0.96rem;
+                    font-weight:600;
+                ">
+                    {flow_status}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    
+    else:
+        st.info(
+            "현재 Daum 시간별 선물 수급 데이터를 가져오지 못했습니다. "
+            "장 마감·주말·공휴일 또는 Daum 내부 API 응답 지연일 수 있습니다. "
+            f"세부 오류: {intraday_flow.get('error', '알 수 없음')}"
+        )
+    
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
     # ==========================================================================
