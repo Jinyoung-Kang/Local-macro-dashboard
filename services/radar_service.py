@@ -19,6 +19,7 @@ import numpy as np
 
 from services.ls_service import call_ls_api
 from services.kis_service import call_kis_api
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from pykrx import stock
@@ -1519,6 +1520,16 @@ def fetch_daum_stock_investor_flow(
         date, foreignStraightPurchaseVolume, institutionStraightPurchaseVolume,
         tradePrice, foreignOwnShares, foreignOwnSharesRate
 
+    [성능 개선]
+    기존에는 1페이지 결과의 totalPages/조기종료 조건을 확인한 뒤에야
+    다음 페이지를 요청할 수 있어(while page <= max_pages) 순차적으로만
+    호출할 수 있었습니다.
+
+    이제는 1페이지를 먼저 요청해 totalPages와 조기 종료 시점을 확인한 뒤,
+    필요한 나머지 페이지 수를 한 번에 계산해 ThreadPoolExecutor로
+    동시에 요청합니다. 1페이지가 이미 충분하면(조기 종료) 추가 요청 없이
+    즉시 반환합니다.
+
     주의:
     - 개인(리테일) 순매수는 이 API가 직접 제공하지 않습니다.
       역산해서 만들어내지 않고, 외국인·기관만 정확하게 표시합니다.
@@ -1545,13 +1556,11 @@ def fetch_daum_stock_investor_flow(
         datetime.now(ZoneInfo("Asia/Seoul")).date() - start_date_obj
     ).days
     per_page = max(min(int(lookback_days * 1.6) + 10, 300), 60)
-
-    all_rows = []
-    page = 1
     max_pages = 6
 
-    try:
-        while page <= max_pages:
+    def fetch_page(page: int):
+        """단일 페이지를 요청합니다. 실패 시 None을 반환합니다."""
+        try:
             response = requests.get(
                 DAUM_STOCK_INVESTOR_URL,
                 headers=headers,
@@ -1563,41 +1572,75 @@ def fetch_daum_stock_investor_flow(
                 },
                 timeout=10,
             )
-
             if response.status_code != 200:
                 logger.warning(
-                    "Daum 종목별 투자자 수급 API HTTP 실패: code=%s, status=%s",
-                    symbol_code,
-                    response.status_code,
+                    "Daum 종목별 투자자 수급 API HTTP 실패: code=%s, page=%s, status=%s",
+                    symbol_code, page, response.status_code,
                 )
-                break
+                return None
+            return response.json()
+        except Exception as e:
+            logger.warning(
+                "Daum 종목별 투자자 수급 페이지 요청 실패: code=%s, page=%s, error=%s",
+                symbol_code, page, e,
+            )
+            return None
 
-            payload = response.json()
-            rows = payload.get("data", [])
-            if not isinstance(rows, list) or not rows:
-                break
+    try:
+        # ------------------------------------------------------------------
+        # 1단계: 1페이지를 먼저 요청해 totalPages와 조기 종료 여부를 확인합니다.
+        # 다음 페이지를 몇 개 더 받아야 하는지는 1페이지 응답을 봐야 알 수
+        # 있으므로, 이 요청만은 병렬화할 수 없습니다.
+        # ------------------------------------------------------------------
+        first_payload = fetch_page(1)
+        if not first_payload:
+            return pd.DataFrame()
 
-            all_rows.extend(rows)
+        first_rows = first_payload.get("data", [])
+        if not isinstance(first_rows, list) or not first_rows:
+            logger.warning("Daum 종목별 투자자 수급 API 빈 응답: code=%s", symbol_code)
+            return pd.DataFrame()
 
-            oldest_date_str = rows[-1].get("date", "")
-            try:
-                oldest_date = pd.to_datetime(oldest_date_str).date()
-            except Exception:
-                oldest_date = None
+        all_rows = list(first_rows)
+        total_pages = first_payload.get("totalPages", 1)
 
-            if oldest_date is not None and oldest_date <= start_date_obj:
-                break
+        oldest_date_in_page1 = None
+        try:
+            oldest_date_in_page1 = pd.to_datetime(first_rows[-1].get("date", "")).date()
+        except Exception:
+            pass
 
-            total_pages = payload.get("totalPages", page)
-            if page >= total_pages:
-                break
+        already_enough = (
+            oldest_date_in_page1 is not None
+            and oldest_date_in_page1 <= start_date_obj
+        )
 
-            page += 1
+        # ------------------------------------------------------------------
+        # 2단계: 1페이지로 부족하면, 필요한 나머지 페이지를 한 번에 계산해
+        # ThreadPoolExecutor로 동시에 요청합니다.
+        # ------------------------------------------------------------------
+        if not already_enough and total_pages > 1:
+            remaining_pages = list(range(2, min(total_pages, max_pages) + 1))
+
+            with ThreadPoolExecutor(max_workers=min(len(remaining_pages), 5)) as executor:
+                future_map = {
+                    executor.submit(fetch_page, page): page
+                    for page in remaining_pages
+                }
+                page_results = {}
+                for future in as_completed(future_map):
+                    page = future_map[future]
+                    payload = future.result()
+                    if payload:
+                        page_results[page] = payload.get("data", [])
+
+            # 페이지 순서(최신→과거)를 그대로 유지하기 위해 페이지 번호 순으로 병합
+            for page in sorted(page_results.keys()):
+                rows = page_results[page]
+                if isinstance(rows, list):
+                    all_rows.extend(rows)
 
         if not all_rows:
-            logger.warning(
-                "Daum 종목별 투자자 수급 API 빈 응답: code=%s", symbol_code
-            )
             return pd.DataFrame()
 
         df = pd.DataFrame(all_rows)
@@ -1622,9 +1665,7 @@ def fetch_daum_stock_investor_flow(
         if df.empty:
             logger.warning(
                 "Daum 종목별 투자자 수급: 요청 기간 내 데이터 없음. code=%s, %s~%s",
-                symbol_code,
-                start_date_obj,
-                end_date_obj,
+                symbol_code, start_date_obj, end_date_obj,
             )
             return pd.DataFrame()
 
@@ -1638,10 +1679,7 @@ def fetch_daum_stock_investor_flow(
 
         logger.info(
             "Daum 종목별 투자자 수급 수집 성공: code=%s, rows=%s, %s~%s",
-            symbol_code,
-            len(df),
-            df["Date"].min().date(),
-            df["Date"].max().date(),
+            symbol_code, len(df), df["Date"].min().date(), df["Date"].max().date(),
         )
 
         return df[[
@@ -1651,9 +1689,7 @@ def fetch_daum_stock_investor_flow(
         ]]
 
     except Exception as e:
-        logger.warning(
-            "Daum 종목별 투자자 수급 수집 실패: code=%s, error=%s", symbol_code, e
-        )
+        logger.warning("Daum 종목별 투자자 수급 수집 실패: code=%s, error=%s", symbol_code, e)
         return pd.DataFrame()
 
 
