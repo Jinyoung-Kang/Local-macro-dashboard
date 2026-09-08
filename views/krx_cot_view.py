@@ -662,12 +662,7 @@ def render_krx_cot_view():
                 "계약수 기준으로 표시됩니다."
             )
         else:
-            if inv_is_placeholder:
-                measure_caption = (
-                    "현재 표시값은 계약수 기준 placeholder(예시) 데이터입니다. "
-                    "Daum 실제 데이터를 가져오지 못해 금액 기준 조회는 제공할 수 없습니다."
-                )
-            elif display_measure == "PRICE":
+            if display_measure == "PRICE":
                 measure_caption = (
                     "금액 기준: Daum 원 단위 응답을 억 원 단위로 변환해 표시합니다."
                 )
@@ -675,7 +670,7 @@ def render_krx_cot_view():
                 measure_caption = (
                     "계약수 기준: 투자주체별 KOSPI 200 선물 순매수 계약 수량입니다."
                 )
-            
+        
             st.caption(
                 "📡 출처: Daum 금융 비공식 API "
                 "(finance.daum.net/api/investor/future/days). "
