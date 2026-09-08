@@ -417,21 +417,38 @@ DAUM_FUTURES_CATEGORY_MAP = [
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_daum_futures_investor_trend(lookback_days: int = 25) -> pd.DataFrame:
+def fetch_daum_futures_investor_trend(
+    lookback_days: int = 25,
+    measure: str = "CONTRACT",
+) -> pd.DataFrame:
     """
-    Daum 금융 '투자주체별 매매동향(선물)' 페이지의 내부 JSON API에서
-    KOSPI 200 선물 개인/외국인/기관계(및 세부: 금융투자/보험/투신/은행/
-    기타금융/연기금등)/기타법인의 일자별 순매수(계약수)를 가져와
-    당일/5일 누적/20일 누적을 계산합니다.
+    Daum 금융 '투자주체별 매매동향(선물)' 내부 JSON API에서
+    KOSPI 200 선물의 투자자별 일자별 순매수 데이터를 가져옵니다.
 
-    주의:
-    - Daum 공식 API가 아닌 웹페이지 내부 요청이므로, 페이지 구조 변경 시
-      실패할 수 있습니다.
-    - 단위는 계약수(contracts)입니다. 금액 기준이 필요하면 type=PRICE
-      파라미터를 추가로 사용해야 합니다(원 단위로 반환됨).
-    - 실패 시 빈 DataFrame을 반환하며, 호출부는 반드시
-      get_krx_investor_derivatives_summary()로 폴백해야 합니다.
+    measure:
+    - CONTRACT: 계약수 기준 (기본값)
+    - PRICE: 금액 기준. Daum 원 단위 응답을 억 원 단위로 변환합니다.
+
+    반환 컬럼:
+    - 투자 주체
+    - 당일 순매수
+    - 5일 누적
+    - 20일 누적
+    - 포지션 성향
+    - is_placeholder
+    - data_measure
+    - data_unit
     """
+    valid_measures = {"CONTRACT", "PRICE"}
+    measure = str(measure).upper().strip()
+
+    if measure not in valid_measures:
+        logger.warning(
+            "Daum 선물 수급 지원하지 않는 measure=%s. CONTRACT로 변경합니다.",
+            measure,
+        )
+        measure = "CONTRACT"
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -443,12 +460,18 @@ def fetch_daum_futures_investor_trend(lookback_days: int = 25) -> pd.DataFrame:
         "Referer": "https://finance.daum.net/domestic/investors/DERIVATIVES",
         "X-Requested-With": "XMLHttpRequest",
     }
+
     params = {
         "page": 1,
         "perPage": max(lookback_days, 20),
         "terms": "days",
         "pagination": "true",
     }
+
+    # Daum API는 계약수 모드일 때 type 파라미터가 없고,
+    # 금액 모드일 때만 type=PRICE를 사용합니다.
+    if measure == "PRICE":
+        params["type"] = "PRICE"
 
     try:
         response = requests.get(
@@ -460,7 +483,9 @@ def fetch_daum_futures_investor_trend(lookback_days: int = 25) -> pd.DataFrame:
 
         if response.status_code != 200:
             logger.warning(
-                "Daum 선물 투자주체별 매매동향 API HTTP 실패: status=%s",
+                "Daum 선물 투자주체별 매매동향 API HTTP 실패: "
+                "measure=%s, status=%s",
+                measure,
                 response.status_code,
             )
             return pd.DataFrame()
@@ -469,43 +494,90 @@ def fetch_daum_futures_investor_trend(lookback_days: int = 25) -> pd.DataFrame:
         rows = payload.get("data", [])
 
         if not isinstance(rows, list) or not rows:
-            logger.warning("Daum 선물 투자주체별 매매동향 API 빈 응답")
+            logger.warning(
+                "Daum 선물 투자주체별 매매동향 API 빈 응답: measure=%s",
+                measure,
+            )
             return pd.DataFrame()
 
-        # 응답은 최신일이 첫 번째(DESC)로 옵니다.
         parsed_rows = []
+
         for row in rows:
             if not isinstance(row, dict):
                 continue
+
             parsed_rows.append({
                 "date": row.get("date"),
                 **{
-                    field: row.get(field, 0)
+                    field: pd.to_numeric(
+                        row.get(field, 0),
+                        errors="coerce",
+                    )
                     for _, field in DAUM_FUTURES_CATEGORY_MAP
                 },
             })
 
         if not parsed_rows:
+            logger.warning(
+                "Daum 선물 수급 API 파싱 결과가 비어 있습니다: measure=%s",
+                measure,
+            )
             return pd.DataFrame()
 
         df_raw = pd.DataFrame(parsed_rows)
 
+        numeric_columns = [
+            field
+            for _, field in DAUM_FUTURES_CATEGORY_MAP
+        ]
+
+        for column in numeric_columns:
+            df_raw[column] = pd.to_numeric(
+                df_raw[column],
+                errors="coerce",
+            ).fillna(0.0)
+
+        # API 응답은 최신 거래일이 첫 행인 DESC 순서입니다.
         today_row = df_raw.iloc[0]
-        cum_5d = df_raw.iloc[: min(5, len(df_raw))].sum(numeric_only=True)
-        cum_20d = df_raw.iloc[: min(20, len(df_raw))].sum(numeric_only=True)
+        cum_5d = df_raw.iloc[: min(5, len(df_raw))].sum(
+            numeric_only=True
+        )
+        cum_20d = df_raw.iloc[: min(20, len(df_raw))].sum(
+            numeric_only=True
+        )
+
+        # type=PRICE 응답은 원 단위이므로 억 원 단위로 변환합니다.
+        divisor = 100_000_000 if measure == "PRICE" else 1
+        unit = "억 원" if measure == "PRICE" else "계약"
+        measure_label = "금액" if measure == "PRICE" else "계약수"
 
         records = []
-        for label, field in DAUM_FUTURES_CATEGORY_MAP:
-            net_today = int(today_row.get(field, 0) or 0)
-            net_5d = int(cum_5d.get(field, 0) or 0)
-            net_20d = int(cum_20d.get(field, 0) or 0)
 
+        for label, field in DAUM_FUTURES_CATEGORY_MAP:
+            raw_today = float(today_row.get(field, 0.0) or 0.0)
+            raw_5d = float(cum_5d.get(field, 0.0) or 0.0)
+            raw_20d = float(cum_20d.get(field, 0.0) or 0.0)
+
+            net_today = raw_today / divisor
+            net_5d = raw_5d / divisor
+            net_20d = raw_20d / divisor
+
+            # 포지션 성향은 최근 20거래일 누적값을 기준으로 판단합니다.
             if net_20d > 0:
                 stance = "🟢 매수 우위(Long)"
             elif net_20d < 0:
                 stance = "🔴 매도 우위(Short)"
             else:
                 stance = "⚪ 중립"
+
+            if measure == "PRICE":
+                net_today = round(net_today, 1)
+                net_5d = round(net_5d, 1)
+                net_20d = round(net_20d, 1)
+            else:
+                net_today = int(net_today)
+                net_5d = int(net_5d)
+                net_20d = int(net_20d)
 
             records.append({
                 "투자 주체": label,
@@ -516,10 +588,19 @@ def fetch_daum_futures_investor_trend(lookback_days: int = 25) -> pd.DataFrame:
             })
 
         df_result = pd.DataFrame(records)
+
+        # 뷰에서 토글별 표기·포맷을 결정하는 데 사용합니다.
         df_result["is_placeholder"] = False
+        df_result["data_measure"] = measure
+        df_result["data_unit"] = unit
+        df_result["data_date"] = str(
+            today_row.get("date", "")
+        )[:10]
 
         logger.info(
-            "Daum 선물 투자주체별 매매동향 수집 성공: rows=%s, 기준일=%s",
+            "Daum 선물 투자주체별 매매동향 수집 성공: "
+            "measure=%s, rows=%s, 기준일=%s",
+            measure_label,
             len(df_result),
             today_row.get("date"),
         )
@@ -527,7 +608,12 @@ def fetch_daum_futures_investor_trend(lookback_days: int = 25) -> pd.DataFrame:
         return df_result
 
     except Exception as e:
-        logger.warning("Daum 선물 투자주체별 매매동향 수집 실패: %s", e)
+        logger.warning(
+            "Daum 선물 투자주체별 매매동향 수집 실패: "
+            "measure=%s, error=%s",
+            measure,
+            e,
+        )
         return pd.DataFrame()
 
 
