@@ -21,6 +21,10 @@ from views.radar_view import render_radar_view
 from views.ai_test_view import render_ai_test_view
 from views.ai_report_view import render_ai_report_view
 from views.toss_test_view import render_toss_test_view
+from views.data_status_view import (
+    render_data_freshness_sidebar,
+    render_data_status_view,
+)
 
 # SSL 경고 비활성화
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -159,7 +163,8 @@ menu_selection = st.sidebar.radio(
         "🇰🇷 국내 파생 & 투기세력 (KRX)",
         "📡 외국인/기관 수급 레이더 (코스피)",
         "🤖 AI 종합 데이터 분석 & 결론 리포트",
-        "🤖 AI API 연결 테스트"
+        "🤖 AI API 연결 테스트",
+        "🗄️ 데이터 저장소 상태"
     ],
     index=0,
     label_visibility="collapsed"
@@ -168,7 +173,10 @@ menu_selection = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.markdown("#### 🔄 데이터 갱신 설정")
 
+render_data_freshness_sidebar()
+
 if st.sidebar.button("데이터 수동 새로고침 🚀", width="stretch"):
+    # 저장 계층 캐시까지 비워 다음 조회에서 다시 수집하도록 합니다.
     st.cache_data.clear()
     st.rerun()
 
@@ -265,3 +273,5 @@ elif menu_selection == "🤖 AI 종합 데이터 분석 & 결론 리포트":
     render_ai_report_view()
 elif menu_selection == "🤖 AI API 연결 테스트":
     render_ai_test_view()
+elif menu_selection == "🗄️ 데이터 저장소 상태":
+    render_data_status_view()

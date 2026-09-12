@@ -10,6 +10,8 @@ import yfinance as yf
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from services import datasets, store
+
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
@@ -42,8 +44,7 @@ ROTATION_ASSET_CLASSES = {
 }
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
+def collect_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
     """
     여러 ETF의 일봉 시계열을 한 번에 수집해 {티커: DataFrame} 으로 반환합니다.
 
@@ -116,6 +117,81 @@ def _fetch_single_history(ticker: str, period: str) -> pd.DataFrame:
     """배치 수집에서 누락된 개별 티커 폴백 수집."""
     df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
     return df if df is not None else pd.DataFrame()
+
+
+# ==============================================================================
+# 0-1. 저장본 우선 읽기 경로
+# ==============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
+    """
+    화면용 진입점. 수집기가 적재해 둔 종가 스냅샷을 먼저 씁니다.
+
+    수집기는 섹터·자산군 전체 티커의 2년 종가를 한 번에 받아 저장하므로,
+    화면은 필요한 티커만 잘라 쓰면 됩니다. 저장본에 없는 티커가 있으면
+    그 티커만 직접 수집합니다.
+    """
+    symbols = [t for t in dict.fromkeys(tickers) if t]
+    if not symbols:
+        return {}
+
+    mode = store.get_read_mode()
+    if mode == store.READ_MODE_LIVE_ONLY:
+        return collect_etf_history_map(tuple(symbols), period=period)
+
+    stored = _read_stored_etf_history(symbols)
+    missing = [t for t in symbols if t not in stored]
+
+    if not missing:
+        return stored
+
+    if mode == store.READ_MODE_STORE_ONLY:
+        if stored:
+            logger.info("store_only: 저장본에 없는 티커는 건너뜁니다: %s", missing)
+        return stored
+
+    logger.info("저장본에 없는 티커를 직접 수집합니다: %s", missing)
+    fetched = collect_etf_history_map(tuple(missing), period=period)
+    stored.update({
+        t: df for t, df in (fetched or {}).items()
+        if df is not None and not df.empty
+    })
+    return stored
+
+
+def _read_stored_etf_history(symbols: list[str]) -> dict:
+    """
+    수집기가 저장한 종가 스냅샷에서 요청 티커만 DataFrame으로 복원합니다.
+
+    저장 형식(collector._task_sector_history):
+        {티커: {"dates": ["YYYY-MM-DD", ...], "close": [float|None, ...]}}
+    """
+    snap = store.read_snapshot(datasets.SNAP_SECTOR_HISTORY)
+    if snap is None or not isinstance(snap.payload, dict):
+        return {}
+
+    if not snap.is_fresh(datasets.MAX_AGE_DAILY):
+        logger.info(
+            "섹터 종가 저장본이 오래됐습니다 (수집 시각 %s)",
+            snap.collected_at_kst_str(),
+        )
+
+    out: dict[str, pd.DataFrame] = {}
+    for ticker in symbols:
+        entry = snap.payload.get(ticker)
+        if not isinstance(entry, dict):
+            continue
+        dates = entry.get("dates") or []
+        closes = entry.get("close") or []
+        if not dates or len(dates) != len(closes):
+            continue
+        df = pd.DataFrame(
+            {"Close": pd.to_numeric(pd.Series(closes), errors="coerce").values},
+            index=pd.to_datetime(dates, errors="coerce"),
+        ).dropna()
+        if not df.empty:
+            out[ticker] = df
+    return out
 
 
 # ==============================================================================

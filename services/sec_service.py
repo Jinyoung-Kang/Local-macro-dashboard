@@ -10,6 +10,8 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from services import datasets, store
 from bs4 import BeautifulSoup
 import streamlit as st
 from config import INSTITUTIONS
@@ -56,8 +58,7 @@ def get_sec_session() -> requests.Session:
 # ==============================================================================
 # 2. 통합 13F 분기 데이터 크롤러 (Type 컬럼 검색 및 콤마 제거 파싱)
 # ==============================================================================
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_sec_13f_multi_quarters(cik: str, max_quarters: int = 4):
+def collect_sec_13f_multi_quarters(cik: str, max_quarters: int = 4):
     """
     최대 max_quarters 분기만큼의 13F 공시를 수집하여
     [(df, meta_info), (df_prev, meta_info_prev), ...] 형태로 반환
@@ -248,6 +249,84 @@ def fetch_sec_13f_multi_quarters(cik: str, max_quarters: int = 4):
 # ==============================================================================
 # 3. 직전 분기 대비 매수/매도 액션 분류 함수 (ImportError 해결 핵심)
 # ==============================================================================
+# ==============================================================================
+# 저장본 우선 읽기 경로
+# ==============================================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_sec_13f_multi_quarters(cik: str, max_quarters: int = 4):
+    """
+    화면용 진입점. 13F는 분기 공시(45일 지연)이므로 저장해 두기에 가장
+    적합합니다. SEC는 초당 10건 제한이 있고 분기별로 문서를 따라 들어가야
+    해서 수집이 특히 느립니다(기관 1곳 8분기에 수십 초).
+
+    반환: (분기별 [(DataFrame, meta), ...], 오류 메시지 | None)
+    """
+    def _collect():
+        return collect_sec_13f_multi_quarters(cik, max_quarters)
+
+    snap_name = datasets.snap_sec_13f(cik, max_quarters)
+
+    # 저장본이 예전 버전의 컬럼 구성이면 화면이 KeyError로 죽습니다.
+    # cached_or_live의 required_columns는 단일 DataFrame만 검사하므로,
+    # 중첩 구조인 13F는 여기서 직접 검증하고 어긋나면 스냅샷을 버립니다.
+    snap = store.read_snapshot(snap_name)
+    if snap is not None and not _history_schema_ok(snap.payload):
+        logger.warning(
+            "13F 저장본 스키마 불일치(cik=%s q=%s). 다시 수집합니다.",
+            cik, max_quarters,
+        )
+        payload = None
+    else:
+        payload = store.cached_or_live(
+            snap_name,
+            _collect,
+            max_age_seconds=datasets.MAX_AGE_SLOW,
+            as_object=True,
+        )
+
+    if payload is None:
+        # 스키마 불일치 → 직접 수집해서 덮어씁니다.
+        try:
+            payload = _collect()
+            store.put_object(snap_name, payload)
+        except Exception as e:
+            logger.warning("13F 재수집 실패 (cik=%s): %s", cik, e)
+            return [], f"수집 실패: {e}"
+
+    if not isinstance(payload, (list, tuple)) or len(payload) != 2:
+        return [], "저장본이 없고 수집에도 실패했습니다."
+
+    history, err = payload
+    return (history if isinstance(history, list) else []), err
+
+
+# 화면(views/sec_view.py)이 직접 인덱싱하는 13F 컬럼
+_REQUIRED_13F_COLUMNS = ("name", "cusip", "class", "value", "shares", "weight")
+
+
+def _history_schema_ok(payload) -> bool:
+    """13F 저장본의 분기별 DataFrame이 필요한 컬럼을 갖고 있는지 확인합니다."""
+    if not isinstance(payload, (list, tuple)) or len(payload) != 2:
+        return False
+
+    history = payload[0]
+    if not isinstance(history, list) or not history:
+        # 빈 이력은 스키마 문제가 아니라 '데이터 없음'이므로 통과시킵니다.
+        return True
+
+    for entry in history:
+        if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+            return False
+        df = entry[0]
+        if not isinstance(df, pd.DataFrame):
+            return False
+        if df.empty:
+            continue
+        if any(c not in df.columns for c in _REQUIRED_13F_COLUMNS):
+            return False
+    return True
+
+
 def classify_qoq_action(row):
     """직전 분기 대비 비중 증감폭을 기준으로 매수/매도/유지 액션 분류"""
     diff = row.get('weight_diff', 0.0) if isinstance(row, dict) else row['weight_diff']

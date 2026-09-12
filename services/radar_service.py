@@ -23,6 +23,7 @@ import numpy as np
 
 from services.ls_service import call_ls_api
 from services.kis_service import call_kis_api
+from services import datasets, store
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -1111,8 +1112,7 @@ def _get_latest_completed_session_str(now_kst: datetime) -> str:
     return d.strftime("%Y%m%d")
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_market_radar_scanner(
+def collect_market_radar_scanner(
     target_date_obj,
     market: str = "KOSPI",
     investor: str = "외국인",
@@ -1120,6 +1120,12 @@ def get_market_radar_scanner(
     top_n: int = 30,
     interval_type: str = "TODAY",
 ) -> pd.DataFrame:
+    """
+    수급 랭킹을 실제로 수집합니다 (KIS → Daum → Naver → PyKrx 폴백 체인).
+
+    화면은 get_market_radar_scanner()를 쓰세요. 이 함수는 항상 네트워크를
+    쓰며, 최악의 경우 7영업일을 거슬러 올라가며 여러 소스를 시도합니다.
+    """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     today_str = now_kst.strftime("%Y%m%d")
     current_time = now_kst.time()
@@ -1242,6 +1248,133 @@ def get_market_radar_scanner(
         PYKRX_AVAILABLE,
     )
     return pd.DataFrame()
+
+
+# ==============================================================================
+# 7-1. 저장본 우선 읽기 경로 + 날짜별 이력 누적
+# ==============================================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def get_market_radar_scanner(
+    target_date_obj,
+    market: str = "KOSPI",
+    investor: str = "외국인",
+    trade_type: str = "순매수",
+    top_n: int = 30,
+    interval_type: str = "TODAY",
+) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본 우선 + 날짜별 이력 누적.
+
+    이 화면이 저장 계층에서 가장 크게 이득을 봅니다.
+      - 수집 경로가 무거움: 최대 7영업일 × (Daum → Naver 렌더링 → PyKrx).
+        저장본이 있으면 이 전부를 건너뜁니다.
+      - **Naver/Daum은 과거 날짜 조회를 지원하지 않습니다.** 지금까지는 앱을
+        끄면 그날 수급이 사라졌지만, 이제 수집할 때마다 observations에
+        날짜별로 쌓이므로 이력을 직접 축적합니다.
+        (read_radar_history()로 조회)
+    """
+    snap_name = datasets.snap_radar_scanner(
+        market, investor, trade_type, interval_type,
+    )
+
+    def _collect():
+        df = collect_market_radar_scanner(
+            target_date_obj, market, investor, trade_type, top_n, interval_type,
+        )
+        if df is not None and not df.empty:
+            _accumulate_radar_history(
+                df, market, investor, trade_type, interval_type,
+            )
+        return df
+
+    df = store.cached_or_live(
+        snap_name,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_REALTIME,
+        as_frame=True,
+    )
+    return df if df is not None else pd.DataFrame()
+
+
+def _accumulate_radar_history(
+    df: pd.DataFrame,
+    market: str,
+    investor: str,
+    trade_type: str,
+    interval_type: str,
+) -> None:
+    """
+    수집된 랭킹을 "데이터 기준 거래일"로 observations에 누적합니다.
+
+    기준일은 수집 시각이 아니라 _get_latest_completed_session_str()이
+    계산한 거래일을 씁니다. Naver/Daum이 날짜 파라미터를 받지 않고
+    "가장 최근에 끝난 거래일"만 주기 때문에, 수집 시각으로 찍으면
+    토요일 새벽에 수집한 금요일 데이터가 토요일로 기록됩니다.
+    """
+    try:
+        session_str = _get_latest_completed_session_str(
+            datetime.now(ZoneInfo("Asia/Seoul"))
+        )
+        obs_date = (
+            f"{session_str[:4]}-{session_str[4:6]}-{session_str[6:8]}"
+        )
+
+        records = df.to_dict(orient="records")
+        for rec in records:
+            rec["시장"] = market
+            rec["투자주체"] = investor
+            rec["매매구분"] = trade_type
+            rec["기간구분"] = interval_type
+
+        # 같은 거래일에 조건별로 여러 건이 들어오므로, entity에 조건을
+        # 포함해야 서로 덮어쓰지 않습니다.
+        for rec in records:
+            rec["_entity"] = (
+                f"{market}|{investor}|{trade_type}|{interval_type}|"
+                f"{rec.get('종목코드', '?')}"
+            )
+
+        saved = store.put_observations(
+            datasets.OBS_RADAR, obs_date, records, entity_key="_entity",
+        )
+        logger.info(
+            "수급 레이더 이력 누적: date=%s, rows=%s (%s/%s/%s/%s)",
+            obs_date, saved, market, investor, trade_type, interval_type,
+        )
+    except Exception as e:
+        # 누적 실패가 화면을 막아서는 안 됩니다.
+        logger.warning("수급 레이더 이력 누적 실패: %s", e)
+
+
+def read_radar_history(
+    *,
+    market: str | None = None,
+    investor: str | None = None,
+    trade_type: str | None = None,
+    start_date: str | None = None,
+) -> pd.DataFrame:
+    """
+    누적된 수급 랭킹 이력을 조회합니다 (Naver/Daum이 제공하지 않는 과거 데이터).
+
+    start_date는 'YYYY-MM-DD' 형식입니다.
+    """
+    df = store.read_observations(datasets.OBS_RADAR, start_date=start_date)
+    if df.empty:
+        return df
+
+    if market and "시장" in df.columns:
+        df = df[df["시장"] == market]
+    if investor and "투자주체" in df.columns:
+        df = df[df["투자주체"] == investor]
+    if trade_type and "매매구분" in df.columns:
+        df = df[df["매매구분"] == trade_type]
+
+    return df.drop(columns=[c for c in ["_entity"] if c in df.columns])
+
+
+def list_radar_history_dates() -> list[str]:
+    """이력이 쌓인 거래일 목록."""
+    return store.list_observation_dates(datasets.OBS_RADAR)
 
 
 # ==============================================================================

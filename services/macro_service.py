@@ -19,6 +19,7 @@ import yfinance as yf
 # (이 모듈과 liquidity_service에 동일 로직이 중복 정의돼 있었습니다.)
 from config import MACRO_CATEGORIES, get_fred_key
 from services.http_client import get_fred_session
+from services import datasets, store
 
 logger = logging.getLogger(__name__)
 
@@ -152,9 +153,12 @@ def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
     return None
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = None) -> pd.DataFrame:
-    """FRED 시계열 수집 (DatetimeIndex 인덱스 및 series_id 컬럼명 매핑)"""
+def collect_fred_series(series_id: str, period_years: int = 10, api_key: str = None) -> pd.DataFrame:
+    """
+    FRED 시계열을 실제로 수집합니다 (DatetimeIndex 인덱스, series_id 컬럼명).
+
+    화면은 fetch_fred_series()를 쓰세요. 이 함수는 항상 네트워크를 씁니다.
+    """
     key = api_key or get_fred_key()
     start_date = (datetime.now() - timedelta(days=period_years * 365 + 60)).strftime("%Y-%m-%d")
 
@@ -211,6 +215,49 @@ def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = Non
         logger.warning(f"FRED CSV 다운로드 실패 ({series_id}): {e}")
 
     logger.error(f"{series_id}: FRED API 및 CSV 모두 실패. 가짜 데이터를 생성하지 않고 빈 데이터를 반환합니다.")
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = None) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본 우선 + 누적 이력 병합.
+
+    FRED는 과거 조회가 되는 소스지만 저장해 두는 이유가 둘 있습니다.
+      1) API 키가 없거나 FRED가 장애일 때도 화면이 비지 않습니다.
+      2) timeseries 테이블에 누적해 두면, 같은 시리즈를 다른 기간으로
+         요청할 때 이미 받아 둔 구간을 재사용할 수 있습니다.
+    """
+    snap_name = datasets.snap_fred_series(series_id)
+
+    def _collect():
+        df = collect_fred_series(series_id, period_years=period_years, api_key=api_key)
+        # 수집 성공 시에만 누적 테이블에 반영합니다(빈 결과로 덮어쓰지 않음).
+        if df is not None and not df.empty:
+            try:
+                store.put_timeseries(datasets.TS_FRED, series_id, df, value_col=series_id)
+            except Exception as e:
+                logger.warning("FRED 누적 저장 실패 (%s): %s", series_id, e)
+        return df
+
+    df = store.cached_or_live(
+        snap_name,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_DAILY,
+        as_frame=True,
+    )
+
+    if df is not None and not df.empty:
+        return df
+
+    # 스냅샷이 비었더라도 과거에 누적해 둔 이력이 있으면 그것으로 복구합니다.
+    accumulated = store.read_timeseries(
+        datasets.TS_FRED, series_id, value_name=series_id,
+    )
+    if not accumulated.empty:
+        logger.info("%s: 누적 이력 %d행으로 복구했습니다.", series_id, len(accumulated))
+        return accumulated
+
     return pd.DataFrame()
 
 
@@ -351,8 +398,15 @@ def _apply_bond_scanner_override(
 # ==============================================================================
 # 3. 실시간 매크로 전 지표 수집 및 텍스트 브리핑 생성
 # ==============================================================================
-@st.cache_data(ttl=30, show_spinner=False)
-def get_collected_macro_data():
+def collect_macro_data():
+    """
+    매크로 전 지표를 실제로 수집합니다 (항상 네트워크를 씁니다).
+
+    화면에서 직접 부르지 마세요. 화면은 저장본을 우선 읽는
+    get_collected_macro_data()를 쓰고, 이 함수는 collector.py가 호출합니다.
+
+    반환: (collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev)
+    """
     collected = {}
     rate_10y_curr, rate_10y_prev = None, None
     rate_2y_curr, rate_2y_prev = None, None
@@ -561,6 +615,43 @@ def get_collected_macro_data():
     )
 
     return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
+
+
+# ==============================================================================
+# 3-1. 저장본 우선 읽기 경로
+# ==============================================================================
+def _macro_payload_is_usable(payload) -> bool:
+    """저장본이 화면에서 쓸 수 있는 형태인지 확인합니다."""
+    return (
+        isinstance(payload, (list, tuple))
+        and len(payload) == 5
+        and isinstance(payload[0], dict)
+        and len(payload[0]) > 0
+    )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_collected_macro_data():
+    """
+    화면용 진입점. SQLite 저장본이 신선하면 그것을 쓰고, 오래됐으면
+    직접 수집한 뒤 저장합니다.
+
+    [주의] 저장본은 JSON을 거치므로 튜플이 리스트로 돌아옵니다.
+    호출부가 5개 값으로 언패킹하므로 반드시 튜플로 되돌려 줍니다.
+    """
+    payload = store.cached_or_live(
+        datasets.SNAP_MACRO_COLLECTED,
+        collect_macro_data,
+        max_age_seconds=datasets.MAX_AGE_REALTIME,
+    )
+
+    if not _macro_payload_is_usable(payload):
+        # 저장본도 없고 수집도 실패한 경우. 호출부가 빈 dict를 보고
+        # "데이터 수집 실패"를 표시할 수 있도록 형태만 맞춰 돌려줍니다.
+        return {}, None, None, None, None
+
+    collected, r10c, r10p, r2c, r2p = payload
+    return collected, r10c, r10p, r2c, r2p
 
 
 # ==============================================================================

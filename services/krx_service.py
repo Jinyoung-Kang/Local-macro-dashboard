@@ -17,6 +17,7 @@ from services.http_client import get_session
 import streamlit as st
 import yfinance as yf
 from config import get_krx_key, KRX_BASE_URL
+from services import datasets, store
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +118,7 @@ def fetch_kospi200_index_close(date_str: str) -> float | None:
 # ==============================================================================
 # 3. 최근 N영업일 파생 시계열 수집 및 동기화 (NaN 결측치 완벽 방어)
 # ==============================================================================
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
+def collect_krx_futures_history(days: int = 40) -> pd.DataFrame:
     """
     최근 N영업일 동안의 KOSPI 200 선물 최근월물 종가, 거래량, 미결제약정 시계열을 수집.
     미확정/야간 데이터는 자동으로 직전 영업일 마감 확정치로 정제.
@@ -396,6 +396,58 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
     })
 
 
+def _is_estimated_frame(df: pd.DataFrame) -> bool:
+    """
+    DataFrame이 추정치(Fallback)인지 판정합니다.
+
+    추정치를 누적 이력 테이블에 쓰면 나중에 실제 확정치와 섞여 구분이
+    불가능해지므로, 누적 저장 전에 반드시 이 검사를 통과해야 합니다.
+    """
+    if df is None or df.empty or "is_estimated" not in df.columns:
+        return False
+    return bool(df["is_estimated"].any())
+
+
+# ==============================================================================
+# 3-1. 저장본 우선 읽기 경로
+# ==============================================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본 우선 + 누적 이력 병합.
+
+    KRX Open API는 날짜별 조회가 가능하지만, 이 함수는 최근 N영업일을
+    매번 다시 긁습니다(요청 수십 건). 저장해 두면 그 왕복이 사라지고,
+    동시에 과거 확정치가 로컬에 축적됩니다.
+    """
+    def _collect():
+        df = collect_krx_futures_history(days)
+        if df is not None and not df.empty and not _is_estimated_frame(df):
+            # ⚠️ 추정치(is_estimated=True)는 누적 테이블에 절대 넣지 않습니다.
+            # 한 번 섞이면 나중에 실제 확정치와 구분할 수 없게 됩니다.
+            try:
+                indexed = df.set_index("Date") if "Date" in df.columns else df
+                store.put_frame_as_timeseries(datasets.TS_KRX_FUTURES, indexed)
+            except Exception as e:
+                logger.warning("KRX 선물 누적 저장 실패: %s", e)
+        return df
+
+    df = store.cached_or_live(
+        datasets.SNAP_KRX_FUTURES,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_DAILY,
+        as_frame=True,
+        # views/krx_cot_view.py가 직접 인덱싱하는 컬럼들. 예전 버전이 저장한
+        # 스냅샷에 이 컬럼이 없으면 KeyError로 화면이 죽으므로, 저장본을
+        # 버리고 다시 수집하게 합니다.
+        required_columns=(
+            "Date", "Futures_Close", "Market_Basis",
+            "Open_Interest", "Volume", "is_estimated",
+        ),
+    )
+    return df if df is not None else pd.DataFrame()
+
+
 # ==============================================================================
 # 4. [신규] Daum 금융 선물(KOSPI 200) 투자주체별 매매동향 실제 데이터 수집
 # ==============================================================================
@@ -418,8 +470,7 @@ DAUM_FUTURES_CATEGORY_MAP = [
 ]
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_daum_futures_investor_trend(
+def collect_daum_futures_investor_trend(
     lookback_days: int = 25,
     measure: str = "CONTRACT",
 ) -> pd.DataFrame:
@@ -622,6 +673,29 @@ def fetch_daum_futures_investor_trend(
 # ==============================================================================
 # 5. 주체별(외인/기관/개인) 선물 수급 요약 — Daum 실데이터 실패 시 폴백 placeholder
 # ==============================================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_daum_futures_investor_trend(
+    lookback_days: int = 25,
+    measure: str = "CONTRACT",
+) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본 우선.
+
+    Daum 내부 JSON API는 조회 조건(기간·기준)별로 응답이 달라 스냅샷 키에
+    조건을 포함합니다. 일별 확정치라 수집기 주기(1시간)로 충분합니다.
+    """
+    def _collect():
+        return collect_daum_futures_investor_trend(lookback_days, measure)
+
+    df = store.cached_or_live(
+        datasets.snap_daum_futures_trend(lookback_days, measure),
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_DAILY,
+        as_frame=True,
+    )
+    return df if df is not None else pd.DataFrame()
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_krx_investor_derivatives_summary() -> pd.DataFrame:
     """

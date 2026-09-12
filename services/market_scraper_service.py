@@ -13,6 +13,7 @@ import requests
 import streamlit as st
 
 from services.http_client import BROWSER_HEADERS, get_session
+from services import datasets, store
 
 logger = logging.getLogger(__name__)
 
@@ -690,10 +691,13 @@ def _collect_one_market(config: dict) -> dict:
         return result
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_scraped_macro_markets() -> dict:
+def collect_scraped_macro_markets() -> dict:
     """
-    외부 참고 시세를 병렬 수집합니다.
+    외부 참고 시세를 실제로 병렬 수집합니다 (항상 네트워크를 씁니다).
+
+    화면에서 직접 부르지 마세요. 화면은 저장본을 우선 읽는
+    get_scraped_macro_markets()를 사용하고, 이 함수는 collector.py가
+    주기적으로 호출합니다.
 
     반환:
     {
@@ -810,3 +814,24 @@ def get_scraped_macro_markets() -> dict:
         ).strftime("%Y-%m-%d %H:%M:%S KST"),
         "items": results,
     }
+
+
+# ==============================================================================
+# 저장본 우선 읽기 경로
+# ==============================================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def get_scraped_macro_markets() -> dict:
+    """
+    화면용 진입점. SQLite 저장본이 신선하면 그것을 쓰고, 오래됐으면
+    직접 수집한 뒤 저장합니다 (읽기 모드에 따라 동작은 services/store.py 참고).
+
+    st.cache_data(ttl=60)은 한 번의 rerun 안에서 같은 값을 여러 번 읽을 때
+    DB 조회조차 반복하지 않기 위한 얇은 메모이즈입니다.
+    """
+    empty = {"updated_at": "수집 이력 없음", "items": []}
+    return store.cached_or_live(
+        datasets.SNAP_SCRAPER_MARKETS,
+        collect_scraped_macro_markets,
+        max_age_seconds=datasets.MAX_AGE_REALTIME,
+        empty_value=empty,
+    ) or empty
