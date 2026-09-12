@@ -716,6 +716,15 @@ def collect_scraped_macro_markets() -> dict:
             _fetch_tradingview_us_treasury_yields
         )
 
+        # [추가] bonds scanner는 "현재 수익률"만 주고 전일 종가가 없어서,
+        # 화면의 미국채 카드가 계속 "전일 종가 N/A · 전일비 미제공"으로
+        # 표시됐습니다. Symbol Scanner는 change/change_abs를 주므로
+        # 전일 종가를 역산할 수 있습니다(KOSPI에서 이미 쓰는 경로).
+        symbol_futures = {
+            key: executor.submit(_fetch_tradingview_symbol_snapshot, symbol)
+            for symbol, key in TRADINGVIEW_US_TREASURY_SYMBOLS.items()
+        }
+
         future_map = {
             executor.submit(
                 _collect_one_market,
@@ -755,6 +764,15 @@ def collect_scraped_macro_markets() -> dict:
             logger.warning("TradingView bonds scanner 조회 실패: %s", e)
             scanner_yields = {}
 
+        treasury_changes: dict[str, tuple] = {}
+        for key, fut in symbol_futures.items():
+            try:
+                treasury_changes[key] = fut.result()
+            except Exception as e:
+                logger.warning(
+                    "TradingView Symbol Scanner 조회 실패 (%s): %s", key, e,
+                )
+
     if scanner_yields:
         for item in results:
             scraper_key = item.get("key")
@@ -763,7 +781,6 @@ def collect_scraped_macro_markets() -> dict:
 
             scanner_item = scanner_yields[scraper_key]
             current_price = scanner_item["price"]
-            previous_close = item.get("previous_close")
 
             item["price"] = current_price
             item["provider"] = "TradingView Scanner"
@@ -772,13 +789,28 @@ def collect_scraped_macro_markets() -> dict:
             item["reference_source"] = "TradingView bonds-yield-curve"
             item["scanner_symbol"] = scanner_item["symbol"]
 
-            # Scanner 응답에서 전일 종가 필드는 확정하지 않았으므로,
-            # 기존 HTML 파서가 확보한 전일값이 있을 때만 변화율을 계산합니다.
-            if previous_close is not None and float(previous_close) != 0:
-                previous_close = float(previous_close)
-                change = current_price - previous_close
-                change_pct = (change / previous_close) * 100.0
+            # 전일 종가 출처 우선순위:
+            #   1) Symbol Scanner의 change_abs로 역산 (가장 신뢰도 높음)
+            #   2) HTML 파서가 읽은 "Previous close"
+            # 둘 다 없으면 0.00%로 위장하지 않고 명시적으로 미제공 처리합니다.
+            previous_close = None
+            sym = treasury_changes.get(scraper_key)
+            if sym:
+                _sym_price, sym_prev, _sym_chg, _sym_pct = sym
+                if sym_prev is not None and float(sym_prev) != 0:
+                    previous_close = float(sym_prev)
+                    item["reference_source"] = (
+                        "TradingView bonds-yield-curve "
+                        "(전일 종가: Symbol Scanner)"
+                    )
 
+            if previous_close is None:
+                html_prev = item.get("previous_close")
+                if html_prev is not None and float(html_prev) != 0:
+                    previous_close = float(html_prev)
+
+            if previous_close is not None:
+                change, change_pct = _derive_change(current_price, previous_close)
                 item["previous_close"] = previous_close
                 item["change"] = change
                 item["change_pct"] = change_pct

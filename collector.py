@@ -227,12 +227,17 @@ def _task_fred_series() -> str:
     from services import datasets, store
     from services.macro_service import collect_fred_series
 
+    from services.advanced_macro_service import ADVANCED_SERIES_IDS
+
     # 화면이 실제로 쓰는 시리즈들
     series_ids = [
         "DGS2", "DGS10", "DGS30", "DGS3MO",
         "BAMLH0A0HYM2",     # 하이일드 OAS
         "STLFSI4",          # 금융스트레스
         "CPF3M",            # 3M 금융 CP
+        # 심화 지표: T10Y3M(10Y-3M) / DFII10(실질금리) / T10YIE(기대인플레)
+        #            BAMLC0A0CM(IG 스프레드) / NFCI(시카고 금융상황)
+        *ADVANCED_SERIES_IDS,
     ]
 
     ok = 0
@@ -323,6 +328,38 @@ def _task_daum_futures_trend() -> str:
         raise EmptyResult(f"0/{len(combos)} 조합 — 기존 저장본 유지")
 
     return f"{ok}/{len(combos)} 조합"
+
+
+def _task_volatility_history() -> str:
+    """
+    ^VIX / ^MOVE 시계열.
+
+    화면이 여러 기간으로 요청하므로 가장 긴 기간(5y)으로 한 번만 저장하고,
+    짧은 기간은 화면에서 잘라 씁니다.
+
+    ⚠️ ^MOVE는 Yahoo가 제공하지 않아 ^TNX 변동성에서 역산한 추정치입니다.
+    df.attrs["is_proxy"]로 표시되며, 저장 계층이 이 표시를 보존합니다.
+    """
+    from services import datasets, store
+    from services.macro_service import collect_ticker_data
+
+    period = datasets.VOLATILITY_STORE_PERIOD
+    ok = 0
+    for symbol in ("^VIX", "^MOVE"):
+        df = collect_ticker_data(symbol, period)
+        if df is None or df.empty:
+            logger.info("    변동성 빈 결과(저장본 유지): %s", symbol)
+            continue
+        store.put_frame(
+            datasets.snap_ticker_history(symbol, period), df,
+            status="estimated" if df.attrs.get("is_proxy") else "ok",
+        )
+        ok += 1
+
+    if not ok:
+        raise EmptyResult("0/2 지수 — 기존 저장본 유지")
+
+    return f"{ok}/2 지수 ({period})"
 
 
 def _task_sector_history() -> str:
@@ -494,6 +531,8 @@ ALL_TASKS: list[Task] = [
          "KRX 선물/미결제약정 (이력 누적)"),
     Task("sector_history", "slow", _task_sector_history,
          "섹터·자산군 ETF 종가"),
+    Task("volatility_history", "slow", _task_volatility_history,
+         "VIX·MOVE 변동성 시계열"),
     Task("cot_history", "slow", _task_cot_history,
          "CFTC COT (주 1회 발표)"),
     Task("daum_futures_trend", "slow", _task_daum_futures_trend,

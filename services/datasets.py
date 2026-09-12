@@ -28,6 +28,16 @@ def snap_daum_futures_trend(lookback_days: int, measure: str) -> str:
     return f"krx.daum_futures_trend.d{lookback_days}.{measure}"
 
 
+# 변동성 지수(^VIX / ^MOVE)는 가장 긴 기간으로 한 번 저장하고,
+# 짧은 기간 요청은 잘라 씁니다 (13F q1←q8과 같은 방식).
+VOLATILITY_STORE_PERIOD = "5y"
+
+
+def snap_ticker_history(symbol: str, period: str) -> str:
+    safe = symbol.replace("^", "").replace("=", "_").replace(".", "_")
+    return f"ticker.{safe}.{period}"
+
+
 # CFTC COT는 계약 코드별로 저장합니다 (views/cot_view.py가 자산별로 조회).
 def snap_cot_contract(contract_code: str, limit: int) -> str:
     return f"cot.contract.{contract_code}.l{limit}"
@@ -85,6 +95,8 @@ __all__ = [
     "snap_sec_13f",
     "snap_cot_contract",
     "snap_daum_futures_trend",
+    "snap_ticker_history",
+    "VOLATILITY_STORE_PERIOD",
     "snap_fred_series",
     "snap_radar_scanner",
     "TS_FRED",

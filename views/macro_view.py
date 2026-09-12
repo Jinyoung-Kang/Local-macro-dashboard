@@ -42,6 +42,10 @@ from services.dashboard_snapshot_service import (
 from services.market_scraper_service import (
     get_scraped_macro_markets,
 )
+from services.advanced_macro_service import (
+    ADVANCED_SERIES,
+    get_advanced_macro_indicators,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +151,170 @@ def _get_realtime_bond_yield(scraper_items_for_bonds: dict, key: str):
     curr = float(price)
     prev = float(previous_close) if previous_close is not None else None
     return curr, prev
+
+
+def _usable_delta(delta_str) -> str | None:
+    """
+    st.metric의 delta로 넘겨도 안전한 값인지 판정합니다.
+
+    Streamlit은 delta 문자열을 숫자로 파싱해 화살표 색을 정합니다.
+    "N/A" 같은 비수치 문자열을 넘기면 파싱에 실패한 채 기본값(녹색 상승)으로
+    렌더링되어, 데이터가 없는 것이 상승으로 보입니다.
+    """
+    if delta_str is None:
+        return None
+    text = str(delta_str).strip()
+    if not text or text.upper() in {"N/A", "NA", "NONE", "-"}:
+        return None
+    # 숫자가 하나도 없으면 delta로 쓸 수 없습니다.
+    if not any(ch.isdigit() for ch in text):
+        return None
+    return text
+
+
+def _render_advanced_macro_section() -> None:
+    """
+    심화 매크로 지표 섹션.
+
+    기존 화면이 답하지 못하던 세 질문을 메웁니다.
+      - 금리 상승이 "실질 긴축"인가 "인플레 기대"인가? → DFII10 / T10YIE
+      - 침체 신호는? → T10Y3M (뉴욕 연준 모델 기준)
+      - 신용 스트레스가 IG까지 번졌는가? → BAMLC0A0CM
+    """
+    st.subheader("🧭 심화 매크로 지표")
+    st.caption(
+        "명목금리·하이일드만으로는 보이지 않는 구조를 봅니다. "
+        "모두 FRED 공식 시계열이며, 수집 실패 시 값을 만들어내지 않습니다."
+    )
+
+    try:
+        result = get_advanced_macro_indicators()
+    except Exception as e:
+        st.warning(f"심화 지표를 불러오지 못했습니다: {e}", icon="⚠️")
+        return
+
+    latest = result.get("latest") or {}
+    if not latest:
+        st.info("심화 지표 데이터가 없습니다.")
+        return
+
+    # ------------------------------------------------------------ 카드 3열
+    groups: dict[str, list] = {}
+    for entry in latest.values():
+        groups.setdefault(entry.get("group", "기타"), []).append(entry)
+
+    for group_name, entries in groups.items():
+        st.markdown(f"**{group_name}**")
+        cols = st.columns(max(len(entries), 1))
+
+        for col, entry in zip(cols, entries):
+            label = entry.get("label", entry["id"])
+            if not entry.get("available"):
+                col.metric(label, "수집 실패")
+                col.caption(f":gray[{entry.get('source', '')}]")
+                continue
+
+            digits = entry.get("digits", 2)
+            unit = entry.get("unit", "")
+            delta = entry.get("delta")
+
+            col.metric(
+                label=label,
+                value=f"{entry['value']:.{digits}f}{unit}",
+                delta=(
+                    f"{delta:+.{digits}f}{unit}" if delta is not None else None
+                ),
+                help=entry.get("why", ""),
+            )
+
+            if entry.get("status"):
+                col.markdown(
+                    f"상태: :{entry.get('color', 'gray')}[**{entry['status']}**]"
+                )
+
+            as_of = entry.get("as_of")
+            caption = []
+            if as_of is not None and hasattr(as_of, "strftime"):
+                caption.append(f"기준일 `{as_of.strftime('%Y-%m-%d')}`")
+            if entry.get("percentile") is not None:
+                caption.append(f"10년 백분위 `{entry['percentile']:.0f}%`")
+            if caption:
+                col.caption(" | ".join(caption))
+
+        # 남는 칸 정리
+        for extra in cols[len(entries):]:
+            extra.empty()
+
+    # ------------------------------------------------------- 금리 분해 해설
+    decomposition = (result.get("derived") or {}).get("decomposition")
+    if decomposition:
+        st.info(
+            f"**금리 분해:** {decomposition}\n\n"
+            "명목금리가 올라도 그 원인이 실질금리인지 기대인플레인지에 따라 "
+            "자산군 영향이 정반대입니다. 실질금리 상승은 금·성장주에 역풍, "
+            "기대인플레 상승은 실물·원자재에 순풍인 경우가 많습니다.",
+            icon="🧮",
+        )
+
+    # ------------------------------------------------------------ 해석 표
+    with st.expander("📘 심화 지표 해석 가이드", expanded=False):
+        rows = []
+        for entry in latest.values():
+            rows.append({
+                "지표": entry.get("label", entry["id"]),
+                "FRED ID": entry["id"],
+                "현재값": (
+                    f"{entry['value']:.{entry.get('digits', 2)}f}"
+                    f"{entry.get('unit', '')}"
+                    if entry.get("available") else "수집 실패"
+                ),
+                "상태": entry.get("status", "-"),
+                "왜 보는가": entry.get("why", ""),
+                "출처": entry.get("source", ""),
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+        st.markdown(
+            "**임계치 요약**\n\n"
+            "| 지표 | 정상 | 경계 | 위험 |\n"
+            "|---|---|---|---|\n"
+            "| 10Y-3M 스프레드 | > +0.5%p | 0 ~ +0.5%p | 음수 (역전) |\n"
+            "| 10년 실질금리 | < 1.0% | 1.0 ~ 2.0% | > 2.0% |\n"
+            "| IG 스프레드 | 1.0 ~ 1.5% | 1.5 ~ 2.0% | > 2.0% |\n"
+            "| NFCI | < 0 | 0 ~ 0.5 | > 0.5 |\n\n"
+            "임계치는 역사적 분포에 근거한 참고치이며 투자 판단의 근거가 "
+            "아닙니다."
+        )
+
+    # ------------------------------------------------------------ 추이 차트
+    series = result.get("series") or {}
+    chart_targets = [
+        sid for sid in ("T10Y3M", "DFII10", "T10YIE")
+        if isinstance(series.get(sid), pd.DataFrame) and not series[sid].empty
+    ]
+    if chart_targets:
+        with st.expander("📈 금리 구조 추이 (10Y-3M · 실질금리 · 기대인플레)",
+                         expanded=False):
+            fig = go.Figure()
+            colors = {"T10Y3M": "#F59E0B", "DFII10": "#3B82F6",
+                      "T10YIE": "#10B981"}
+            for sid in chart_targets:
+                df = series[sid]
+                fig.add_trace(go.Scatter(
+                    x=df.index, y=df[sid], mode="lines",
+                    name=ADVANCED_SERIES[sid]["label"],
+                    line=dict(color=colors.get(sid), width=2),
+                ))
+            fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.6)
+            fig.update_layout(
+                title="금리 구조 지표 추이 (FRED 공식 일별)",
+                xaxis_title="일자", yaxis_title="%",
+                hovermode="x unified",
+                margin=dict(l=20, r=20, t=40, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1),
+            )
+            st.plotly_chart(fig, width="stretch")
 
 
 def render_macro_view(now_str_kst: str, refresh_interval: int):
@@ -266,12 +434,20 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                 display_name = inject_market_status(item["name"])
                 col = cols[idx]
                 if item["status"] == "ok":
+                    # [UI 버그 수정] delta에 "N/A" 문자열을 넘기면 Streamlit이
+                    # 숫자로 파싱하지 못한 채 **녹색 상승 화살표**로 그립니다.
+                    # 전일 종가를 모르는 미국채 카드가 "↑ N/A"로 보여서
+                    # 상승한 것처럼 읽혔습니다. 값이 없으면 delta를 아예
+                    # 넘기지 않고 캡션으로만 알립니다.
+                    delta_value = _usable_delta(item.get("delta_str"))
                     col.metric(
                         label=display_name,
                         value=item["price_str"],
-                        delta=item["delta_str"],
-                        help=f"직전 거래일 종가: {item['prev_str']}"
+                        delta=delta_value,
+                        help=f"직전 거래일 종가: {item['prev_str']}",
                     )
+                    if delta_value is None:
+                        col.caption(":gray[전일 대비 미제공]")
                     extra_caption_parts = [f"전일 종가: `{item['prev_str']}`"]
                     if item.get("contract_month"):
                         extra_caption_parts.append(f"월물: `{item['contract_month']}`")
@@ -1026,6 +1202,13 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             fig_fsi.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="시스템 위기 경보선 (+1.0 pt)")
             fig_fsi.update_layout(title=f"세인트루이스 연준 금융스트레스지수 (STLFSI4) 추이 (최근 {fsi_period_years}년)", xaxis_title="일자", yaxis_title="스트레스 지수 (pt)", hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig_fsi, width="stretch")
+
+    st.divider()
+
+    # ==========================================================================
+    # 3-1. 심화 매크로 지표
+    # ==========================================================================
+    _render_advanced_macro_section()
 
     st.divider()
 

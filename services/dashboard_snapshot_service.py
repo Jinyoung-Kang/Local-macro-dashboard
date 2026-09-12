@@ -29,6 +29,12 @@ from services.krx_service import (
     get_krx_investor_derivatives_summary,
 )
 from services.sec_service import load_all_institutions_data
+from services.radar_service import get_market_radar_scanner
+from services.market_scraper_service import get_scraped_macro_markets
+from services.advanced_macro_service import (
+    get_advanced_macro_indicators,
+    summarize_advanced_for_ai,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +104,25 @@ def collect_dashboard_snapshot() -> dict:
             safe_call,
             load_all_institutions_data,
         )
+        # [추가] 국내 수급 레이더는 별도 메뉴로 존재하는데 "전체 대시보드
+        # 원본 데이터"에는 빠져 있었습니다. AI 리포트가 국내 수급을 전혀
+        # 보지 못하는 상태였습니다.
+        fut_radar = executor.submit(
+            safe_call,
+            get_market_radar_scanner,
+            datetime.now(ZoneInfo("Asia/Seoul")).date(),
+            "KOSPI", "외국인", "순매수", 20, "TODAY",
+        )
+        fut_radar_inst = executor.submit(
+            safe_call,
+            get_market_radar_scanner,
+            datetime.now(ZoneInfo("Asia/Seoul")).date(),
+            "KOSPI", "기관", "순매수", 20, "TODAY",
+        )
+        # [추가] 미국채 실시간 참고 시세(TradingView)도 화면에는 있는데
+        # 스냅샷에는 없었습니다.
+        fut_scraper = executor.submit(safe_call, get_scraped_macro_markets)
+        fut_advanced = executor.submit(safe_call, get_advanced_macro_indicators)
 
         return {
             "collected_at": datetime.now(
@@ -111,13 +136,18 @@ def collect_dashboard_snapshot() -> dict:
             "krx": fut_krx.result(),
             "krx_investor": fut_krx_investor.result(),
             "sec": fut_sec.result(),
+            "radar_foreign": fut_radar.result(),
+            "radar_inst": fut_radar_inst.result(),
+            "scraper": fut_scraper.result(),
+            "advanced": fut_advanced.result(),
         }
 
 
 def _append_macro_section(lines: list[str], macro_res):
     lines.append("## 1. 거시경제 매크로 지표")
 
-    if not isinstance(macro_res, tuple) or len(macro_res) < 5:
+    # 저장 계층을 거치면 튜플이 리스트로 돌아올 수 있으므로 둘 다 받습니다.
+    if not isinstance(macro_res, (tuple, list)) or len(macro_res) < 5:
         lines.append("- 거시 지표 수집 실패")
         lines.append("")
         return
@@ -287,6 +317,86 @@ def _append_sec_section(lines: list[str], sec_res):
     lines.append("")
 
 
+def _append_radar_section(lines: list[str], foreign_df, inst_df):
+    lines.append("## 8. 국내 수급 레이더 (코스피 외국인·기관 순매수 상위)")
+
+    any_data = False
+    for label, df in (("외국인", foreign_df), ("기관", inst_df)):
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            lines.append(f"- {label} 순매수 상위: 데이터 수집 실패")
+            continue
+
+        any_data = True
+        source = ""
+        if "데이터_출처" in df.columns and not df["데이터_출처"].empty:
+            source = f" (출처: {df['데이터_출처'].iloc[0]})"
+        lines.append(f"\n### {label} 순매수 상위{source}")
+
+        for _, row in df.head(10).iterrows():
+            name = row.get("종목명", "N/A")
+            code = row.get("종목코드", "")
+            amount = _get_num(row, "순매수대금(억)")
+            change = _get_num(row, "등락률(%)")
+            lines.append(
+                f"- {name}({code}): 순매수 {amount:+,.1f}억원 | "
+                f"등락률 {change:+.2f}%"
+            )
+
+    if not any_data:
+        lines.append(
+            "- 참고: Naver/Daum은 과거 날짜 조회를 지원하지 않아 장 시작 전에는"
+            " 직전 거래일 데이터가 조회됩니다."
+        )
+    lines.append("")
+
+
+def _append_scraper_section(lines: list[str], scraper_res):
+    lines.append("## 9. 비공식 스크래핑 참고 시세 (TradingView/Yahoo)")
+    lines.append(
+        "주의: 공식 데이터가 아닌 공개 웹페이지 수집값입니다. "
+        "페이지 구조 변경 시 조용히 실패할 수 있습니다."
+    )
+
+    items = (scraper_res or {}).get("items") if isinstance(scraper_res, dict) else None
+    if not items:
+        lines.append("- 참고 시세 수집 실패")
+        lines.append("")
+        return
+
+    lines.append(f"- 수집 시각: {scraper_res.get('updated_at', '알 수 없음')}")
+    for item in items:
+        name = item.get("name", "N/A")
+        provider = item.get("provider", "?")
+        if item.get("status") != "ok" or item.get("price") is None:
+            lines.append(f"- {name} [{provider}]: 수집 실패")
+            continue
+
+        unit = item.get("unit", "")
+        price = item.get("price")
+        prev = item.get("previous_close")
+        pct = item.get("change_pct")
+
+        digits = 3 if unit == "%" else 2
+        text = f"- {name} [{provider}]: {price:,.{digits}f}{unit}"
+        if prev is not None and pct is not None:
+            text += f" | 전일 {prev:,.{digits}f} | {pct:+.2f}%"
+        else:
+            text += " | 전일 대비 미제공"
+        lines.append(text)
+
+    lines.append("")
+
+
+def _append_advanced_section(lines: list[str], advanced_res):
+    lines.append("## 10. 심화 매크로 지표 (금리 구조·신용·금융상황)")
+    lines.append(
+        "명목금리만으로는 구분되지 않는 실질금리/기대인플레, "
+        "10Y-3M 스프레드, 투자등급 신용, 금융상황지수입니다."
+    )
+    lines.append(summarize_advanced_for_ai(advanced_res))
+    lines.append("")
+
+
 def format_dashboard_snapshot_text(snapshot: dict) -> str:
     """
     AI 호출 없이 복사·검증 가능한 전체 대시보드 원본 데이터 텍스트 생성.
@@ -321,5 +431,12 @@ def format_dashboard_snapshot_text(snapshot: dict) -> str:
         snapshot.get("krx_investor"),
     )
     _append_sec_section(lines, snapshot.get("sec"))
+    _append_radar_section(
+        lines,
+        snapshot.get("radar_foreign"),
+        snapshot.get("radar_inst"),
+    )
+    _append_scraper_section(lines, snapshot.get("scraper"))
+    _append_advanced_section(lines, snapshot.get("advanced"))
 
     return "\n".join(lines)

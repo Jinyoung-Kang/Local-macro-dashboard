@@ -305,6 +305,7 @@ def _encode_obj(obj: Any) -> Any:
         return {
             _DF_TAG: obj.to_json(orient="split", date_format="iso"),
             "index_is_datetime": isinstance(obj.index, pd.DatetimeIndex),
+            "attrs": _json_safe_attrs(obj.attrs),
         }
     if isinstance(obj, pd.Series):
         return _encode_obj(obj.to_frame())
@@ -341,6 +342,9 @@ def _decode_obj(obj: Any) -> Any:
                 df.index, pd.DatetimeIndex
             ):
                 df.index = pd.to_datetime(df.index, errors="coerce")
+            nested_attrs = obj.get("attrs")
+            if isinstance(nested_attrs, dict):
+                df.attrs.update(nested_attrs)
             return df
         if _TUPLE_TAG in obj:
             return tuple(_decode_obj(v) for v in obj[_TUPLE_TAG])
@@ -403,6 +407,20 @@ def put_snapshot(
         )
 
 
+def _json_safe_attrs(attrs) -> dict:
+    """
+    df.attrs에서 JSON으로 안전하게 저장 가능한 스칼라만 추립니다.
+    (플래그·라벨 용도이므로 스칼라면 충분합니다.)
+    """
+    if not isinstance(attrs, dict):
+        return {}
+    return {
+        str(k): v
+        for k, v in attrs.items()
+        if isinstance(v, (str, int, float, bool, type(None)))
+    }
+
+
 def put_frame(
     name: str,
     df: pd.DataFrame,
@@ -423,6 +441,11 @@ def put_frame(
         payload = {
             "__frame__": df.to_json(orient="split", date_format="iso"),
             "index_is_datetime": isinstance(df.index, pd.DatetimeIndex),
+            # df.attrs는 to_json이 보존하지 않습니다. 이 프로젝트는 attrs에
+            # is_proxy / is_intraday / source_label 같은 "이 값은 실제
+            # 지표가 아니다" 표시를 담고 있어서, 잃어버리면 추정치가
+            # 공식 데이터처럼 화면과 AI 리포트에 나갑니다. 따로 싣습니다.
+            "attrs": _json_safe_attrs(df.attrs),
         }
 
     with connect(db_path) as conn:
@@ -501,6 +524,10 @@ def _revive_frame(raw: Any) -> pd.DataFrame | None:
 
     if raw.get("index_is_datetime") and not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, errors="coerce")
+
+    attrs = raw.get("attrs")
+    if isinstance(attrs, dict):
+        df.attrs.update(attrs)
 
     return df
 
@@ -1048,9 +1075,23 @@ def missing_datasets(db_path: Path | None = None) -> list[dict]:
         (ds.SNAP_SECTOR_HISTORY, "섹터·자산군 ETF 종가"),
         (ds.SNAP_COT_HISTORY, "CFTC COT 통합"),
     ]
-    for sid in ("DGS2", "DGS10", "DGS30", "DGS3MO",
-                "BAMLH0A0HYM2", "STLFSI4", "CPF3M"):
+    fred_ids = ["DGS2", "DGS10", "DGS30", "DGS3MO",
+                "BAMLH0A0HYM2", "STLFSI4", "CPF3M"]
+    try:
+        from services.advanced_macro_service import ADVANCED_SERIES_IDS
+
+        fred_ids.extend(ADVANCED_SERIES_IDS)
+    except Exception:
+        pass
+
+    for sid in fred_ids:
         expected.append((ds.snap_fred_series(sid), f"FRED {sid}"))
+
+    for symbol in ("^VIX", "^MOVE"):
+        expected.append((
+            ds.snap_ticker_history(symbol, ds.VOLATILITY_STORE_PERIOD),
+            f"변동성 {symbol}",
+        ))
 
     for lookback, measure in ((25, "CONTRACT"), (25, "PRICE")):
         expected.append((

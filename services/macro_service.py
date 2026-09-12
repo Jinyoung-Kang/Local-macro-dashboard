@@ -48,8 +48,7 @@ def _clean_macro_label(text: str) -> str:
 # ==============================================================================
 # 2. yfinance / FRED 데이터 수집 엔진 (DatetimeIndex 보존)
 # ==============================================================================
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
+def collect_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
     """
     yfinance를 통해 티커 시계열 데이터를 수집합니다.
 
@@ -278,6 +277,66 @@ def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
 
     logger.error("CP Spread 데이터 합산 실패. 빈 데이터를 반환합니다.")
     return pd.DataFrame()
+
+
+# ==============================================================================
+# 2-0. 저장본 우선 읽기 경로 (변동성 지수만 해당)
+# ==============================================================================
+# ^VIX / ^MOVE는 화면 여러 곳에서 서로 다른 기간으로 요청됩니다. 기간마다
+# 스냅샷을 만들면 저장본이 난립하므로, 가장 긴 기간(5y)으로 한 번만 저장하고
+# 짧은 기간 요청은 꼬리를 잘라 씁니다 (13F에서 q1을 q8에서 유도하는 것과
+# 같은 방식). 덕분에 store_only 모드에서 이 두 심볼은 네트워크를 타지 않습니다.
+_STORE_BACKED_TICKERS = {"^VIX", "^MOVE", "MOVE", "MOVE:INDEX"}
+
+_PERIOD_DAYS = {
+    "1d": 1, "5d": 5, "1mo": 31, "3mo": 92, "6mo": 183,
+    "1y": 366, "2y": 731, "5y": 1827,
+}
+
+
+def _slice_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    """저장된 긴 시계열에서 요청 기간만큼 최근 구간을 잘라 냅니다."""
+    days = _PERIOD_DAYS.get(period)
+    if not days or df is None or df.empty:
+        return df
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    cutoff = df.index.max() - pd.Timedelta(days=days)
+    sliced = df[df.index >= cutoff]
+    out = sliced if len(sliced) >= 2 else df
+    # attrs(is_proxy 등)는 슬라이싱에서 보존되지 않으므로 직접 옮깁니다.
+    out.attrs.update(df.attrs)
+    return out
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
+    """
+    화면용 진입점. 변동성 지수는 저장본을 우선 사용하고, 나머지 심볼은
+    기존처럼 직접 수집합니다(티커가 많아 전부 저장할 이유가 없습니다).
+    """
+    if symbol not in _STORE_BACKED_TICKERS:
+        return collect_ticker_data(symbol, period)
+
+    store_period = datasets.VOLATILITY_STORE_PERIOD
+    snap_name = datasets.snap_ticker_history(symbol, store_period)
+
+    def _collect():
+        return collect_ticker_data(symbol, store_period)
+
+    full = store.cached_or_live(
+        snap_name,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_DAILY,
+        as_frame=True,
+    )
+
+    if full is None or (isinstance(full, pd.DataFrame) and full.empty):
+        # 저장본도 없고 수집도 실패 → 요청 기간 그대로 한 번 더 시도
+        return collect_ticker_data(symbol, period)
+
+    return _slice_period(full, period)
 
 
 # ==============================================================================

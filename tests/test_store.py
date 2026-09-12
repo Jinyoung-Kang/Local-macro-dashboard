@@ -784,3 +784,253 @@ def test_process_lock_reclaims_dead_holder(tmp_path, monkeypatch):
         pass                                        # 예외 없이 회수돼야 함
 
     store._initialized_paths.clear()
+
+
+# ==============================================================================
+# 15. df.attrs 보존 (추정치 경고가 저장 왕복에서 사라지면 안 된다)
+# ==============================================================================
+def test_frame_attrs_survive_store_roundtrip(db):
+    """
+    [회귀] put_frame은 to_json(orient="split")을 쓰는데 이 포맷은 df.attrs를
+    보존하지 않습니다. attrs에는 is_proxy / source_label 같은 "이 값은 실제
+    지표가 아니다" 표시가 들어 있어서, 잃어버리면 추정치가 공식 데이터처럼
+    화면과 AI 리포트에 나갑니다.
+    """
+    from services import store
+
+    df = pd.DataFrame(
+        {"Close": [100.0, 101.0]}, index=pd.date_range("2026-01-01", periods=2)
+    )
+    df.attrs.update({
+        "is_proxy": True,
+        "source_label": "^TNX 변동성 기반 추정치",
+        "is_intraday": False,
+    })
+
+    store.put_frame("move", df)
+    back = store.read_snapshot("move").payload
+
+    assert back.attrs.get("is_proxy") is True
+    assert back.attrs.get("source_label") == "^TNX 변동성 기반 추정치"
+    assert back.attrs.get("is_intraday") is False
+
+
+def test_nested_frame_attrs_survive_object_codec(db):
+    from services import store
+
+    df = pd.DataFrame({"v": [1.0]})
+    df.attrs["is_proxy"] = True
+
+    store.put_object("nested", {"MOVE": {"data": df}})
+    back = store.read_snapshot("nested").payload["MOVE"]["data"]
+
+    assert back.attrs.get("is_proxy") is True
+
+
+def test_non_scalar_attrs_are_dropped_not_crashing(db):
+    """직렬화 불가한 attrs 값이 있어도 저장이 실패하면 안 됩니다."""
+    from services import store
+
+    df = pd.DataFrame({"v": [1.0]})
+    df.attrs.update({"ok": "yes", "bad": object(), "nested": {"a": 1}})
+
+    store.put_frame("x", df)
+    back = store.read_snapshot("x").payload
+
+    assert back.attrs.get("ok") == "yes"
+    assert "bad" not in back.attrs
+
+
+# ==============================================================================
+# 16. 변동성 지수: 긴 저장본에서 기간 슬라이싱
+# ==============================================================================
+def test_volatility_period_slicing_avoids_network(db, monkeypatch):
+    """
+    ^VIX/^MOVE는 5y로 한 번 저장하고 짧은 기간은 잘라 씁니다.
+    store_only에서 네트워크를 타면 안 됩니다.
+    """
+    import numpy as np
+
+    from services import datasets, store
+    import services.macro_service as ms
+
+    idx = pd.date_range(end="2026-09-12", periods=1300, freq="B")
+    store.put_frame(
+        datasets.snap_ticker_history("^VIX", datasets.VOLATILITY_STORE_PERIOD),
+        pd.DataFrame({"Close": np.linspace(12, 34, len(idx))}, index=idx),
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        ms, "collect_ticker_data",
+        lambda s, p: (calls.append((s, p)), pd.DataFrame())[1],
+    )
+
+    lengths = {}
+    for period in ("3mo", "1y", "5y"):
+        ms.fetch_ticker_data.clear()
+        lengths[period] = len(ms.fetch_ticker_data("^VIX", period=period))
+    ms.fetch_ticker_data.clear()
+
+    assert calls == [], "저장본이 있으면 네트워크를 타지 않아야 합니다"
+    assert lengths["3mo"] < lengths["1y"] < lengths["5y"]
+
+
+def test_non_volatility_ticker_is_not_store_backed(db, monkeypatch):
+    """티커가 많아 전부 저장할 이유가 없으므로, 나머지는 직접 수집합니다."""
+    import services.macro_service as ms
+
+    calls = []
+    monkeypatch.setattr(
+        ms, "collect_ticker_data",
+        lambda s, p: (calls.append((s, p)), pd.DataFrame({"Close": [1.0]}))[1],
+    )
+    ms.fetch_ticker_data.clear()
+    ms.fetch_ticker_data("^GSPC", period="5d")
+    ms.fetch_ticker_data.clear()
+
+    assert calls == [("^GSPC", "5d")]
+
+
+# ==============================================================================
+# 17. 심화 매크로 지표
+# ==============================================================================
+def test_advanced_series_definitions_are_complete():
+    from services.advanced_macro_service import (
+        ADVANCED_SERIES,
+        ADVANCED_SERIES_IDS,
+    )
+
+    assert set(ADVANCED_SERIES_IDS) == set(ADVANCED_SERIES)
+    for sid, meta in ADVANCED_SERIES.items():
+        for key in ("label", "unit", "digits", "group", "why", "source"):
+            assert meta.get(key) is not None, f"{sid}: {key} 누락"
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(0.8, "정상"), (0.2, "평탄"), (-0.35, "역전"), (-0.9, "깊은 역전")],
+)
+def test_t10y3m_interpretation(value, expected):
+    from services.advanced_macro_service import interpret_t10y3m
+
+    assert interpret_t10y3m(value)[0] == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(-0.5, "마이너스"), (0.6, "완화적"), (1.5, "중립"), (2.5, "긴축적")],
+)
+def test_real_rate_interpretation(value, expected):
+    from services.advanced_macro_service import interpret_real_rate
+
+    assert interpret_real_rate(value)[0] == expected
+
+
+def test_advanced_indicators_read_from_store(db):
+    """심화 지표는 FRED 저장본을 그대로 씁니다 (별도 네트워크 없음)."""
+    import numpy as np
+
+    from services import datasets, store
+    from services.advanced_macro_service import (
+        ADVANCED_SERIES_IDS,
+        get_advanced_macro_indicators,
+    )
+
+    idx = pd.date_range(end="2026-09-12", periods=300, freq="B")
+    for sid in ADVANCED_SERIES_IDS:
+        store.put_frame(
+            datasets.snap_fred_series(sid),
+            pd.DataFrame({sid: np.linspace(0.5, 1.5, len(idx))}, index=idx),
+        )
+
+    get_advanced_macro_indicators.clear()
+    result = get_advanced_macro_indicators()
+    get_advanced_macro_indicators.clear()
+
+    latest = result["latest"]
+    assert set(latest) == set(ADVANCED_SERIES_IDS)
+    for sid in ADVANCED_SERIES_IDS:
+        assert latest[sid]["available"], f"{sid} 사용 불가"
+        assert latest[sid]["value"] == pytest.approx(1.5, abs=0.01)
+
+
+def test_advanced_summary_flags_missing_series():
+    from services.advanced_macro_service import summarize_advanced_for_ai
+
+    result = {
+        "latest": {
+            "T10Y3M": {"label": "10Y-3M", "available": False},
+            "DFII10": {
+                "label": "실질금리", "available": True, "value": 2.1,
+                "digits": 3, "unit": "%", "delta": 0.01,
+                "status": "긴축적", "percentile": 95.0,
+            },
+        },
+        "derived": {},
+    }
+    text = summarize_advanced_for_ai(result)
+    assert "수집 실패" in text
+    assert "긴축적" in text
+
+
+# ==============================================================================
+# 18. 대시보드 스냅샷: 수급 레이더 / 참고 시세 / 심화 지표 포함
+# ==============================================================================
+def test_snapshot_includes_radar_and_scraper_and_advanced():
+    """
+    [회귀] "전체 대시보드 원본 데이터"에 국내 수급 레이더가 빠져 있어서
+    AI 리포트가 국내 수급을 전혀 보지 못했습니다.
+    """
+    from services.dashboard_snapshot_service import format_dashboard_snapshot_text
+
+    radar = pd.DataFrame([{
+        "종목명": "삼성전자", "종목코드": "005930",
+        "순매수대금(억)": 512.3, "등락률(%)": 1.8,
+        "데이터_출처": "Daum 실시간",
+    }])
+
+    text = format_dashboard_snapshot_text({
+        "collected_at": "2026-09-13 05:20:00 KST",
+        "macro": ({}, None, None, None, None),
+        "radar_foreign": radar,
+        "radar_inst": radar,
+        "scraper": {
+            "updated_at": "05:08 KST",
+            "items": [{
+                "name": "미국채 10년물", "provider": "TradingView", "unit": "%",
+                "status": "ok", "price": 4.969, "previous_close": 4.955,
+                "change_pct": 0.28,
+            }],
+        },
+        "advanced": {
+            "latest": {"T10Y3M": {
+                "label": "10Y-3M", "available": True, "value": -0.35,
+                "digits": 3, "unit": "%p", "delta": -0.01,
+                "status": "역전", "percentile": 5.0,
+            }},
+            "derived": {},
+        },
+    })
+
+    assert "국내 수급 레이더" in text
+    assert "삼성전자(005930)" in text
+    assert "비공식 스크래핑 참고 시세" in text
+    assert "심화 매크로 지표" in text
+    assert "역전" in text
+
+
+def test_snapshot_macro_section_accepts_list_payload():
+    """저장 계층을 거치면 튜플이 리스트로 돌아옵니다."""
+    from services.dashboard_snapshot_service import format_dashboard_snapshot_text
+
+    payload = [
+        {"통화": [{"name": "원/달러", "status": "ok", "price_str": "1,341.05",
+                  "delta_str": "-0.29", "prev_str": "1,341.34"}]},
+        4.969, 4.955, 4.630, 4.620,
+    ]
+    text = format_dashboard_snapshot_text({"macro": payload})
+
+    assert "거시 지표 수집 실패" not in text
+    assert "원/달러" in text
+    assert "10Y-2Y 스프레드" in text
