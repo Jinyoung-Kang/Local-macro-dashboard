@@ -441,3 +441,346 @@ def test_dataset_names_are_unique():
     ]
     assert len(generated) == len(set(generated))
     assert not set(fixed) & set(generated)
+
+
+# ==============================================================================
+# 9. 수집 실행 상태 판정 (죽은 수집기를 '진행 중'으로 보고하면 안 된다)
+# ==============================================================================
+def test_dead_pid_running_run_is_reported_interrupted(db):
+    """
+    [회귀] 수집기가 Ctrl+C·절전·강제종료로 죽으면 status가 'running'에
+    영구히 남아 --status가 "진행 중"이라고 거짓 보고했습니다.
+    """
+    import socket
+
+    from services import store
+
+    run = {
+        "status": "running",
+        "pid": 999_999_999,                 # 존재하지 않는 PID
+        "host": socket.gethostname(),
+        "heartbeat_at": store._utc_now_iso(),
+        "started_at": store._utc_now_iso(),
+    }
+    assert store.resolve_run_status(run) == "interrupted"
+
+
+def test_live_pid_with_fresh_heartbeat_is_running(db):
+    import os
+    import socket
+
+    from services import store
+
+    run = {
+        "status": "running",
+        "pid": os.getpid(),                 # 살아 있는 PID (이 테스트 프로세스)
+        "host": socket.gethostname(),
+        "heartbeat_at": store._utc_now_iso(),
+        "started_at": store._utc_now_iso(),
+    }
+    assert store.resolve_run_status(run) == "running"
+
+
+def test_stale_heartbeat_is_interrupted_even_if_pid_alive(db):
+    """PID가 재사용됐거나 프로세스가 멈춘 경우도 잡아야 합니다."""
+    import os
+    import socket
+    from datetime import datetime, timedelta, timezone
+
+    from services import store
+
+    old = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=store.STALE_RUN_SECONDS + 60)
+    ).isoformat(timespec="seconds")
+
+    run = {
+        "status": "running",
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "heartbeat_at": old,
+        "started_at": old,
+    }
+    assert store.resolve_run_status(run) == "interrupted"
+
+
+def test_finished_run_status_is_passed_through(db):
+    from services import store
+
+    assert store.resolve_run_status({"status": "ok"}) == "ok"
+    assert store.resolve_run_status({"status": "partial"}) == "partial"
+    assert store.resolve_run_status(None) == "none"
+
+
+def test_mark_stale_runs_interrupted_cleans_db(db):
+    import socket
+
+    from services import store
+
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO collector_runs "
+            "(started_at, status, pid, host, heartbeat_at) VALUES (?,?,?,?,?)",
+            (store._utc_now_iso(), "running", 999_999_999,
+             socket.gethostname(), store._utc_now_iso()),
+        )
+
+    assert store.mark_stale_runs_interrupted() == 1
+    assert store.read_last_run()["status"] == "interrupted"
+    # 멱등: 두 번째 호출은 아무것도 바꾸지 않습니다.
+    assert store.mark_stale_runs_interrupted() == 0
+
+
+# ==============================================================================
+# 10. 태스크별 실행 로그
+# ==============================================================================
+def test_task_run_log_records_each_task(db):
+    from datetime import datetime, timezone
+
+    from services import store
+
+    run_id = store.start_run(group_name="fast")
+    for task, status, detail in [
+        ("scraper_markets", "ok", "10/10 소스"),
+        ("krx_futures", "error", "ConnectionError: 끊김"),
+        ("sector_history", "empty", "0/20 티커"),
+    ]:
+        store.record_task_run(
+            run_id, task, speed="fast", status=status,
+            started_at=datetime.now(timezone.utc), duration_ms=1234,
+            detail=detail,
+        )
+
+    summary = {t["task"]: t for t in store.read_task_summary()}
+    assert summary["krx_futures"]["status"] == "error"
+    assert "ConnectionError" in summary["krx_futures"]["detail"]
+    assert summary["sector_history"]["status"] == "empty"
+    assert summary["scraper_markets"]["status"] == "ok"
+
+
+def test_task_summary_returns_only_latest_per_task(db):
+    from datetime import datetime, timezone
+
+    from services import store
+
+    for status in ("error", "ok"):
+        store.record_task_run(
+            None, "krx_futures", speed="slow", status=status,
+            started_at=datetime.now(timezone.utc), duration_ms=10,
+            detail=status,
+        )
+
+    rows = [t for t in store.read_task_summary() if t["task"] == "krx_futures"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "ok", "가장 최근 결과를 써야 합니다"
+
+
+def test_task_history_filters_by_task(db):
+    from datetime import datetime, timezone
+
+    from services import store
+
+    for task in ("a", "b", "a"):
+        store.record_task_run(
+            None, task, speed="fast", status="ok",
+            started_at=datetime.now(timezone.utc), duration_ms=1,
+        )
+
+    assert len(store.read_task_history("a")) == 2
+    assert len(store.read_task_history()) == 3
+
+
+# ==============================================================================
+# 11. 누락 데이터셋 탐지 (있는 것만 보여주면 빠진 걸 알 수 없다)
+# ==============================================================================
+def test_missing_datasets_reports_absent_expected_keys(db):
+    from services import datasets, store
+
+    # 아무것도 없으면 기대 목록 전체가 누락으로 나와야 합니다.
+    all_missing = store.missing_datasets()
+    assert len(all_missing) > 20
+    names = {m["name"] for m in all_missing}
+    assert datasets.SNAP_KRX_FUTURES in names
+    assert datasets.SNAP_SECTOR_HISTORY in names
+    assert datasets.SNAP_COT_HISTORY in names
+
+    # 하나 채우면 그 항목만 목록에서 빠집니다.
+    store.put_snapshot(datasets.SNAP_KRX_FUTURES, {"x": 1})
+    after = {m["name"] for m in store.missing_datasets()}
+    assert datasets.SNAP_KRX_FUTURES not in after
+    assert datasets.SNAP_SECTOR_HISTORY in after
+
+
+def test_missing_datasets_entries_have_human_labels(db):
+    from services import store
+
+    for m in store.missing_datasets():
+        assert m["label"] and not m["label"].startswith("krx.")
+
+
+# ==============================================================================
+# 12. 스키마 마이그레이션 (기존 사용자 DB에 컬럼 추가)
+# ==============================================================================
+def test_migration_adds_columns_to_existing_db(tmp_path, monkeypatch):
+    """
+    이전 버전이 만든 collector_runs(pid/heartbeat 없음)에도
+    컬럼이 추가돼야 합니다. CREATE TABLE IF NOT EXISTS는 컬럼을
+    추가해 주지 않습니다.
+    """
+    import sqlite3
+
+    from services import store
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE collector_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            ok_count INTEGER NOT NULL DEFAULT 0,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            detail TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO collector_runs (started_at, status) VALUES ('x', 'ok')"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DASHBOARD_DB", str(path))
+    store._initialized_paths.clear()
+    store.init_db()
+
+    with store.connect(readonly=True) as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(collector_runs)")}
+    store._initialized_paths.clear()
+
+    assert {"pid", "host", "heartbeat_at", "group_name"} <= cols
+    # 기존 데이터는 보존돼야 합니다.
+    assert cols >= {"started_at", "status"}
+
+
+# ==============================================================================
+# 13. SEC 13F 최적화
+# ==============================================================================
+def test_sec_rate_limiter_respects_cap_under_concurrency():
+    """SEC 초당 요청 한도를 병렬 상황에서도 넘지 않아야 합니다."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from services.sec_service import _SEC_MAX_RPS, _sec_rate_limit
+
+    n = 24
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda _: _sec_rate_limit(), range(n)))
+    rps = n / (time.perf_counter() - start)
+
+    assert rps <= _SEC_MAX_RPS * 1.25, f"한도 초과: {rps:.1f} req/s"
+
+
+def test_q1_is_derived_from_q8_snapshot_without_network(db, monkeypatch):
+    """
+    q1은 q8의 앞부분과 동일하므로 재수집하면 안 됩니다
+    (수집기 기준 기관당 요청 2회 절약).
+    """
+    import pandas as pd
+
+    from services import datasets, store
+    import services.sec_service as sec
+
+    cols = ["name", "cusip", "class", "value", "shares", "weight"]
+    hist8 = [
+        (pd.DataFrame([[f"N{i}", "c", "COM", 1.0, 1, 100.0]], columns=cols),
+         {"report_date": f"2026-0{i}-30"})
+        for i in range(1, 9)
+    ]
+    store.put_object(datasets.snap_sec_13f("CIK1", 8), (hist8, None))
+
+    called = []
+    monkeypatch.setattr(
+        sec, "collect_sec_13f_multi_quarters",
+        lambda c, q: (called.append((c, q)), ([], "네트워크"))[1],
+    )
+
+    sec.fetch_sec_13f_multi_quarters.clear()
+    history, err = sec.fetch_sec_13f_multi_quarters("CIK1", 1)
+    sec.fetch_sec_13f_multi_quarters.clear()
+
+    assert len(history) == 1
+    assert history[0][1]["report_date"] == "2026-01-30"
+    assert called == [], "q8 저장본이 있으면 네트워크를 타지 않아야 합니다"
+
+
+def test_full_quarters_request_does_not_self_derive(db, monkeypatch):
+    """q8 요청은 q8에서 유도할 수 없으므로 정상 경로를 타야 합니다."""
+    import services.sec_service as sec
+
+    assert sec._derive_from_longer_snapshot("CIK1", 8) is None
+
+
+# ==============================================================================
+# 14. 수집기 루프 순서 / 락
+# ==============================================================================
+def test_loop_runs_fast_group_before_weekly():
+    """
+    [회귀] weekly(13F, 10분+)를 먼저 돌려 fast 데이터가 늦게 채워졌습니다.
+    싼 것부터 처리해야 기동 직후 화면이 빨리 쓸만해집니다.
+    """
+    import inspect
+
+    import collector
+
+    src = inspect.getsource(collector.run_loop)
+    assert 'for group in ("fast", "slow", "weekly")' in src
+
+
+def test_process_lock_blocks_second_instance(tmp_path, monkeypatch):
+    """수집기 중복 실행은 외부 소스를 두 배로 호출하므로 막아야 합니다."""
+    import collector
+    from services import store
+
+    monkeypatch.setenv("DASHBOARD_DB", str(tmp_path / "x.db"))
+    store._initialized_paths.clear()
+
+    with collector.process_lock():
+        # 같은 프로세스 재진입은 허용 (PID가 같으므로)
+        lock_file = collector._lock_path()
+        assert lock_file.exists()
+
+        # 다른 살아 있는 PID가 들고 있는 것처럼 위조
+        import os
+
+        lock_file.write_text(f"{os.getppid()} now\n")
+        with pytest.raises(collector.AlreadyRunning):
+            with collector.process_lock():
+                pass
+
+        # --force 면 통과해야 합니다
+        lock_file.write_text(f"{os.getppid()} now\n")
+        with collector.process_lock(force=True):
+            pass
+
+    store._initialized_paths.clear()
+
+
+def test_process_lock_reclaims_dead_holder(tmp_path, monkeypatch):
+    import collector
+    from services import store
+
+    monkeypatch.setenv("DASHBOARD_DB", str(tmp_path / "y.db"))
+    store._initialized_paths.clear()
+
+    lock_file = collector._lock_path()
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text("999999999 stale\n")      # 죽은 PID
+
+    with collector.process_lock():
+        pass                                        # 예외 없이 회수돼야 함
+
+    store._initialized_paths.clear()

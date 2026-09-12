@@ -43,7 +43,9 @@ import os
 import sys
 import time as time_module
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -91,26 +93,47 @@ class Task:
         self.fn = fn
         self.description = description
 
-    def run(self) -> tuple[bool, str]:
+    def run(self, run_id: int | None = None) -> tuple[bool, str]:
+        """
+        태스크를 1회 실행하고 결과를 DB(collector_task_runs)에 남깁니다.
+
+        태스크 단위 기록이 없으면 "성공 0 · 실패 3"만 보이고 어떤 작업이 왜
+        실패했는지 알 수 없습니다. 로그는 터미널을 닫으면 사라지므로,
+        --status로 언제든 다시 볼 수 있게 DB에 남깁니다.
+        """
+        from services import store
+
+        started_wall = datetime.now(timezone.utc)
         started = time_module.perf_counter()
+
+        status = "ok"
+        ok = True
+        detail = ""
+
         try:
-            detail = self.fn()
+            detail = self.fn() or ""
         except EmptyResult as e:
-            elapsed = time_module.perf_counter() - started
             # 예외 없이 끝났지만 데이터가 없음 → 실패로 집계(기존 저장본은 보존)
-            logger.warning("  ⚠️  %-26s %6.2fs  수집 결과 없음: %s",
-                           self.name, elapsed, e)
-            return False, f"수집 결과 없음: {e}"
+            status, ok, detail = "empty", False, f"수집 결과 없음: {e}"
         except Exception as e:
-            elapsed = time_module.perf_counter() - started
-            logger.warning("  ❌ %-26s %6.2fs  %s: %s",
-                           self.name, elapsed, type(e).__name__, e)
+            status, ok = "error", False
+            detail = f"{type(e).__name__}: {e}"
             logger.debug(traceback.format_exc())
-            return False, f"{type(e).__name__}: {e}"
 
         elapsed = time_module.perf_counter() - started
-        logger.info("  ✅ %-26s %6.2fs  %s", self.name, elapsed, detail or "")
-        return True, detail or ""
+        icon = {"ok": "✅", "empty": "⚠️ ", "error": "❌"}[status]
+        log = logger.info if ok else logger.warning
+        log("  %s %-26s %6.2fs  %s", icon, self.name, elapsed, detail)
+
+        store.record_task_run(
+            run_id, self.name,
+            speed=self.speed,
+            status=status,
+            started_at=started_wall,
+            duration_ms=int(elapsed * 1000),
+            detail=detail,
+        )
+        return ok, detail
 
 
 # ------------------------------------------------------------------ fast tasks
@@ -386,36 +409,72 @@ def _task_cot_history() -> str:
 
 def _task_sec_13f() -> str:
     """
-    13F는 기관 12곳 × 분기별 문서 추적이라 가장 느린 작업입니다
-    (SEC 초당 10건 제한 준수 때문에 더 느립니다). 화면이 쓰는
-    max_quarters 조합(1, 8)을 미리 받아 둡니다.
+    SEC 13F 수집 — 전체 수집에서 가장 오래 걸리는 작업입니다.
+
+    [최적화 2가지]
+    1) q1은 q8의 부분집합입니다. collect_sec_13f_multi_quarters()는 공시를
+       최신순으로 훑어 max_quarters개만 자르므로, q8[:1] == q1 입니다.
+       따라서 q8만 수집하고 q1은 잘라서 저장합니다 (수집 24건 → 12건).
+    2) 기존에는 기관을 순차 처리했습니다. SEC 한도는 초당 10건인데
+       time.sleep(0.2) 직렬 방식으로는 초당 5건도 못 썼습니다.
+       _sec_rate_limit() 토큰 버킷으로 바꿨으므로 기관을 병렬 처리해도
+       전체 합계 한도는 지켜집니다.
     """
     from services import datasets, store
     from services.sec_service import collect_sec_13f_multi_quarters
     from config import INSTITUTIONS
 
+    targets = [
+        (name, info["cik"])
+        for name, info in INSTITUTIONS.items()
+        if info.get("cik")
+    ]
+    if not targets:
+        raise EmptyResult("수집 대상 기관이 없습니다")
+
+    QUARTERS = 8
+
+    def one(item):
+        name, cik = item
+        history, err = collect_sec_13f_multi_quarters(cik, QUARTERS)
+        return name, cik, history, err
+
     ok = 0
-    attempted = 0
-    for name, info in INSTITUTIONS.items():
-        cik = info.get("cik")
-        if not cik:
-            continue
-        for quarters in (1, 8):
-            attempted += 1
-            history, err = collect_sec_13f_multi_quarters(cik, quarters)
+    saved = 0
+    errors: list[str] = []
+
+    # SEC 한도는 토큰 버킷이 전역으로 지키므로, 워커 수는 지연 숨기기 용도만
+    # 입니다. 과도하게 늘리면 커넥션만 낭비합니다.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for name, cik, history, err in executor.map(one, targets):
             if not history:
-                logger.info("    13F 빈 결과(저장본 유지): %s q%s (%s)",
-                            name, quarters, err)
+                logger.info("    13F 빈 결과(저장본 유지): %s (%s)", name, err)
+                errors.append(f"{name}: {err or '빈 결과'}")
                 continue
+
+            # q8 전체
             store.put_object(
-                datasets.snap_sec_13f(cik, quarters), (history, err), status="ok",
+                datasets.snap_sec_13f(cik, QUARTERS), (history, err), status="ok",
             )
+            saved += 1
+
+            # q1은 q8의 첫 분기 = 같은 데이터. 재수집하지 않습니다.
+            store.put_object(
+                datasets.snap_sec_13f(cik, 1), (history[:1], err), status="ok",
+            )
+            saved += 1
             ok += 1
 
     if not ok:
-        raise EmptyResult(f"0/{attempted} 건 — 기존 저장본 유지")
+        raise EmptyResult(
+            f"0/{len(targets)} 기관 — 기존 저장본 유지"
+            + (f" ({errors[0]})" if errors else "")
+        )
 
-    return f"{ok}/{attempted} 건 (기관 {len(INSTITUTIONS)}곳)"
+    detail = f"{ok}/{len(targets)} 기관, 스냅샷 {saved}건 (q8 수집 → q1 유도)"
+    if errors:
+        detail += f", 실패 {len(errors)}곳"
+    return detail
 
 
 ALL_TASKS: list[Task] = [
@@ -448,21 +507,86 @@ ALL_TASKS: list[Task] = [
 # ==============================================================================
 # 실행
 # ==============================================================================
-def run_once(only: str | None = None) -> tuple[int, int]:
+# ==============================================================================
+# 중복 실행 방지
+# ==============================================================================
+class AlreadyRunning(Exception):
+    """다른 수집기 프로세스가 이미 돌고 있을 때."""
+
+
+def _lock_path() -> Path:
+    from services import store
+
+    return store.get_db_path().parent / "collector.lock"
+
+
+@contextmanager
+def process_lock(force: bool = False):
+    """
+    수집기 중복 실행을 막습니다.
+
+    두 프로세스가 동시에 돌면 같은 외부 소스를 두 배로 호출하고(레이트리밋
+    위험), SQLite 쓰기 경쟁도 늘어납니다. 무엇보다 --status 출력이 뒤섞여
+    원인 파악이 어려워집니다.
+
+    락 파일에 PID를 적고, 죽은 프로세스의 락은 자동으로 회수합니다
+    (절전/강제종료로 락이 남는 것을 방지).
+    """
+    from services import store
+
+    path = _lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
+        try:
+            holder = int(path.read_text().split()[0])
+        except (ValueError, IndexError, OSError):
+            holder = None
+
+        if holder and holder != os.getpid() and store._pid_is_alive(holder):
+            if not force:
+                raise AlreadyRunning(
+                    f"다른 수집기가 이미 실행 중입니다 (PID {holder}).\n"
+                    f"  락 파일: {path}\n"
+                    f"  그 프로세스를 끝내거나, --force로 무시할 수 있습니다."
+                )
+            logger.warning("--force: 기존 락(PID %s)을 무시합니다.", holder)
+        elif holder:
+            logger.info("죽은 프로세스의 락을 회수합니다 (PID %s).", holder)
+
+    path.write_text(f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}\n")
+    try:
+        yield
+    finally:
+        try:
+            # 내 락만 지웁니다 (--force로 빼앗긴 경우 남의 락을 지우지 않도록)
+            if path.exists() and path.read_text().split()[0] == str(os.getpid()):
+                path.unlink()
+        except (OSError, IndexError):
+            pass
+
+
+def run_once(
+    only: str | None = None,
+    task_name: str | None = None,
+) -> tuple[int, int]:
     """선택된 작업을 1회 실행합니다. (성공 수, 실패 수)를 반환합니다."""
     from services import store
 
-    tasks = [t for t in ALL_TASKS if only in (None, "all") or t.speed == only]
+    if task_name:
+        tasks = [t for t in ALL_TASKS if t.name == task_name]
+    else:
+        tasks = [t for t in ALL_TASKS if only in (None, "all") or t.speed == only]
     if not tasks:
         logger.warning("실행할 작업이 없습니다 (--only %s)", only)
         return 0, 0
 
-    label = only or "all"
+    label = task_name or only or "all"
     logger.info("수집 시작 (%s): %d개 작업", label, len(tasks))
 
     run_id = None
     try:
-        run_id = store.start_run()
+        run_id = store.start_run(group_name=label)
     except Exception as e:
         logger.warning("실행 로그 기록 실패(수집은 계속합니다): %s", e)
 
@@ -471,11 +595,15 @@ def run_once(only: str | None = None) -> tuple[int, int]:
     failures: list[str] = []
 
     for task in tasks:
-        success, detail = task.run()
+        success, detail = task.run(run_id)
         if success:
             ok_count += 1
         else:
             failures.append(f"{task.name}: {detail}")
+        # 태스크마다 heartbeat를 찍어, 죽은 수집기를 "진행 중"으로
+        # 오인하지 않게 합니다 (13F는 한 태스크가 10분 넘게 걸립니다).
+        if run_id is not None:
+            store.heartbeat_run(run_id)
 
     elapsed = time_module.perf_counter() - started
     fail_count = len(failures)
@@ -524,8 +652,10 @@ def run_loop(
         while True:
             now = time_module.monotonic()
 
-            # 무거운 군을 먼저 처리해, 가벼운 fast가 뒤에서 밀리지 않게 합니다.
-            for group in ("weekly", "slow", "fast"):
+            # [수정] 예전에는 weekly를 먼저 돌렸습니다. 그런데 13F(weekly)는
+            # 10분 이상 걸려서, 기동 직후 가장 자주 보는 fast 데이터가
+            # 그만큼 늦게 채워졌습니다. 싼 것부터 처리합니다.
+            for group in ("fast", "slow", "weekly"):
                 if now >= next_run[group]:
                     run_once(group)
                     next_run[group] = time_module.monotonic() + intervals[group]
@@ -538,48 +668,104 @@ def run_loop(
         logger.info("상주 모드를 종료합니다.")
 
 
-def print_status() -> None:
-    """저장 상태를 출력합니다."""
+def print_status(verbose: bool = False) -> None:
+    """저장 상태를 출력합니다. '무엇이 왜 실패했는지'가 핵심입니다."""
     from services import store
 
     stats = store.store_stats()
 
     print(f"\nDB 경로   : {stats['db_path']}")
     if not stats["exists"]:
-        print("상태      : 아직 생성되지 않았습니다. `python collector.py`를 먼저 실행하세요.\n")
+        print("상태      : 아직 생성되지 않았습니다. "
+              "`python collector.py`를 먼저 실행하세요.\n")
         return
 
-    print(f"DB 크기   : {stats['size_bytes'] / 1024:.1f} KB")
+    print(f"DB 크기   : {stats['size_bytes'] / 1024:,.1f} KB")
     print(f"누적 시계열: {stats['timeseries_rows']:,}행")
     print(f"누적 레코드: {stats['observation_rows']:,}행")
 
-    last = stats["last_run"]
+    # ----------------------------------------------------------- 최근 수집
+    last = stats.get("last_run")
+    resolved = stats.get("last_run_status", "none")
     if last:
-        print(
-            f"최근 수집 : {last['started_at']} → {last.get('finished_at') or '진행 중'} "
-            f"[{last['status']}] 성공 {last['ok_count']} · 실패 {last['fail_count']}"
-        )
-        if last.get("detail"):
-            print(f"            실패 상세: {last['detail'][:300]}")
+        started = _fmt_kst(last.get("started_at"))
+        finished = _fmt_kst(last.get("finished_at"))
 
-    print("\n저장된 스냅샷:")
-    if not stats["snapshots"]:
-        print("  (없음)")
+        if resolved == "running":
+            beat = store._parse_iso(
+                last.get("heartbeat_at") or last.get("started_at")
+            )
+            mins = (
+                (datetime.now(timezone.utc) - beat).total_seconds() / 60
+                if beat else 0
+            )
+            tail = f"진행 중 (마지막 신호 {mins:.1f}분 전, PID {last.get('pid')})"
+        elif resolved == "interrupted":
+            tail = "⚠️ 비정상 종료 (프로세스가 사라졌거나 신호가 끊겼습니다)"
+        else:
+            tail = f"{finished or '?'} [{resolved}]"
+
+        print(
+            f"최근 수집 : {started} → {tail}  "
+            f"성공 {last.get('ok_count', 0)} · 실패 {last.get('fail_count', 0)}"
+            + (f" · 대상 {last.get('group_name')}" if last.get("group_name") else "")
+        )
+
+    # ------------------------------------------------------ 태스크별 결과
+    summary = stats.get("task_summary") or []
+    print("\n태스크별 최근 결과:")
+    if not summary:
+        print("  (기록 없음 — 이 버전 이전에 수집했다면 다시 한 번 실행하세요)")
     else:
-        now = datetime.now(tz=ZoneInfo("UTC"))
+        icons = {"ok": "✅", "empty": "⚠️ ", "error": "❌"}
+        for t in summary:
+            secs = (t.get("duration_ms") or 0) / 1000
+            print(
+                f"  {icons.get(t['status'], '? ')} "
+                f"[{(t.get('speed') or '?'):<6}] {t['task']:<22} "
+                f"{secs:7.1f}s  {_fmt_kst(t.get('started_at')) or ''}"
+            )
+            if t["status"] != "ok" and t.get("detail"):
+                print(f"       └─ {t['detail'][:160]}")
+
+    # -------------------------------------------------- 누락된 데이터셋
+    missing = store.missing_datasets()
+    print(f"\n저장된 스냅샷: {len(stats['snapshots'])}개"
+          f" / 누락: {len(missing)}개")
+
+    if missing:
+        print("\n⚠️  있어야 하는데 없는 데이터셋:")
+        for m in missing[: (None if verbose else 15)]:
+            print(f"  - {m['label']:<28} ({m['name']})")
+        if not verbose and len(missing) > 15:
+            print(f"  ... 외 {len(missing) - 15}개 (--status -v 로 전체 보기)")
+        print("\n  해당 태스크가 실패했거나 아직 실행되지 않았습니다.")
+        print("  위 '태스크별 최근 결과'에서 ❌/⚠️ 항목을 확인하세요.")
+
+    if verbose and stats["snapshots"]:
+        print("\n저장된 스냅샷 상세:")
+        now = datetime.now(tz=timezone.utc)
         for snap in stats["snapshots"]:
             collected = snap.get("collected_at") or ""
-            age = ""
             try:
-                dt = datetime.fromisoformat(collected)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+                dt = store._parse_iso(collected)
                 mins = (now - dt).total_seconds() / 60
-                age = f"{mins:6.1f}분 전"
-            except ValueError:
+                age = f"{mins:8.1f}분 전"
+            except (ValueError, TypeError):
                 age = "        ?"
-            print(f"  {snap['name']:<34} [{snap['status']:<9}] {age}")
+            print(f"  {snap['name']:<40} [{snap['status']:<9}] {age}")
+
     print()
+
+
+def _fmt_kst(iso: str | None) -> str | None:
+    """UTC ISO 문자열을 KST 표시 문자열로."""
+    from services import store
+
+    dt = store._parse_iso(iso)
+    if dt is None:
+        return None
+    return dt.astimezone(KST).strftime("%m-%d %H:%M:%S")
 
 
 def print_launchd_plist(fast_interval: int) -> None:
@@ -671,6 +857,22 @@ def main() -> int:
         help="저장 상태만 출력하고 종료",
     )
     parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="--status 출력에 스냅샷 상세와 전체 누락 목록 포함",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="다른 수집기가 실행 중이어도 강제로 진행",
+    )
+    parser.add_argument(
+        "--task", default=None,
+        help="특정 태스크만 실행 (--list로 이름 확인)",
+    )
+    parser.add_argument(
+        "--history", default=None, metavar="TASK",
+        help="해당 태스크의 실행 이력을 출력하고 종료 ('all'이면 전체)",
+    )
+    parser.add_argument(
         "--list", action="store_true",
         help="수집 작업 목록 출력",
     )
@@ -696,7 +898,26 @@ def main() -> int:
         return 0
 
     if args.status:
-        print_status()
+        print_status(verbose=args.verbose)
+        return 0
+
+    if args.history:
+        from services import store
+
+        task = None if args.history == "all" else args.history
+        rows = store.read_task_history(task, limit=40)
+        if not rows:
+            print(f"\n실행 이력이 없습니다: {args.history}\n")
+            return 0
+        print(f"\n태스크 실행 이력 ({args.history}, 최신순):")
+        icons = {"ok": "✅", "empty": "⚠️ ", "error": "❌"}
+        for r in rows:
+            secs = (r.get("duration_ms") or 0) / 1000
+            print(
+                f"  {icons.get(r['status'], '? ')} {_fmt_kst(r['started_at'])}  "
+                f"{r['task']:<22} {secs:7.1f}s  {(r.get('detail') or '')[:90]}"
+            )
+        print()
         return 0
 
     if args.purge_days is not None:
@@ -705,11 +926,37 @@ def main() -> int:
         logger.info("정리 완료: %s", removed)
         return 0
 
-    if args.loop:
-        run_loop(args.fast_interval, args.slow_interval, args.weekly_interval)
-        return 0
+    from services import store
 
-    ok, fail = run_once(args.only)
+    # 비정상 종료로 'running'에 남아 있던 기록을 먼저 정리합니다.
+    try:
+        store.mark_stale_runs_interrupted()
+    except Exception as e:
+        logger.debug("오래된 실행 기록 정리 실패: %s", e)
+
+    try:
+        with process_lock(force=args.force):
+            if args.loop:
+                run_loop(
+                    args.fast_interval, args.slow_interval, args.weekly_interval,
+                )
+                return 0
+
+            if args.task:
+                names = {t.name for t in ALL_TASKS}
+                if args.task not in names:
+                    logger.error(
+                        "알 수 없는 태스크: %s (가능: %s)",
+                        args.task, ", ".join(sorted(names)),
+                    )
+                    return 2
+                ok, fail = run_once(only=None, task_name=args.task)
+            else:
+                ok, fail = run_once(args.only)
+    except AlreadyRunning as e:
+        logger.error("%s", e)
+        return 3
+
     # 전부 실패하면 0이 아닌 종료코드를 줘서 cron/launchd가 알아챌 수 있게 합니다.
     return 0 if ok else 1
 

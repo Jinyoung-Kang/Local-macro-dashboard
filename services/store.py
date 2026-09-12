@@ -137,7 +137,44 @@ CREATE TABLE IF NOT EXISTS collector_runs (
     fail_count   INTEGER NOT NULL DEFAULT 0,
     detail       TEXT
 );
+
+-- 태스크별 실행 결과. 집계만 있으면 "무엇이 왜 실패했는지" 알 수 없습니다.
+CREATE TABLE IF NOT EXISTS collector_task_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       INTEGER,
+    task         TEXT NOT NULL,
+    speed        TEXT,
+    status       TEXT NOT NULL,      -- ok | empty | error
+    started_at   TEXT NOT NULL,
+    duration_ms  INTEGER,
+    detail       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task
+    ON collector_task_runs (task, id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runs_run
+    ON collector_task_runs (run_id);
 """
+
+# collector_runs에 나중에 추가된 컬럼들.
+# 기존 사용자의 DB에는 없으므로 ALTER TABLE로 보강합니다
+# (CREATE TABLE IF NOT EXISTS는 이미 있는 테이블의 컬럼을 추가해 주지 않습니다).
+_MIGRATIONS = [
+    ("collector_runs", "pid", "INTEGER"),
+    ("collector_runs", "host", "TEXT"),
+    ("collector_runs", "heartbeat_at", "TEXT"),
+    ("collector_runs", "group_name", "TEXT"),
+]
+
+
+def _apply_migrations(conn) -> None:
+    """없는 컬럼만 추가합니다 (멱등)."""
+    for table, column, coltype in _MIGRATIONS:
+        existing = {
+            r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+            logger.info("스키마 마이그레이션: %s.%s 추가", table, column)
 
 
 def _utc_now_iso() -> str:
@@ -175,6 +212,7 @@ def init_db(db_path: Path | None = None) -> Path:
             # NORMAL: 로컬 대시보드에는 FULL fsync까지 필요하지 않습니다.
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(_SCHEMA)
+            _apply_migrations(conn)
             conn.commit()
         finally:
             conn.close()
@@ -702,13 +740,157 @@ def list_observation_dates(dataset: str, db_path: Path | None = None) -> list[st
 # ==============================================================================
 # 5. 수집 실행 로그
 # ==============================================================================
-def start_run(db_path: Path | None = None) -> int:
+# 이 시간 동안 heartbeat가 갱신되지 않은 'running' 레코드는 죽은 것으로 봅니다.
+# 수집기는 태스크마다 heartbeat를 찍으므로, 가장 느린 태스크(13F)보다
+# 넉넉하게 잡습니다.
+STALE_RUN_SECONDS = 30 * 60
+
+
+def start_run(
+    db_path: Path | None = None,
+    group_name: str | None = None,
+) -> int:
+    """
+    수집 실행을 기록하고 run_id를 반환합니다.
+
+    PID와 heartbeat를 함께 남기는 이유: 수집기가 Ctrl+C나 절전·강제종료로
+    죽으면 status가 'running'에 영구히 남아, --status가 "진행 중"이라고
+    거짓 보고합니다. PID 생존 여부와 heartbeat로 실제 진행 중인지 판정합니다.
+    """
+    import socket
+
     with connect(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO collector_runs (started_at, status) VALUES (?, 'running')",
-            (_utc_now_iso(),),
+            "INSERT INTO collector_runs "
+            "(started_at, status, pid, host, heartbeat_at, group_name) "
+            "VALUES (?, 'running', ?, ?, ?, ?)",
+            (
+                _utc_now_iso(), os.getpid(), socket.gethostname(),
+                _utc_now_iso(), group_name,
+            ),
         )
         return int(cur.lastrowid)
+
+
+def heartbeat_run(run_id: int, db_path: Path | None = None) -> None:
+    """진행 중임을 알리는 타임스탬프를 갱신합니다."""
+    try:
+        with connect(db_path) as conn:
+            conn.execute(
+                "UPDATE collector_runs SET heartbeat_at = ? WHERE id = ?",
+                (_utc_now_iso(), run_id),
+            )
+    except sqlite3.Error as e:
+        logger.debug("heartbeat 갱신 실패: %s", e)
+
+
+def record_task_run(
+    run_id: int | None,
+    task: str,
+    *,
+    speed: str | None,
+    status: str,
+    started_at: datetime,
+    duration_ms: int,
+    detail: str | None = None,
+    db_path: Path | None = None,
+) -> None:
+    """
+    태스크 1건의 결과를 기록합니다.
+
+    status: "ok" | "empty"(수집됐지만 데이터 없음) | "error"
+    """
+    try:
+        with connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO collector_task_runs "
+                "(run_id, task, speed, status, started_at, duration_ms, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id, task, speed, status,
+                    started_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                    duration_ms, (detail or "")[:1000] or None,
+                ),
+            )
+    except sqlite3.Error as e:
+        logger.warning("태스크 로그 기록 실패 (%s): %s", task, e)
+
+
+def _pid_is_alive(pid: int | None) -> bool:
+    """해당 PID가 살아 있는지 확인합니다 (같은 머신일 때만 의미 있음)."""
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)      # 시그널 0 = 존재 확인만
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True               # 존재하지만 권한이 없음
+    except (TypeError, ValueError, OSError):
+        return False
+    return True
+
+
+def resolve_run_status(run: dict | None) -> str:
+    """
+    기록된 status를 실제 상태로 보정합니다.
+
+    'running'으로 남아 있지만 프로세스가 죽었거나 heartbeat가 끊긴 경우
+    'interrupted'로 보고합니다. 그래야 --status가 거짓말을 하지 않습니다.
+    """
+    if not run:
+        return "none"
+
+    status = run.get("status") or "?"
+    if status != "running":
+        return status
+
+    import socket
+
+    same_host = (run.get("host") or socket.gethostname()) == socket.gethostname()
+    if same_host and not _pid_is_alive(run.get("pid")):
+        return "interrupted"
+
+    beat = _parse_iso(run.get("heartbeat_at") or run.get("started_at"))
+    if beat is not None:
+        age = (datetime.now(timezone.utc) - beat).total_seconds()
+        if age > STALE_RUN_SECONDS:
+            return "interrupted"
+
+    return "running"
+
+
+def mark_stale_runs_interrupted(db_path: Path | None = None) -> int:
+    """
+    죽은 'running' 레코드를 정리합니다. 수집기 시작 시 호출합니다.
+    정리한 건수를 반환합니다.
+    """
+    try:
+        with connect(db_path, readonly=True) as conn:
+            rows = [
+                dict(r) for r in conn.execute(
+                    "SELECT * FROM collector_runs WHERE status = 'running'"
+                ).fetchall()
+            ]
+    except sqlite3.Error:
+        return 0
+
+    stale = [
+        r["id"] for r in rows
+        if resolve_run_status(r) == "interrupted"
+    ]
+    if not stale:
+        return 0
+
+    with connect(db_path) as conn:
+        conn.executemany(
+            "UPDATE collector_runs SET status = 'interrupted', "
+            "detail = COALESCE(detail, '') || ' [비정상 종료로 판정]' "
+            "WHERE id = ?",
+            [(i,) for i in stale],
+        )
+    logger.info("비정상 종료된 수집 기록 %d건을 정리했습니다.", len(stale))
+    return len(stale)
 
 
 def finish_run(
@@ -723,8 +905,12 @@ def finish_run(
     with connect(db_path) as conn:
         conn.execute(
             "UPDATE collector_runs SET finished_at = ?, status = ?, "
-            "ok_count = ?, fail_count = ?, detail = ? WHERE id = ?",
-            (_utc_now_iso(), status, ok_count, fail_count, detail, run_id),
+            "ok_count = ?, fail_count = ?, detail = ?, heartbeat_at = ? "
+            "WHERE id = ?",
+            (
+                _utc_now_iso(), status, ok_count, fail_count, detail,
+                _utc_now_iso(), run_id,
+            ),
         )
 
 
@@ -777,7 +963,142 @@ def store_stats(db_path: Path | None = None) -> dict:
         logger.warning("통계 조회 실패: %s", e)
 
     stats["last_run"] = read_last_run(db_path)
+    stats["last_run_status"] = resolve_run_status(stats["last_run"])
+    stats["task_summary"] = read_task_summary(db_path)
     return stats
+
+
+def read_task_summary(db_path: Path | None = None) -> list[dict]:
+    """
+    태스크별 '가장 최근 실행 결과'를 반환합니다.
+
+    집계(성공 N·실패 M)만으로는 어떤 태스크가 왜 실패했는지 알 수 없어서,
+    태스크 단위로 최신 1건씩 추립니다.
+    """
+    try:
+        with connect(db_path, readonly=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT t.task, t.speed, t.status, t.started_at,
+                       t.duration_ms, t.detail
+                FROM collector_task_runs t
+                JOIN (
+                    SELECT task, MAX(id) AS max_id
+                    FROM collector_task_runs GROUP BY task
+                ) m ON m.task = t.task AND m.max_id = t.id
+                ORDER BY t.speed, t.task
+                """
+            ).fetchall()
+    except sqlite3.Error as e:
+        logger.warning("태스크 요약 조회 실패: %s", e)
+        return []
+    return [dict(r) for r in rows]
+
+
+def read_task_history(
+    task: str | None = None,
+    limit: int = 50,
+    db_path: Path | None = None,
+) -> list[dict]:
+    """태스크 실행 이력(최신순). task를 주면 그 태스크만."""
+    sql = (
+        "SELECT run_id, task, speed, status, started_at, duration_ms, detail "
+        "FROM collector_task_runs"
+    )
+    params: list[Any] = []
+    if task:
+        sql += " WHERE task = ?"
+        params.append(task)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+
+    try:
+        with connect(db_path, readonly=True) as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    except sqlite3.Error as e:
+        logger.warning("태스크 이력 조회 실패: %s", e)
+        return []
+
+
+def missing_datasets(db_path: Path | None = None) -> list[dict]:
+    """
+    "있어야 하는데 없는" 데이터셋을 찾습니다.
+
+    기존 store_stats()는 존재하는 스냅샷만 나열해서, 수집이 아예 안 된
+    데이터셋은 목록에서 조용히 빠져 있었습니다. 그래서 무엇이 누락됐는지
+    알아챌 수 없었습니다.
+    """
+    from services import datasets as ds
+
+    try:
+        with connect(db_path, readonly=True) as conn:
+            present = {
+                r["name"] for r in conn.execute(
+                    "SELECT name FROM snapshots"
+                ).fetchall()
+            }
+    except sqlite3.Error:
+        return []
+
+    expected: list[tuple[str, str]] = [
+        (ds.SNAP_MACRO_COLLECTED, "매크로 카드"),
+        (ds.SNAP_SCRAPER_MARKETS, "TradingView/Yahoo 참고 시세"),
+        (ds.SNAP_FED_LIQUIDITY, "연준 순유동성"),
+        (ds.SNAP_KRX_FUTURES, "KRX 선물 시계열"),
+        (ds.SNAP_SECTOR_HISTORY, "섹터·자산군 ETF 종가"),
+        (ds.SNAP_COT_HISTORY, "CFTC COT 통합"),
+    ]
+    for sid in ("DGS2", "DGS10", "DGS30", "DGS3MO",
+                "BAMLH0A0HYM2", "STLFSI4", "CPF3M"):
+        expected.append((ds.snap_fred_series(sid), f"FRED {sid}"))
+
+    for lookback, measure in ((25, "CONTRACT"), (25, "PRICE")):
+        expected.append((
+            ds.snap_daum_futures_trend(lookback, measure),
+            f"Daum 선물 수급 ({measure})",
+        ))
+
+    try:
+        from services.cot_service import COT_ASSETS
+
+        weeks = int(3 * 52 + 10)
+        for asset, info in COT_ASSETS.items():
+            expected.append((
+                ds.snap_cot_contract(info["code"], weeks), f"COT {asset}",
+            ))
+    except Exception:
+        pass
+
+    for market, investor, trade in (
+        ("KOSPI", "외국인", "순매수"),
+        ("KOSPI", "기관", "순매수"),
+        ("KOSPI", "외국인", "순매도"),
+    ):
+        expected.append((
+            ds.snap_radar_scanner(market, investor, trade, "TODAY"),
+            f"수급 레이더 {investor}/{trade}",
+        ))
+
+    try:
+        from config import INSTITUTIONS
+
+        for name, info in INSTITUTIONS.items():
+            cik = info.get("cik")
+            if not cik:
+                continue
+            short = name.split("(")[0].strip()
+            for q in (1, 8):
+                expected.append((
+                    ds.snap_sec_13f(cik, q), f"13F {short} q{q}",
+                ))
+    except Exception:
+        pass
+
+    return [
+        {"name": name, "label": label}
+        for name, label in expected
+        if name not in present
+    ]
 
 
 # ==============================================================================

@@ -59,11 +59,18 @@ def render_data_freshness_sidebar() -> None:
             f"수집 시각: `{snap.collected_at_kst_str()}`"
         )
 
-    if last_run and last_run.get("status") not in (None, "ok"):
-        st.sidebar.caption(
-            f"⚠️ 최근 수집 실패 {last_run.get('fail_count', 0)}건 "
-            "— '🗄️ 데이터 저장소 상태' 메뉴에서 확인"
-        )
+    if last_run:
+        resolved = store.resolve_run_status(last_run)
+        if resolved == "interrupted":
+            st.sidebar.caption(
+                "⚠️ 수집기가 비정상 종료된 것으로 보입니다 "
+                "— '🗄️ 데이터 저장소 상태'에서 확인"
+            )
+        elif resolved not in ("ok", "running"):
+            st.sidebar.caption(
+                f"⚠️ 최근 수집 실패 {last_run.get('fail_count', 0)}건 "
+                "— '🗄️ 데이터 저장소 상태' 메뉴에서 확인"
+            )
 
     if mode != store.READ_MODE_AUTO:
         st.sidebar.caption(f"읽기 모드: `{mode}`")
@@ -113,12 +120,15 @@ def render_data_status_view() -> None:
     if not last_run:
         st.info("수집 실행 기록이 없습니다.")
     else:
-        status = last_run.get("status", "?")
+        # 기록된 status가 아니라 "실제" 상태를 씁니다. 수집기가 죽으면
+        # status는 'running'에 영구히 남아 거짓 보고가 됩니다.
+        status = store.resolve_run_status(last_run)
         badge = {
             "ok": ("✅ 정상", "green"),
             "partial": ("⚠️ 일부 실패", "orange"),
             "fail": ("❌ 전체 실패", "red"),
             "running": ("⏳ 진행 중", "blue"),
+            "interrupted": ("⚠️ 비정상 종료", "red"),
         }.get(status, (f"? {status}", "gray"))
 
         r1, r2, r3 = st.columns([1.2, 1, 1])
@@ -129,12 +139,79 @@ def render_data_status_view() -> None:
         st.caption(
             f"시작 `{_to_kst(last_run.get('started_at'))}` → "
             f"종료 `{_to_kst(last_run.get('finished_at')) or '진행 중'}`"
+            + (f" · 대상 `{last_run['group_name']}`"
+               if last_run.get("group_name") else "")
+            + (f" · PID `{last_run['pid']}`" if last_run.get("pid") else "")
         )
 
+        if status == "interrupted":
+            st.warning(
+                "수집 프로세스가 사라졌거나 신호가 끊겼습니다. "
+                "터미널에서 `python collector.py --loop`을 다시 실행하세요. "
+                "기존 저장본은 그대로 유지됩니다.",
+                icon="⚠️",
+            )
+
         if last_run.get("detail"):
-            with st.expander("실패 상세", expanded=status == "fail"):
+            with st.expander("실패 상세", expanded=status in ("fail", "partial")):
                 for line in str(last_run["detail"]).split("; "):
                     st.markdown(f"- {line}")
+
+    # ------------------------------------------------------- 태스크별 결과
+    st.markdown("##### 태스크별 최근 결과")
+    st.caption(
+        "집계만 보면 어떤 작업이 왜 실패했는지 알 수 없습니다. "
+        "태스크 단위 기록이라 터미널을 닫아도 남습니다."
+    )
+
+    task_rows = stats.get("task_summary") or []
+    if not task_rows:
+        st.info(
+            "태스크 기록이 없습니다. 수집기를 한 번 실행하면 채워집니다 "
+            "(`python collector.py`)."
+        )
+    else:
+        icons = {"ok": "✅ 정상", "empty": "⚠️ 데이터 없음", "error": "❌ 오류"}
+        st.dataframe(
+            pd.DataFrame([{
+                "작업": t["task"],
+                "군": t.get("speed") or "?",
+                "상태": icons.get(t["status"], t["status"]),
+                "소요(초)": round((t.get("duration_ms") or 0) / 1000, 1),
+                "실행 시각(KST)": _to_kst(t.get("started_at")) or "",
+                "상세": (t.get("detail") or "")[:200],
+            } for t in task_rows]),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "소요(초)": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+
+    # ------------------------------------------------------- 누락 데이터셋
+    try:
+        missing = store.missing_datasets()
+    except Exception as e:
+        st.warning(f"누락 데이터셋 조회 실패: {e}")
+        missing = []
+
+    if missing:
+        with st.expander(
+            f"⚠️ 있어야 하는데 없는 데이터셋 {len(missing)}개", expanded=True,
+        ):
+            st.caption(
+                "해당 태스크가 실패했거나 아직 실행되지 않았습니다. "
+                "위 표에서 ❌/⚠️ 항목을 먼저 확인하세요."
+            )
+            st.dataframe(
+                pd.DataFrame([
+                    {"데이터": m["label"], "키": m["name"]} for m in missing
+                ]),
+                width="stretch",
+                hide_index=True,
+            )
+    else:
+        st.success("기대되는 모든 데이터셋이 적재돼 있습니다.", icon="✅")
 
     st.divider()
 

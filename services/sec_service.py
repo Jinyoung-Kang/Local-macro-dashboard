@@ -4,6 +4,7 @@ SEC EDGAR 13F-HR 공시 데이터 수집 및 기관 포트폴리오 분석 엔�
 (강력한 Session 기반 통신 방어, 콤마 수치 정제 및 무적 ElementTree XML 파서 탑재)
 """
 import logging
+import threading
 import time
 import xml.etree.ElementTree as ET
 import pandas as pd
@@ -22,6 +23,35 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 # 1. SEC 전용 강행 돌파 통신 세션 설정 (Timeout, Rate Limit 완벽 방어)
 # ==============================================================================
+# ==============================================================================
+# SEC 레이트 리미터 (초당 10건 제한 준수 + 병렬 수집 허용)
+# ==============================================================================
+# SEC EDGAR는 초당 10요청을 넘기면 차단합니다. 기존 코드는 요청 사이에
+# time.sleep(0.2)를 넣어 이를 지켰는데, 이 방식은 호출을 **직렬화**해서
+# 기관 12곳 × 8분기 = 약 200요청이 한 줄로 늘어섭니다. 대기 시간만 40초가
+# 넘고, 실제 왕복 지연까지 더하면 수 분이 걸립니다.
+#
+# 토큰 버킷으로 바꾸면 "전체 합계가 초당 N건을 넘지 않는" 조건을 지키면서
+# 여러 스레드가 동시에 요청할 수 있습니다. 한도는 10이 아니라 8로 둡니다
+# (버스트·시계 오차 여유분).
+_SEC_MAX_RPS = 8.0
+
+_sec_rate_lock = threading.Lock()
+_sec_next_slot = [0.0]
+
+
+def _sec_rate_limit() -> None:
+    """전체 프로세스 합계가 _SEC_MAX_RPS를 넘지 않도록 대기합니다."""
+    interval = 1.0 / _SEC_MAX_RPS
+    with _sec_rate_lock:
+        now = time.monotonic()
+        slot = max(now, _sec_next_slot[0])
+        _sec_next_slot[0] = slot + interval
+    wait = slot - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+
+
 @st.cache_resource(show_spinner=False)
 def get_sec_session() -> requests.Session:
     """
@@ -32,7 +62,7 @@ def get_sec_session() -> requests.Session:
     13F 교집합 화면(기관 12곳)에서 세션과 커넥션 풀이 12벌씩 생겼습니다.
 
     [주의] SEC는 연락처가 포함된 User-Agent를 요구합니다(미준수 시 403).
-    초당 10건 제한은 호출부의 time.sleep(0.2)로 지킵니다.
+    초당 요청 한도는 _sec_rate_limit() 토큰 버킷이 지킵니다.
     """
     session = requests.Session()
     retries = Retry(
@@ -101,7 +131,7 @@ def collect_sec_13f_multi_quarters(cik: str, max_quarters: int = 4):
     all_results = []
     for filing_date, doc_url in history_links:
         try:
-            time.sleep(0.2)  # SEC API 호출 제한(Rate Limit) 준수
+            _sec_rate_limit()   # SEC 초당 요청 한도 준수 (병렬 허용)
             doc_res = session.get(doc_url, timeout=30)
             doc_res.raise_for_status()
         except Exception as e:
@@ -150,7 +180,7 @@ def collect_sec_13f_multi_quarters(cik: str, max_quarters: int = 4):
             continue
 
         try:
-            time.sleep(0.2)
+            _sec_rate_limit()
             xml_res = session.get(xml_url, timeout=30)
             xml_res.raise_for_status()
         except Exception as e:
@@ -252,6 +282,38 @@ def collect_sec_13f_multi_quarters(cik: str, max_quarters: int = 4):
 # ==============================================================================
 # 저장본 우선 읽기 경로
 # ==============================================================================
+def _derive_from_longer_snapshot(cik: str, max_quarters: int):
+    """
+    요청한 분기 수보다 긴 저장본이 있으면 거기서 잘라 반환합니다.
+    없으면 None (호출부가 평소 경로를 타도록).
+    """
+    if max_quarters >= _MAX_TRACKED_QUARTERS:
+        return None
+
+    for longer in range(max_quarters + 1, _MAX_TRACKED_QUARTERS + 1):
+        snap = store.read_snapshot(datasets.snap_sec_13f(cik, longer))
+        if snap is None or not snap.is_fresh(datasets.MAX_AGE_SLOW):
+            continue
+        if not _history_schema_ok(snap.payload):
+            continue
+
+        history, err = snap.payload
+        if not isinstance(history, list) or len(history) < max_quarters:
+            continue
+
+        logger.debug(
+            "13F q%s를 q%s 저장본에서 유도했습니다 (cik=%s)",
+            max_quarters, longer, cik,
+        )
+        return history[:max_quarters], err
+
+    return None
+
+
+# 수집기가 저장하는 최대 분기 수 (collector._task_sec_13f의 QUARTERS와 일치)
+_MAX_TRACKED_QUARTERS = 8
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_sec_13f_multi_quarters(cik: str, max_quarters: int = 4):
     """
@@ -265,6 +327,13 @@ def fetch_sec_13f_multi_quarters(cik: str, max_quarters: int = 4):
         return collect_sec_13f_multi_quarters(cik, max_quarters)
 
     snap_name = datasets.snap_sec_13f(cik, max_quarters)
+
+    # q1 같은 짧은 요청은 더 긴 저장본(q8)의 앞부분과 동일합니다
+    # (collect_*가 공시를 최신순으로 훑어 앞에서 자르기 때문).
+    # 그러니 q1 저장본이 없어도 q8이 있으면 수집하지 않고 잘라 씁니다.
+    derived = _derive_from_longer_snapshot(cik, max_quarters)
+    if derived is not None:
+        return derived
 
     # 저장본이 예전 버전의 컬럼 구성이면 화면이 KeyError로 죽습니다.
     # cached_or_live의 required_columns는 단일 DataFrame만 검사하므로,
@@ -370,7 +439,7 @@ def load_all_institutions_data():
                 'df': df,
                 'meta': meta
             }
-        time.sleep(0.2)
+        _sec_rate_limit()
     return data
 
 

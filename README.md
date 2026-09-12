@@ -63,6 +63,16 @@ streamlit run app.py
 | 글로벌 투기세력 (COT) | 7.2s | **0.02s** |
 | 연준 순유동성 | 6.1s | **0.44s** |
 
+수집기 자체도 최적화했습니다. 가장 느린 **SEC 13F**는 두 가지로 줄였습니다.
+
+- `q1`은 `q8`의 앞부분과 동일합니다(공시를 최신순으로 훑어 앞에서 자르므로).
+  `q8`만 수집하고 `q1`은 잘라 씁니다 — 요청 216 → 192회.
+- 기존 `time.sleep(0.2)` 방식은 요청을 **직렬화**해 초당 5건도 못 썼습니다.
+  SEC 한도(초당 10건)를 지키는 토큰 버킷으로 바꿔 기관을 병렬 처리합니다.
+
+실제 왕복 지연(250ms)을 흉내낸 측정: **97.3s → 24.1s (4.0배)**. 전역 합계는
+8 req/s를 넘지 않습니다(동시 8스레드 검증).
+
 ### 수집기 사용법
 
 ```bash
@@ -71,10 +81,38 @@ python collector.py --only fast     # 시세·수급만 (5분 주기 권장)
 python collector.py --only slow     # FRED·KRX·COT (1시간 주기 권장)
 python collector.py --only weekly   # SEC 13F (12시간 주기 권장)
 python collector.py --loop          # 상주 모드 (위 세 주기를 동시에 관리)
-python collector.py --status        # 저장 상태 확인
 python collector.py --list          # 수집 작업 목록
 python collector.py --purge-days 400  # 오래된 누적 이력 정리
 ```
+
+### 문제가 생겼을 때 — 진단 3단계
+
+```bash
+# 1) 무엇이 왜 실패했는지 (태스크별 결과 + 누락 데이터셋)
+python collector.py --status
+python collector.py --status -v       # 스냅샷 상세 + 전체 누락 목록
+
+# 2) 특정 작업의 실행 이력 추적
+python collector.py --history krx_futures
+python collector.py --history all
+
+# 3) 그 작업만 다시 실행
+python collector.py --task krx_futures
+```
+
+`--status`는 세 가지를 함께 보여줍니다.
+
+- **태스크별 최근 결과** — ✅ 정상 / ⚠️ 데이터 없음 / ❌ 오류, 실패 이유 포함.
+  터미널을 닫아도 DB에 남으므로 나중에 다시 볼 수 있습니다.
+- **있어야 하는데 없는 데이터셋** — 존재하는 것만 나열하면 누락을 알아챌 수
+  없어서, 기대 목록과 비교해 빠진 것을 이름으로 알려줍니다.
+- **실제 실행 상태** — 수집기가 Ctrl+C·절전·강제종료로 죽으면 기록은
+  `running`에 남습니다. PID 생존 여부와 heartbeat로 검사해 `비정상 종료`로
+  보고합니다(거짓 "진행 중"을 없앴습니다).
+
+수집기는 **중복 실행을 막습니다**(`data/collector.lock`). 두 프로세스가 같이
+돌면 외부 소스를 두 배로 호출하고 진단도 뒤섞입니다. 죽은 프로세스의 락은
+자동 회수되며, 정말 필요하면 `--force`로 무시할 수 있습니다.
 
 **macOS 자동 시작 (launchd)**
 
@@ -112,7 +150,8 @@ DASHBOARD_READ_MODE=store_only streamlit run app.py
 | `snapshots` | "최신 상태" 1건 (매크로 카드, 스크래퍼 결과, 13F, COT …) |
 | `timeseries` | (데이터셋, 시리즈, 날짜) → 값. FRED·KRX·순유동성 이력 누적 |
 | `observations` | (데이터셋, 날짜, 종목) → 레코드. 수급 랭킹 이력 누적 |
-| `collector_runs` | 수집 실행 로그 (성공/실패, 실패 상세) |
+| `collector_runs` | 수집 실행 로그 (성공/실패, PID·heartbeat) |
+| `collector_task_runs` | 태스크별 실행 결과 (상태·소요시간·실패 이유) |
 
 동시성은 SQLite **WAL 모드**로 처리합니다. 수집기가 쓰는 동안 화면이 막히지
 않습니다(검증: 동시 48회 쓰기 + 268회 읽기, 오류 0건).
