@@ -427,6 +427,14 @@ def _apply_bond_scanner_override(
                 + " (TradingView 수집 시각)"
             )
 
+            prev_source = "TradingView"
+            if previous_close is None or float(previous_close) == 0:
+                # 스크래핑이 전일값을 못 주면 FRED 공식 확정치로 보완합니다.
+                fred_prev = get_bond_previous_close_from_fred(scraper_key)
+                if fred_prev is not None:
+                    previous_close = fred_prev
+                    prev_source = "FRED 공식 확정치"
+
             if previous_close is not None and float(previous_close) != 0:
                 previous_close = float(previous_close)
                 delta = price - previous_close
@@ -435,10 +443,10 @@ def _apply_bond_scanner_override(
                 item["pct"] = pct
                 item["prev_str"] = f"{previous_close:,.3f}"
                 item["delta_str"] = f"{delta:+,.3f} ({pct:+.2f}%)"
+                item["prev_source"] = prev_source
             else:
-                # Scanner는 현재 최신 수익률만 신뢰도 있게 제공하므로,
-                # 전일 종가가 없을 때 "변화 없음(0.00%)"으로 위장하지 않고
-                # 명시적으로 N/A 처리합니다.
+                # 어느 출처도 전일값을 주지 못하면 "변화 없음(0.00%)"으로
+                # 위장하지 않고 명시적으로 N/A 처리합니다.
                 item["delta"] = None
                 item["pct"] = None
                 item["prev_str"] = "N/A"
@@ -452,6 +460,54 @@ def _apply_bond_scanner_override(
                 rate_2y_prev = previous_close if previous_close else rate_2y_prev
 
     return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
+
+
+# ==============================================================================
+# 2-2. 미국채 전일 종가 폴백 (FRED 공식 일별)
+# ==============================================================================
+# TradingView bonds scanner는 현재 수익률만 주고, Symbol Scanner·HTML 파서도
+# 전일 종가를 못 주는 경우가 있습니다. 그 결과 미국채 카드가 계속
+# "전일 종가 N/A · 전일 대비 미제공"으로 표시됐습니다.
+#
+# FRED의 DGS2/DGS10/DGS30은 미 재무부 Constant Maturity 공식 일별 확정치라,
+# **직전 영업일 값이 곧 전일 종가**입니다. 수집기가 이미 이 시리즈를 적재해
+# 두므로 추가 네트워크 비용도 없습니다.
+#
+# 주의: 현재가(TradingView 실시간)와 전일값(FRED 확정치)은 출처가 다릅니다.
+# 이 사실을 item["prev_source"]에 남겨 화면이 밝힐 수 있게 합니다.
+BOND_FRED_FALLBACK = {
+    "us02y": "DGS2",
+    "us10y": "DGS10",
+    "us30y": "DGS30",
+}
+
+
+def get_bond_previous_close_from_fred(scraper_key: str) -> float | None:
+    """
+    FRED 공식 일별 시계열에서 해당 만기의 '직전 영업일' 수익률을 반환합니다.
+
+    FRED는 하루 지연 발표이므로 시리즈의 마지막 값이 곧 직전 거래일
+    확정치입니다.
+    """
+    series_id = BOND_FRED_FALLBACK.get(scraper_key)
+    if not series_id:
+        return None
+
+    try:
+        df = fetch_fred_series(series_id, period_years=1)
+    except Exception as e:
+        logger.warning("미국채 전일값 FRED 조회 실패 (%s): %s", series_id, e)
+        return None
+
+    if df is None or df.empty or series_id not in df.columns:
+        return None
+
+    values = df[series_id].dropna()
+    if values.empty:
+        return None
+
+    last = float(values.iloc[-1])
+    return last if last > 0 else None
 
 
 # ==============================================================================

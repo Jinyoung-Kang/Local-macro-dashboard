@@ -1034,3 +1034,115 @@ def test_snapshot_macro_section_accepts_list_payload():
     assert "거시 지표 수집 실패" not in text
     assert "원/달러" in text
     assert "10Y-2Y 스프레드" in text
+
+
+# ==============================================================================
+# 19. 미국채 전일 종가 FRED 폴백
+# ==============================================================================
+def test_bond_previous_close_falls_back_to_fred(db):
+    """
+    [회귀] TradingView bonds scanner는 현재 수익률만 주고, Symbol Scanner·
+    HTML 파서도 전일 종가를 못 주는 경우가 있어 미국채 카드가 계속
+    "전일 종가 N/A"였습니다. FRED DGS는 미 재무부 공식 일별 확정치라
+    직전 영업일 값이 곧 전일 종가입니다.
+    """
+    import numpy as np
+
+    from services import datasets, store
+    import services.macro_service as ms
+
+    idx = pd.date_range(end="2026-09-11", periods=60, freq="B")
+    for sid, last in (("DGS2", 4.615), ("DGS10", 4.951), ("DGS30", 5.340)):
+        store.put_frame(
+            datasets.snap_fred_series(sid),
+            pd.DataFrame({sid: np.linspace(last - 0.3, last, len(idx))},
+                         index=idx),
+        )
+
+    ms.fetch_fred_series.clear()
+    assert ms.get_bond_previous_close_from_fred("us02y") == pytest.approx(4.615)
+    assert ms.get_bond_previous_close_from_fred("us10y") == pytest.approx(4.951)
+    assert ms.get_bond_previous_close_from_fred("us30y") == pytest.approx(5.340)
+    assert ms.get_bond_previous_close_from_fred("없는키") is None
+    ms.fetch_fred_series.clear()
+
+
+def test_bond_override_uses_fred_when_scraper_lacks_previous(db, monkeypatch):
+    import numpy as np
+
+    from services import datasets, store
+    import services.macro_service as ms
+    import services.market_scraper_service as mss
+
+    idx = pd.date_range(end="2026-09-11", periods=60, freq="B")
+    store.put_frame(
+        datasets.snap_fred_series("DGS10"),
+        pd.DataFrame({"DGS10": np.linspace(4.6, 4.951, len(idx))}, index=idx),
+    )
+
+    monkeypatch.setattr(mss, "get_scraped_macro_markets", lambda: {"items": [{
+        "key": "us10y", "status": "ok", "price": 4.969,
+        "previous_close": None, "provider": "TradingView Scanner",
+    }]})
+
+    collected = {"국채": [{
+        "name": "미국채 10년물 수익률(%) :gray[[TradingView 참고]]",
+        "status": "ok",
+    }]}
+
+    ms.fetch_fred_series.clear()
+    out, r10c, r10p, _, _ = ms._apply_bond_scanner_override(
+        collected, None, None, None, None,
+    )
+    ms.fetch_fred_series.clear()
+
+    item = out["국채"][0]
+    assert item["prev_str"] != "N/A"
+    assert item["prev_source"] == "FRED 공식 확정치"
+    assert item["delta"] == pytest.approx(4.969 - 4.951, abs=1e-6)
+    assert r10c == pytest.approx(4.969)
+    assert r10p == pytest.approx(4.951)
+
+
+def test_bond_override_keeps_na_when_no_source_has_previous(db, monkeypatch):
+    """어느 출처도 전일값이 없으면 0.00%로 위장하지 않아야 합니다."""
+    import services.macro_service as ms
+    import services.market_scraper_service as mss
+
+    monkeypatch.setattr(mss, "get_scraped_macro_markets", lambda: {"items": [{
+        "key": "us02y", "status": "ok", "price": 4.630,
+        "previous_close": None, "provider": "TradingView Scanner",
+    }]})
+    monkeypatch.setattr(ms, "get_bond_previous_close_from_fred", lambda k: None)
+
+    collected = {"국채": [{
+        "name": "미국채 2년물 수익률(%) :gray[[TradingView 참고]]",
+        "status": "ok",
+    }]}
+    out, *_ = ms._apply_bond_scanner_override(collected, None, None, None, None)
+
+    item = out["국채"][0]
+    assert item["prev_str"] == "N/A"
+    assert item["delta"] is None
+    assert item["delta_str"] == "N/A"
+
+
+# ==============================================================================
+# 20. 심화 지표 카드 표시 순서
+# ==============================================================================
+def test_advanced_display_order_leads_with_recession_signal():
+    """
+    가나다순이면 "기대인플레이션"이 맨 앞에 옵니다. 이 화면의 머리기사는
+    침체 신호(10Y-3M)이므로 순서를 명시적으로 고정합니다.
+    """
+    from services.advanced_macro_service import (
+        ADVANCED_DISPLAY_ORDER,
+        ADVANCED_SERIES_IDS,
+    )
+
+    assert ADVANCED_DISPLAY_ORDER[0] == "T10Y3M"
+    assert set(ADVANCED_DISPLAY_ORDER) == set(ADVANCED_SERIES_IDS)
+    # 실질금리와 기대인플레는 짝이므로 붙어 있어야 읽기 좋습니다.
+    i_real = ADVANCED_DISPLAY_ORDER.index("DFII10")
+    i_bei = ADVANCED_DISPLAY_ORDER.index("T10YIE")
+    assert abs(i_real - i_bei) == 1

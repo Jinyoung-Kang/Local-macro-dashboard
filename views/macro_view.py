@@ -43,6 +43,7 @@ from services.market_scraper_service import (
     get_scraped_macro_markets,
 )
 from services.advanced_macro_service import (
+    ADVANCED_DISPLAY_ORDER,
     ADVANCED_SERIES,
     get_advanced_macro_indicators,
 )
@@ -172,6 +173,151 @@ def _usable_delta(delta_str) -> str | None:
     return text
 
 
+# 심화 지표 카드 배치: 한 행에 3개 (5개 → 3 + 2)
+_ADVANCED_COLS = 3
+
+
+def _render_advanced_card(container, entry: dict) -> None:
+    """
+    심화 지표 카드 1장.
+
+    [UI 수정] 이전에는 metric 아래에 상태·기준일을 col.markdown/col.caption으로
+    따로 그려서, 테두리 박스 밖으로 흘러나오고 그룹마다 컬럼 수가 달라져
+    (신용·금융상황은 항목이 1개라) 박스가 화면 폭 전체로 늘어났습니다.
+    이제 항목 수와 무관하게 고정 3열 그리드를 쓰고, 카드 내용은
+    st.container(border=True) 안에 함께 담습니다.
+    """
+    with container:
+        box = st.container(border=True)
+        with box:
+            label = entry.get("label", entry["id"])
+
+            if not entry.get("available"):
+                st.metric(label, "수집 실패", help=entry.get("why", ""))
+                st.caption(f":gray[{entry.get('source', '')}]")
+                return
+
+            digits = entry.get("digits", 2)
+            unit = entry.get("unit", "")
+            delta = entry.get("delta")
+
+            st.metric(
+                label=label,
+                value=f"{entry['value']:.{digits}f}{unit}",
+                delta=(
+                    f"{delta:+.{digits}f}{unit}" if delta is not None else None
+                ),
+                help=entry.get("why", ""),
+            )
+
+            meta_bits = []
+            if entry.get("status"):
+                color = entry.get("color", "gray")
+                meta_bits.append(f":{color}[**{entry['status']}**]")
+
+            as_of = entry.get("as_of")
+            if as_of is not None and hasattr(as_of, "strftime"):
+                meta_bits.append(f":gray[{as_of.strftime('%m-%d')} 기준]")
+
+            pct = entry.get("percentile")
+            if pct is not None:
+                meta_bits.append(f":gray[10y {pct:.0f}%]")
+
+            if meta_bits:
+                st.markdown(
+                    " · ".join(meta_bits),
+                    help="10y = 최근 10년 표본 내 백분위",
+                )
+
+
+def _build_rate_structure_chart(series: dict, targets: list[str]):
+    """
+    금리 구조 추이 차트.
+
+    [UI 수정] 이전에는 y축이 데이터 범위와 무관하게 -2~2로 잡혀 실제 변동이
+    납작하게 눌렸고, 범례가 우상단 제목과 겹쳤습니다. 데이터에 맞춰 y축을
+    잡고, 범례를 아래로 내리고, 10Y-3M이 음수인 구간(=역전)을 음영으로
+    표시해 침체 신호가 한눈에 보이게 했습니다.
+    """
+    colors = {"T10Y3M": "#F59E0B", "DFII10": "#60A5FA", "T10YIE": "#34D399"}
+
+    fig = go.Figure()
+    y_min, y_max = None, None
+
+    for sid in targets:
+        df = series[sid]
+        values = df[sid].dropna()
+        if values.empty:
+            continue
+
+        y_min = values.min() if y_min is None else min(y_min, values.min())
+        y_max = values.max() if y_max is None else max(y_max, values.max())
+
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df[sid],
+            mode="lines",
+            name=ADVANCED_SERIES[sid]["label"],
+            line=dict(color=colors.get(sid), width=2),
+            hovertemplate="%{y:.3f}%<extra>%{fullData.name}</extra>",
+        ))
+
+    # 역전 구간(10Y-3M < 0) 음영 — 침체 선행 신호를 눈으로 잡을 수 있게
+    if "T10Y3M" in targets:
+        spread = series["T10Y3M"]["T10Y3M"].dropna()
+        inverted = spread < 0
+        if inverted.any():
+            block_start = None
+            for ts, is_inv in inverted.items():
+                if is_inv and block_start is None:
+                    block_start = ts
+                elif not is_inv and block_start is not None:
+                    fig.add_vrect(
+                        x0=block_start, x1=ts,
+                        fillcolor="#EF4444", opacity=0.10,
+                        layer="below", line_width=0,
+                    )
+                    block_start = None
+            if block_start is not None:
+                fig.add_vrect(
+                    x0=block_start, x1=inverted.index[-1],
+                    fillcolor="#EF4444", opacity=0.10,
+                    layer="below", line_width=0,
+                )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#6B7280", opacity=0.8)
+
+    # y축을 데이터 범위 + 여백으로 한정 (기본 자동범위는 너무 넓게 잡힙니다)
+    if y_min is not None and y_max is not None:
+        pad = max((y_max - y_min) * 0.12, 0.1)
+        y_range = [y_min - pad, y_max + pad]
+    else:
+        y_range = None
+
+    fig.update_layout(
+        height=380,
+        margin=dict(l=10, r=10, t=10, b=10),
+        hovermode="x unified",
+        yaxis=dict(
+            title="%",
+            range=y_range,
+            gridcolor="rgba(255,255,255,0.06)",
+            zeroline=False,
+        ),
+        xaxis=dict(
+            title=None,
+            gridcolor="rgba(255,255,255,0.04)",
+            rangeslider=dict(visible=False),
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="top", y=-0.08,
+            xanchor="center", x=0.5,
+        ),
+    )
+    return fig
+
+
 def _render_advanced_macro_section() -> None:
     """
     심화 매크로 지표 섹션.
@@ -198,68 +344,57 @@ def _render_advanced_macro_section() -> None:
         st.info("심화 지표 데이터가 없습니다.")
         return
 
-    # ------------------------------------------------------------ 카드 3열
-    groups: dict[str, list] = {}
-    for entry in latest.values():
-        groups.setdefault(entry.get("group", "기타"), []).append(entry)
+    # ----------------------------------------------------------- 카드 그리드
+    # 그룹 순서는 유지하되 레이아웃은 고정 3열입니다. 그룹마다 컬럼을
+    # 새로 만들면 항목 1개짜리 그룹이 화면 폭을 독차지합니다.
+    ordered = [latest[sid] for sid in ADVANCED_DISPLAY_ORDER if sid in latest]
+    # 정의에 없는 지표가 추가돼도 빠뜨리지 않습니다.
+    ordered += [e for sid, e in latest.items() if sid not in ADVANCED_DISPLAY_ORDER]
 
-    for group_name, entries in groups.items():
-        st.markdown(f"**{group_name}**")
-        cols = st.columns(max(len(entries), 1))
-
-        for col, entry in zip(cols, entries):
-            label = entry.get("label", entry["id"])
-            if not entry.get("available"):
-                col.metric(label, "수집 실패")
-                col.caption(f":gray[{entry.get('source', '')}]")
-                continue
-
-            digits = entry.get("digits", 2)
-            unit = entry.get("unit", "")
-            delta = entry.get("delta")
-
-            col.metric(
-                label=label,
-                value=f"{entry['value']:.{digits}f}{unit}",
-                delta=(
-                    f"{delta:+.{digits}f}{unit}" if delta is not None else None
-                ),
-                help=entry.get("why", ""),
-            )
-
-            if entry.get("status"):
-                col.markdown(
-                    f"상태: :{entry.get('color', 'gray')}[**{entry['status']}**]"
-                )
-
-            as_of = entry.get("as_of")
-            caption = []
-            if as_of is not None and hasattr(as_of, "strftime"):
-                caption.append(f"기준일 `{as_of.strftime('%Y-%m-%d')}`")
-            if entry.get("percentile") is not None:
-                caption.append(f"10년 백분위 `{entry['percentile']:.0f}%`")
-            if caption:
-                col.caption(" | ".join(caption))
-
-        # 남는 칸 정리
-        for extra in cols[len(entries):]:
-            extra.empty()
+    for row_start in range(0, len(ordered), _ADVANCED_COLS):
+        row = ordered[row_start: row_start + _ADVANCED_COLS]
+        cols = st.columns(_ADVANCED_COLS, gap="small")
+        for col, entry in zip(cols, row):
+            _render_advanced_card(col, entry)
+        for filler in cols[len(row):]:
+            filler.empty()
 
     # ------------------------------------------------------- 금리 분해 해설
     decomposition = (result.get("derived") or {}).get("decomposition")
     if decomposition:
-        st.info(
-            f"**금리 분해:** {decomposition}\n\n"
-            "명목금리가 올라도 그 원인이 실질금리인지 기대인플레인지에 따라 "
-            "자산군 영향이 정반대입니다. 실질금리 상승은 금·성장주에 역풍, "
-            "기대인플레 상승은 실물·원자재에 순풍인 경우가 많습니다.",
-            icon="🧮",
+        st.caption(
+            f"🧮 **금리 분해** — {decomposition}. "
+            "명목금리가 올라도 원인이 실질금리인지 기대인플레인지에 따라 "
+            "자산군 영향이 정반대입니다 "
+            "(실질금리↑ = 금·성장주 역풍, 기대인플레↑ = 실물·원자재 순풍)."
         )
 
-    # ------------------------------------------------------------ 해석 표
-    with st.expander("📘 심화 지표 해석 가이드", expanded=False):
+    # ------------------------------------------------------------ 추이 차트
+    series = result.get("series") or {}
+    chart_targets = [
+        sid for sid in ("T10Y3M", "DFII10", "T10YIE")
+        if isinstance(series.get(sid), pd.DataFrame) and not series[sid].empty
+    ]
+
+    tab_chart, tab_guide = st.tabs(["📈 금리 구조 추이", "📘 해석 가이드"])
+
+    with tab_chart:
+        if not chart_targets:
+            st.info("차트를 그릴 시계열이 없습니다.")
+        else:
+            st.caption(
+                "붉은 음영은 10Y-3M 스프레드가 **역전(음수)** 된 구간입니다. "
+                "역사적으로 역전 이후 1~2년 내 침체가 뒤따른 사례가 많습니다."
+            )
+            st.plotly_chart(
+                _build_rate_structure_chart(series, chart_targets),
+                width="stretch",
+                config={"displayModeBar": False},
+            )
+
+    with tab_guide:
         rows = []
-        for entry in latest.values():
+        for entry in ordered:
             rows.append({
                 "지표": entry.get("label", entry["id"]),
                 "FRED ID": entry["id"],
@@ -270,51 +405,26 @@ def _render_advanced_macro_section() -> None:
                 ),
                 "상태": entry.get("status", "-"),
                 "왜 보는가": entry.get("why", ""),
-                "출처": entry.get("source", ""),
             })
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        st.dataframe(
+            pd.DataFrame(rows),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "왜 보는가": st.column_config.TextColumn(width="large"),
+            },
+        )
 
         st.markdown(
-            "**임계치 요약**\n\n"
+            "**임계치 요약** (역사적 분포 기반 참고치이며 투자 판단 근거가 "
+            "아닙니다)\n\n"
             "| 지표 | 정상 | 경계 | 위험 |\n"
             "|---|---|---|---|\n"
             "| 10Y-3M 스프레드 | > +0.5%p | 0 ~ +0.5%p | 음수 (역전) |\n"
             "| 10년 실질금리 | < 1.0% | 1.0 ~ 2.0% | > 2.0% |\n"
             "| IG 스프레드 | 1.0 ~ 1.5% | 1.5 ~ 2.0% | > 2.0% |\n"
-            "| NFCI | < 0 | 0 ~ 0.5 | > 0.5 |\n\n"
-            "임계치는 역사적 분포에 근거한 참고치이며 투자 판단의 근거가 "
-            "아닙니다."
+            "| NFCI | < 0 | 0 ~ 0.5 | > 0.5 |"
         )
-
-    # ------------------------------------------------------------ 추이 차트
-    series = result.get("series") or {}
-    chart_targets = [
-        sid for sid in ("T10Y3M", "DFII10", "T10YIE")
-        if isinstance(series.get(sid), pd.DataFrame) and not series[sid].empty
-    ]
-    if chart_targets:
-        with st.expander("📈 금리 구조 추이 (10Y-3M · 실질금리 · 기대인플레)",
-                         expanded=False):
-            fig = go.Figure()
-            colors = {"T10Y3M": "#F59E0B", "DFII10": "#3B82F6",
-                      "T10YIE": "#10B981"}
-            for sid in chart_targets:
-                df = series[sid]
-                fig.add_trace(go.Scatter(
-                    x=df.index, y=df[sid], mode="lines",
-                    name=ADVANCED_SERIES[sid]["label"],
-                    line=dict(color=colors.get(sid), width=2),
-                ))
-            fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.6)
-            fig.update_layout(
-                title="금리 구조 지표 추이 (FRED 공식 일별)",
-                xaxis_title="일자", yaxis_title="%",
-                hovermode="x unified",
-                margin=dict(l=20, r=20, t=40, b=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                            xanchor="right", x=1),
-            )
-            st.plotly_chart(fig, width="stretch")
 
 
 def render_macro_view(now_str_kst: str, refresh_interval: int):
@@ -448,7 +558,12 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                     )
                     if delta_value is None:
                         col.caption(":gray[전일 대비 미제공]")
-                    extra_caption_parts = [f"전일 종가: `{item['prev_str']}`"]
+                    prev_label = f"전일 종가: `{item['prev_str']}`"
+                    if item.get("prev_source") == "FRED 공식 확정치":
+                        # 현재가(TradingView 실시간)와 전일값(FRED 확정치)의
+                        # 출처가 다르다는 점을 반드시 밝힙니다.
+                        prev_label += " :gray[(FRED 확정치)]"
+                    extra_caption_parts = [prev_label]
                     if item.get("contract_month"):
                         extra_caption_parts.append(f"월물: `{item['contract_month']}`")
                     if item.get("source"):
