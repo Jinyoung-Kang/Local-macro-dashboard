@@ -1146,3 +1146,212 @@ def test_advanced_display_order_leads_with_recession_signal():
     i_real = ADVANCED_DISPLAY_ORDER.index("DFII10")
     i_bei = ADVANCED_DISPLAY_ORDER.index("T10YIE")
     assert abs(i_real - i_bei) == 1
+
+
+# ==============================================================================
+# 21. dtype 보존 — 종목코드/cusip의 앞자리 0이 사라지면 안 된다
+# ==============================================================================
+def test_leading_zero_stock_codes_survive_store_roundtrip(db):
+    """
+    [회귀] to_json(orient="split")은 dtype을 저장하지 않아, 읽을 때 pandas가
+    타입을 추론합니다. 숫자로만 이루어진 문자열 컬럼이 int로 바뀌면서
+    "069500" → 69500, "005930" → 5930 으로 앞자리 0이 사라졌습니다.
+
+    그 결과 Daum(A69500)·pykrx·yfinance(69500.KS) 조회가 모두 실패하고
+    "가격/거래량 기반 추정치로 대체" 경로로 빠졌습니다.
+    """
+    from services import store
+
+    df = pd.DataFrame([
+        {"순위": 1, "종목코드": "069500", "종목명": "KODEX 200"},
+        {"순위": 2, "종목코드": "005930", "종목명": "삼성전자"},
+        {"순위": 3, "종목코드": "000660", "종목명": "SK하이닉스"},
+    ])
+
+    store.put_frame("radar", df)
+    back = store.read_snapshot("radar").payload
+
+    assert back["종목코드"].tolist() == ["069500", "005930", "000660"]
+    assert back["종목코드"].dtype == object
+    # 숫자 컬럼은 숫자로 남아야 합니다.
+    assert pd.api.types.is_integer_dtype(back["순위"])
+
+
+def test_leading_zero_cusip_survives_object_codec(db):
+    """13F cusip도 9자리 숫자 문자열이라 같은 문제를 겪습니다."""
+    from services import store
+
+    cols = ["name", "cusip", "class", "value", "shares", "weight"]
+    df = pd.DataFrame([
+        ["APPLE INC", "037833100", "COM", 1.2e9, 5e6, 8.1],
+        ["MICROSOFT", "594918104", "COM", 9.9e8, 3e6, 6.5],
+    ], columns=cols)
+
+    store.put_object("sec", ([(df, {"report_date": "2026-06-30"})], None))
+    history, _ = store.read_snapshot("sec").payload
+
+    assert history[0][0]["cusip"].tolist() == ["037833100", "594918104"]
+
+
+def test_numeric_columns_keep_numeric_dtype(db):
+    """dtype 보존이 숫자 컬럼을 문자열로 만들어서도 안 됩니다."""
+    from services import store
+
+    idx = pd.date_range("2026-01-01", periods=3, freq="D")
+    df = pd.DataFrame(
+        {"Close": [1.5, 2.5, 3.5], "Volume": [100, 200, 300]}, index=idx,
+    )
+    store.put_frame("t", df)
+    back = store.read_snapshot("t").payload
+
+    assert pd.api.types.is_float_dtype(back["Close"])
+    assert pd.api.types.is_integer_dtype(back["Volume"])
+    assert isinstance(back.index, pd.DatetimeIndex)
+
+
+def test_legacy_snapshot_without_dtypes_does_not_infer(db):
+    """
+    dtype 정보가 없는 예전 저장본은 추론을 꺼서, 최소한 문자열이
+    숫자로 바뀌지는 않게 합니다.
+    """
+    import json
+
+    from services import store
+
+    payload = {
+        "__frame__": json.dumps({
+            "columns": ["종목코드"],
+            "index": [0, 1],
+            "data": [["069500"], ["005930"]],
+        }),
+        "index_is_datetime": False,
+        # dtypes 키 없음 (예전 버전이 저장한 형태)
+    }
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO snapshots (name, payload, kind, status, collected_at) "
+            "VALUES ('legacy', ?, 'frame', 'ok', ?)",
+            (json.dumps(payload), store._utc_now_iso()),
+        )
+
+    back = store.read_snapshot("legacy").payload
+    assert back["종목코드"].tolist() == ["069500", "005930"]
+
+
+# ==============================================================================
+# 22. 미국채 보강이 bonds scanner 실패와 무관해야 한다
+# ==============================================================================
+def test_symbol_scanner_previous_close_used_when_bonds_scanner_fails(monkeypatch):
+    """
+    [회귀] 미국채 보강 로직 전체가 `if scanner_yields:` 안에 있어서,
+    bonds scanner가 실패하면(현재 TradingView가 d=[]를 반환) Symbol Scanner로
+    받아 둔 전일 종가까지 통째로 버려졌습니다.
+    """
+    import services.market_scraper_service as m
+
+    monkeypatch.setattr(m, "_fetch_tradingview_us_treasury_yields", lambda: {})
+    monkeypatch.setattr(
+        m, "_fetch_tradingview_symbol_snapshot",
+        lambda symbol: (4.969, 4.951, 0.018, 0.36),
+    )
+    monkeypatch.setattr(m, "_collect_one_market", lambda cfg: {
+        "key": cfg["key"], "name": cfg["name"], "url": cfg["url"],
+        "provider": cfg["provider"], "unit": cfg["unit"],
+        "status": "fail", "price": None, "previous_close": None,
+        "change": None, "change_pct": None, "error": "테스트",
+    })
+
+    result = m.get_scraped_macro_markets.__wrapped__()
+    items = {i["key"]: i for i in result["items"]}
+
+    for key in m.TREASURY_KEYS:
+        assert items[key]["status"] == "ok", f"{key}: Symbol Scanner 값이 버려졌습니다"
+        assert items[key]["previous_close"] == pytest.approx(4.951)
+        assert items[key]["change_pct"] is not None
+        assert items[key]["prev_source"] == "TradingView Symbol Scanner"
+
+
+def test_treasury_keeps_na_when_all_sources_lack_previous(monkeypatch):
+    """어느 출처도 전일값이 없으면 0.00%로 위장하지 않아야 합니다."""
+    import services.market_scraper_service as m
+
+    monkeypatch.setattr(m, "_fetch_tradingview_us_treasury_yields", lambda: {})
+    monkeypatch.setattr(
+        m, "_fetch_tradingview_symbol_snapshot",
+        lambda symbol: (4.630, None, None, None),
+    )
+    monkeypatch.setattr(m, "_collect_one_market", lambda cfg: {
+        "key": cfg["key"], "name": cfg["name"], "url": cfg["url"],
+        "provider": cfg["provider"], "unit": cfg["unit"],
+        "status": "fail", "price": None, "previous_close": None,
+        "change": None, "change_pct": None, "error": None,
+    })
+
+    items = {i["key"]: i for i in m.get_scraped_macro_markets.__wrapped__()["items"]}
+
+    assert items["us02y"]["price"] == pytest.approx(4.630)
+    assert items["us02y"]["previous_close"] is None
+    assert items["us02y"]["change_pct"] is None
+
+
+# ==============================================================================
+# 23. KRX 투자자 수급: 실데이터 우선, 폴백은 명확히 표시
+# ==============================================================================
+def test_krx_investor_prefers_real_daum_data(monkeypatch):
+    """
+    [회귀] 스냅샷이 get_krx_investor_derivatives_summary()를 곧바로 불렀는데,
+    그 함수는 항상 고정 예시를 반환하는 최종 폴백입니다. Daum 실데이터가
+    정상인데도 AI 리포트에 매번 가짜 수치가 들어가고 있었습니다.
+    """
+    import services.dashboard_snapshot_service as dss
+
+    real = pd.DataFrame([{
+        "투자 주체": "외국인", "당일 순매수": 100,
+        "5일 누적": 200, "20일 누적": 300,
+    }])
+    monkeypatch.setattr(
+        dss, "fetch_daum_futures_investor_trend", lambda d, m: real,
+    )
+
+    called = []
+    monkeypatch.setattr(
+        dss, "get_krx_investor_derivatives_summary",
+        lambda: (called.append(1), pd.DataFrame())[1],
+    )
+
+    out = dss._collect_krx_investor_trend()
+    assert not out["is_placeholder"].any()
+    assert out["20일 누적"].iloc[0] == 300
+    assert called == [], "실데이터가 있는데 폴백을 불렀습니다"
+
+
+def test_krx_investor_falls_back_and_marks_placeholder(monkeypatch):
+    import services.dashboard_snapshot_service as dss
+
+    monkeypatch.setattr(
+        dss, "fetch_daum_futures_investor_trend",
+        lambda d, m: pd.DataFrame(),
+    )
+    out = dss._collect_krx_investor_trend()
+
+    assert out is not None and not out.empty
+    assert out["is_placeholder"].all()
+
+
+def test_snapshot_labels_placeholder_vs_real_differently():
+    from services.dashboard_snapshot_service import _append_krx_section
+
+    real = pd.DataFrame([{
+        "투자 주체": "외국인", "20일 누적": 38500, "is_placeholder": False,
+    }])
+    fake = real.assign(is_placeholder=True)
+
+    real_lines: list[str] = []
+    _append_krx_section(real_lines, None, real)
+    fake_lines: list[str] = []
+    _append_krx_section(fake_lines, None, fake)
+
+    assert "Daum 금융" in "\n".join(real_lines)
+    assert "placeholder" not in "\n".join(real_lines)
+    assert "placeholder" in "\n".join(fake_lines)
+    assert "판단 근거로 쓰지 마세요" in "\n".join(fake_lines)

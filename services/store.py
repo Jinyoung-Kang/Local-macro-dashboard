@@ -306,6 +306,7 @@ def _encode_obj(obj: Any) -> Any:
             _DF_TAG: obj.to_json(orient="split", date_format="iso"),
             "index_is_datetime": isinstance(obj.index, pd.DatetimeIndex),
             "attrs": _json_safe_attrs(obj.attrs),
+            "dtypes": {str(c): str(t) for c, t in obj.dtypes.items()},
         }
     if isinstance(obj, pd.Series):
         return _encode_obj(obj.to_frame())
@@ -334,7 +335,11 @@ def _decode_obj(obj: Any) -> Any:
     if isinstance(obj, dict):
         if _DF_TAG in obj:
             try:
-                df = pd.read_json(StringIO(obj[_DF_TAG]), orient="split")
+                df = pd.read_json(
+                    StringIO(obj[_DF_TAG]),
+                    orient="split",
+                    dtype=_restore_dtypes(obj.get("dtypes")),
+                )
             except ValueError as e:
                 logger.warning("중첩 DataFrame 역직렬화 실패: %s", e)
                 return pd.DataFrame()
@@ -407,6 +412,31 @@ def put_snapshot(
         )
 
 
+def _restore_dtypes(stored):
+    """
+    put_frame이 기록한 dtype 맵을 read_json의 dtype 인자로 변환합니다.
+
+    반환값 의미:
+      - dict : 컬럼별 dtype을 그대로 적용
+      - False: dtype 정보가 없는 예전 저장본 → 추론을 끕니다.
+               추론을 켜 두면 "069500" 같은 문자열이 int로 바뀌어
+               앞자리 0이 사라지므로, 모르면 추론하지 않는 편이 안전합니다.
+
+    datetime 계열은 read_json이 직접 처리하므로 제외합니다
+    (dtype으로 넘기면 파싱 단계에서 충돌합니다).
+    """
+    if not isinstance(stored, dict) or not stored:
+        return False
+
+    out = {}
+    for col, dtype in stored.items():
+        text = str(dtype)
+        if "datetime" in text or "period" in text or "interval" in text:
+            continue
+        out[col] = text
+    return out or False
+
+
 def _json_safe_attrs(attrs) -> dict:
     """
     df.attrs에서 JSON으로 안전하게 저장 가능한 스칼라만 추립니다.
@@ -446,6 +476,13 @@ def put_frame(
             # 지표가 아니다" 표시를 담고 있어서, 잃어버리면 추정치가
             # 공식 데이터처럼 화면과 AI 리포트에 나갑니다. 따로 싣습니다.
             "attrs": _json_safe_attrs(df.attrs),
+            # [중요] to_json(orient="split")은 dtype을 저장하지 않습니다.
+            # 읽을 때 pandas가 타입을 추론하는데, 숫자로만 이루어진 문자열
+            # 컬럼("069500", "005930", cusip "037833100")을 int로 바꿔버려
+            # **앞자리 0이 영구히 사라집니다**. 종목코드가 69500이 되면
+            # Daum/pykrx/yfinance 조회가 전부 실패합니다.
+            # dtype을 함께 저장해 복원 시 그대로 되돌립니다.
+            "dtypes": {str(c): str(t) for c, t in df.dtypes.items()},
         }
 
     with connect(db_path) as conn:
@@ -517,7 +554,13 @@ def _revive_frame(raw: Any) -> pd.DataFrame | None:
     from io import StringIO
 
     try:
-        df = pd.read_json(StringIO(raw["__frame__"]), orient="split")
+        df = pd.read_json(
+            StringIO(raw["__frame__"]),
+            orient="split",
+            # dtype 추론을 끄고 저장된 dtype을 그대로 적용합니다.
+            # (추론에 맡기면 "069500" 같은 문자열이 int가 됩니다.)
+            dtype=_restore_dtypes(raw.get("dtypes")),
+        )
     except ValueError as e:
         logger.warning("DataFrame 역직렬화 실패: %s", e)
         return None

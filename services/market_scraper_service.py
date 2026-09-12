@@ -40,6 +40,9 @@ TRADINGVIEW_BONDS_SCANNER_PARAMS = {
     "label-product": "bonds-yield-curve",
 }
 
+# 미국채 보강 대상 (bonds scanner / Symbol Scanner 공통)
+TREASURY_KEYS = ("us02y", "us10y", "us30y")
+
 TRADINGVIEW_US_TREASURY_SYMBOLS = {
     "TVC:US02Y": "us02y",
     "TVC:US10Y": "us10y",
@@ -322,11 +325,11 @@ def _fetch_tradingview_us_treasury_yields() -> dict:
 
             values = row.get("d", [])
             if not isinstance(values, list) or len(values) < 5:
-                logger.warning(
-                    "TradingView bonds scanner 응답 형식이 예상과 다릅니다: "
-                    "symbol=%s, data=%s",
-                    symbol,
-                    values,
+                # 행마다 경고를 찍으면 매 수집마다 로그가 도배됩니다.
+                # 아래 요약 한 줄로 충분하므로 상세는 debug로 내립니다.
+                logger.debug(
+                    "TradingView bonds scanner 행 형식 불일치: symbol=%s, d=%s",
+                    symbol, values,
                 )
                 continue
 
@@ -347,11 +350,15 @@ def _fetch_tradingview_us_treasury_yields() -> dict:
                 "symbol": symbol,
             }
 
-        expected_keys = {"us02y", "us10y", "us30y"}
-        missing_keys = expected_keys - set(result.keys())
+        missing_keys = set(TREASURY_KEYS) - set(result.keys())
         if missing_keys:
-            logger.warning(
-                "TradingView bonds scanner 일부 만기 수집 실패: missing=%s",
+            # bonds scanner는 "있으면 좋은" 보조 출처입니다. 실패해도
+            # Symbol Scanner와 HTML 파서, 그리고 화면의 FRED 폴백이
+            # 값을 채우므로 info 수준으로 남깁니다.
+            # (2026-09 기준 TradingView가 d=[]를 돌려주는 상태입니다.)
+            logger.info(
+                "TradingView bonds scanner 미수집: %s "
+                "— Symbol Scanner/HTML 파서로 대체합니다.",
                 sorted(missing_keys),
             )
 
@@ -773,59 +780,75 @@ def collect_scraped_macro_markets() -> dict:
                     "TradingView Symbol Scanner 조회 실패 (%s): %s", key, e,
                 )
 
-    if scanner_yields:
-        for item in results:
-            scraper_key = item.get("key")
-            if scraper_key not in scanner_yields:
-                continue
+    # --------------------------------------------------------------------------
+    # 미국채 보강.
+    #
+    # [버그 수정] 예전에는 이 블록 전체가 `if scanner_yields:` 안에 있어서,
+    # bonds scanner가 실패하면(현재 TradingView가 d=[]를 돌려주는 상태)
+    # **Symbol Scanner로 받아 둔 전일 종가까지 통째로 버려졌습니다.**
+    # 두 출처는 서로 독립이므로 각각 있는 만큼만 반영합니다.
+    #
+    # 현재가 우선순위 : bonds scanner → Symbol Scanner → HTML 파서
+    # 전일 종가 우선순위: Symbol Scanner → HTML 파서
+    # --------------------------------------------------------------------------
+    for item in results:
+        scraper_key = item.get("key")
+        if scraper_key not in TREASURY_KEYS:
+            continue
 
-            scanner_item = scanner_yields[scraper_key]
+        sym = treasury_changes.get(scraper_key) or (None, None, None, None)
+        sym_price, sym_prev, _sym_chg, _sym_pct = sym
+
+        # ---- 현재가 -----------------------------------------------------
+        current_price = item.get("price")
+        scanner_item = scanner_yields.get(scraper_key)
+
+        if scanner_item and scanner_item.get("price") is not None:
             current_price = scanner_item["price"]
-
-            item["price"] = current_price
             item["provider"] = "TradingView Scanner"
-            item["status"] = "ok"
-            item["error"] = None
             item["reference_source"] = "TradingView bonds-yield-curve"
             item["scanner_symbol"] = scanner_item["symbol"]
+        elif sym_price is not None:
+            current_price = float(sym_price)
+            item["provider"] = "TradingView Symbol Scanner"
+            item["reference_source"] = "TradingView symbols-performance"
 
-            # 전일 종가 출처 우선순위:
-            #   1) Symbol Scanner의 change_abs로 역산 (가장 신뢰도 높음)
-            #   2) HTML 파서가 읽은 "Previous close"
-            # 둘 다 없으면 0.00%로 위장하지 않고 명시적으로 미제공 처리합니다.
-            previous_close = None
-            sym = treasury_changes.get(scraper_key)
-            if sym:
-                _sym_price, sym_prev, _sym_chg, _sym_pct = sym
-                if sym_prev is not None and float(sym_prev) != 0:
-                    previous_close = float(sym_prev)
-                    item["reference_source"] = (
-                        "TradingView bonds-yield-curve "
-                        "(전일 종가: Symbol Scanner)"
-                    )
+        if current_price is None:
+            continue
 
-            if previous_close is None:
-                html_prev = item.get("previous_close")
-                if html_prev is not None and float(html_prev) != 0:
-                    previous_close = float(html_prev)
+        item["price"] = current_price
+        item["status"] = "ok"
+        item["error"] = None
 
-            if previous_close is not None:
-                change, change_pct = _derive_change(current_price, previous_close)
-                item["previous_close"] = previous_close
-                item["change"] = change
-                item["change_pct"] = change_pct
-            else:
-                item["previous_close"] = None
-                item["change"] = None
-                item["change_pct"] = None
+        # ---- 전일 종가 ---------------------------------------------------
+        previous_close = None
+        if sym_prev is not None and float(sym_prev) != 0:
+            previous_close = float(sym_prev)
+            item["prev_source"] = "TradingView Symbol Scanner"
+        else:
+            html_prev = item.get("previous_close")
+            if html_prev is not None and float(html_prev) != 0:
+                previous_close = float(html_prev)
+                item["prev_source"] = "TradingView 페이지"
 
-            logger.info(
-                "TradingView Scanner 미국채 수익률 적용: "
-                "key=%s, symbol=%s, yield=%.4f",
-                scraper_key,
-                scanner_item["symbol"],
-                current_price,
-            )
+        if previous_close is not None:
+            change, change_pct = _derive_change(current_price, previous_close)
+            item["previous_close"] = previous_close
+            item["change"] = change
+            item["change_pct"] = change_pct
+        else:
+            # 여기서 0.00%로 위장하지 않습니다. 화면(macro_view)은 이 경우
+            # FRED 공식 확정치로 전일값을 보완합니다.
+            item["previous_close"] = None
+            item["change"] = None
+            item["change_pct"] = None
+            item["prev_source"] = None
+
+        logger.debug(
+            "미국채 보강: key=%s, yield=%.4f, 전일=%s (%s)",
+            scraper_key, current_price, previous_close,
+            item.get("prev_source") or "미제공",
+        )
 
     sort_order = {
         config["key"]: index

@@ -25,6 +25,7 @@ from services.cot_service import (
     summarize_cot_asset,
 )
 from services.krx_service import (
+    fetch_daum_futures_investor_trend,
     get_krx_futures_history,
     get_krx_investor_derivatives_summary,
 )
@@ -70,6 +71,26 @@ def _get_num(row, *keys, default=0.0):
     return default
 
 
+def _collect_krx_investor_trend() -> pd.DataFrame | None:
+    """
+    투자자별 선물 수급: Daum 실데이터 → 실패 시 placeholder.
+
+    반환 DataFrame에는 is_placeholder 컬럼이 반드시 포함돼, 화면·텍스트가
+    "실데이터인지 예시인지"를 구분할 수 있습니다.
+    """
+    df = safe_call(fetch_daum_futures_investor_trend, 25, "CONTRACT")
+
+    if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+        out = df.copy()
+        out["is_placeholder"] = False
+        return out
+
+    logger.warning(
+        "투자자별 선물 수급: Daum 실데이터 실패 → 고정 예시로 대체합니다."
+    )
+    return safe_call(get_krx_investor_derivatives_summary)
+
+
 def collect_dashboard_snapshot() -> dict:
     """
     AI 호출 없이 전체 대시보드의 최신 원본 데이터를 병렬 수집.
@@ -96,9 +117,14 @@ def collect_dashboard_snapshot() -> dict:
             get_krx_futures_history,
             40,
         )
+        # [버그 수정] 예전에는 get_krx_investor_derivatives_summary()를
+        # 곧바로 불렀습니다. 그런데 그 함수는 **항상 고정 예시(placeholder)**
+        # 를 돌려주는 최종 폴백입니다(문서에도 그렇게 적혀 있습니다).
+        # 실데이터인 Daum 선물 수급이 정상 동작하는데도 스냅샷과 AI 리포트에는
+        # 매번 "+38,500 계약" 같은 가짜 숫자가 들어가고 있었습니다.
+        # 실데이터를 먼저 시도하고, 실패했을 때만 폴백을 씁니다.
         fut_krx_investor = executor.submit(
-            safe_call,
-            get_krx_investor_derivatives_summary,
+            _collect_krx_investor_trend,
         )
         fut_sec = executor.submit(
             safe_call,
@@ -276,13 +302,32 @@ def _append_krx_section(lines: list[str], krx_res, krx_inv_res):
     else:
         lines.append("- KRX 선물 시계열 데이터 수집 대기 상태")
 
-    if krx_inv_res is not None and isinstance(krx_inv_res, pd.DataFrame) and not krx_inv_res.empty:
+    if (
+        krx_inv_res is not None
+        and isinstance(krx_inv_res, pd.DataFrame)
+        and not krx_inv_res.empty
+    ):
+        is_placeholder = bool(
+            krx_inv_res.get("is_placeholder", pd.Series([False])).any()
+        )
+
         lines.append("\n### 주요 투자자 20일 누적 순매수:")
-        lines.append("⚠️ 투자자별 20일 누적 수급은 현재 예시/추정 데이터이며, KRX 공식 확정 투자자별 선물 거래 데이터가 아닙니다.")
+        if is_placeholder:
+            lines.append(
+                "⚠️ 아래 수치는 **고정 예시(placeholder)** 입니다. "
+                "Daum 실데이터 수집에 실패했을 때만 나타나며, "
+                "실제 시장 데이터가 아니므로 판단 근거로 쓰지 마세요."
+            )
+        else:
+            lines.append(
+                "출처: Daum 금융 선물 투자주체별 매매동향 (계약수 기준). "
+                "KRX 공식 확정치가 아닌 포털 집계값입니다."
+            )
+
         for _, r in krx_inv_res.iterrows():
             subj = r.get("투자 주체", r.get("주체", "Unknown"))
-            amt = r.get("20일 누적", r.get("20일 누적 순매수 (계약)", 0))
-            lines.append(f"- {subj}: {amt:+,} 계약")
+            amt = _get_num(r, "20일 누적", "20일 누적 순매수 (계약)")
+            lines.append(f"- {subj}: {amt:+,.0f} 계약")
     lines.append("")
 
 

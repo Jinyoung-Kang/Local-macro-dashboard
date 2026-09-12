@@ -384,7 +384,19 @@ def _apply_bond_scanner_override(
         return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
 
     try:
-        scraper_result = get_scraped_macro_markets()
+        # [성능] 수집기(live_only 모드)에서는 scraper_markets 태스크가 방금
+        # 같은 데이터를 받아 저장해 뒀습니다. 여기서 래퍼를 그대로 부르면
+        # 같은 실행 안에서 외부 스크래핑이 두 번 일어납니다(요청 20여 건 낭비).
+        # 갓 저장된 스냅샷이 있으면 그것을 씁니다.
+        scraper_result = None
+        snap = store.read_snapshot(datasets.SNAP_SCRAPER_MARKETS)
+        if snap is not None and snap.is_fresh(300) and snap.payload:
+            scraper_result = snap.payload
+            logger.debug("국채 보정: 방금 저장된 스크래핑 스냅샷을 재사용합니다.")
+
+        if not scraper_result:
+            scraper_result = get_scraped_macro_markets()
+
         scraper_items = {
             item.get("key"): item
             for item in scraper_result.get("items", [])
