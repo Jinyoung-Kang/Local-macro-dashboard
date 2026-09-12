@@ -11,7 +11,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
-import requests
+# 공용 커넥션 풀 세션을 사용해 요청마다 TCP/TLS 핸드셰이크를
+# 반복하지 않습니다 (services/http_client.py).
+from services.http_client import get_session
 import streamlit as st
 import yfinance as yf
 from config import get_krx_key, KRX_BASE_URL
@@ -39,7 +41,7 @@ def fetch_krx_derivatives_daily(date_str: str) -> pd.DataFrame:
     params = {"basDd": date_str}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=8)
+        response = get_session().get(url, headers=headers, params=params, timeout=8)
         if response.status_code == 200:
             data = response.json()
             if isinstance(data, dict):
@@ -60,7 +62,7 @@ def fetch_krx_derivatives_daily(date_str: str) -> pd.DataFrame:
 # 2. KRX Open API 지수 엔드포인트로 코스피200 현물 지수 조회
 # ==============================================================================
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_kospi200_index_close(date_str: str) -> float:
+def fetch_kospi200_index_close(date_str: str) -> float | None:
     """
     KRX Open API 지수 서비스(idx/kospi_dd_trd)로 코스피200 현물 지수
     종가를 조회합니다. pykrx 웹 스크래핑 대신 정식 AUTH_KEY 기반
@@ -78,7 +80,7 @@ def fetch_kospi200_index_close(date_str: str) -> float:
     params = {"basDd": date_str}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=8)
+        response = get_session().get(url, headers=headers, params=params, timeout=8)
         if response.status_code != 200:
             return None
 
@@ -474,7 +476,7 @@ def fetch_daum_futures_investor_trend(
         params["type"] = "PRICE"
 
     try:
-        response = requests.get(
+        response = get_session().get(
             DAUM_FUTURES_INVESTOR_URL,
             headers=headers,
             params=params,
@@ -765,7 +767,7 @@ def fetch_daum_futures_intraday_acceleration(
     }
 
     try:
-        response = requests.get(
+        response = get_session().get(
             DAUM_FUTURES_INVESTOR_TIMES_URL,
             headers=headers,
             params=params,

@@ -12,6 +12,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+
+# 공용 커넥션 풀 세션을 사용해 요청마다 TCP/TLS 핸드셰이크를
+# 반복하지 않습니다 (services/http_client.py).
+from services.http_client import get_session
 import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
@@ -37,43 +41,9 @@ COMMON_HEADERS = {
     ),
 }
 
-from playwright.sync_api import sync_playwright
-
-
-def _fetch_rendered_html(
-    url: str,
-    wait_selector: str = "table",
-    timeout_ms: int = 10000,
-    wait_state: str = "attached",
-) -> str:
-    """
-    JS로 렌더링되는 페이지(Naver/Daum 신규 UI)를 헤드리스 브라우저로
-    실제 렌더링한 뒤 최종 HTML을 반환합니다.
-
-    주의: 일반 requests.get()으로는 React/Next.js가 그리는 표를
-    가져올 수 없어서 이 방식이 필요합니다.
-
-    wait_state="attached"를 기본값으로 사용합니다. Naver의 일부 표는
-    CSS로 숨겨져 있거나(display:none) 크기가 0이어서 "visible" 상태를
-    영원히 만족하지 못할 수 있지만, HTML 자체에는 데이터가 완성되어
-    있으므로 DOM에 존재하기만 하면 충분합니다.
-    """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent=COMMON_HEADERS["User-Agent"]
-        )
-        try:
-            page.goto(url, timeout=timeout_ms, wait_until="networkidle")
-            page.wait_for_selector(
-                wait_selector,
-                timeout=timeout_ms,
-                state=wait_state,
-            )
-            html = page.content()
-        finally:
-            browser.close()
-        return html
+# 렌더링 수집은 services/browser_pool.py의 공용 Chromium을 재사용합니다.
+# (기존에는 호출마다 Chromium을 새로 띄워 매번 콜드 스타트 비용을 냈습니다.)
+from services.browser_pool import fetch_rendered_html as _fetch_rendered_html
 
 # ==============================================================================
 # KIS FHPTJ04400000 투자자별 실제 필드 매핑
@@ -730,7 +700,7 @@ def fetch_daum_deal_ranking(
     }
 
     try:
-        response = requests.get(
+        response = get_session().get(
             url,
             headers=headers,
             params=params,
@@ -940,7 +910,7 @@ def debug_daum_investor_purchase_response(interval_type: str = "TODAY") -> dict:
     }
 
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        resp = get_session().get(url, headers=headers, params=params, timeout=8)
         return {
             "status_code": resp.status_code,
             "body": resp.json() if resp.status_code == 200 else resp.text[:500],
@@ -1294,7 +1264,7 @@ def fetch_daum_investor_daily_history(stock_code: str, start_date_obj, end_date_
     url = f"https://finance.daum.net/quotes/A{ticker_code}"
 
     try:
-        res = requests.get(url, headers=headers, timeout=8)
+        res = get_session().get(url, headers=headers, timeout=8)
         if res.status_code != 200:
             logger.warning(f"Daum 종목 페이지 실패 (종목={stock_code}): HTTP {res.status_code}")
             return pd.DataFrame()
@@ -1561,7 +1531,7 @@ def fetch_daum_stock_investor_flow(
     def fetch_page(page: int):
         """단일 페이지를 요청합니다. 실패 시 None을 반환합니다."""
         try:
-            response = requests.get(
+            response = get_session().get(
                 DAUM_STOCK_INVESTOR_URL,
                 headers=headers,
                 params={
@@ -2122,61 +2092,67 @@ def debug_daum_investor_periods() -> dict:
     실제로 선택(select_option)했을 때, investor_purchase API 요청이
     어떻게 바뀌는지 옵션별로 구분해서 캡처합니다.
     """
+    from playwright.sync_api import sync_playwright
+
     results_by_option = {}
 
+    # 진단 전용 경로이므로 공용 브라우저 풀을 오염시키지 않도록
+    # 일회성 브라우저를 쓰고, 예외가 나도 반드시 닫습니다.
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=COMMON_HEADERS["User-Agent"])
+        try:
+            page = browser.new_page(user_agent=COMMON_HEADERS["User-Agent"])
 
-        captured = []
+            captured = []
 
-        def on_request(req):
-            if "investor_purchase" in req.url:
-                captured.append(req.url)
+            def on_request(req):
+                if "investor_purchase" in req.url:
+                    captured.append(req.url)
 
-        page.on("request", on_request)
+            page.on("request", on_request)
 
-        page.goto(
-            "https://finance.daum.net/domestic/influential_investors",
-            wait_until="networkidle",
-            timeout=15000,
-        )
-        page.wait_for_timeout(1000)
+            page.goto(
+                "https://finance.daum.net/domestic/influential_investors",
+                wait_until="networkidle",
+                timeout=15000,
+            )
+            page.wait_for_timeout(1000)
 
-        # 페이지 안의 모든 select 요소와 그 안의 option 값을 먼저 조사
-        select_info = page.evaluate(
-            """
-            () => {
-                const selects = Array.from(document.querySelectorAll('select'));
-                return selects.map(sel => ({
-                    name: sel.name || sel.id || '(이름없음)',
-                    options: Array.from(sel.options).map(o => ({
-                        value: o.value,
-                        text: o.text,
-                    })),
-                }));
-            }
-            """
-        )
-        results_by_option["__select_구조__"] = select_info
+            # 페이지 안의 모든 select 요소와 그 안의 option 값을 먼저 조사
+            select_info = page.evaluate(
+                """
+                () => {
+                    const selects = Array.from(document.querySelectorAll('select'));
+                    return selects.map(sel => ({
+                        name: sel.name || sel.id || '(이름없음)',
+                        options: Array.from(sel.options).map(o => ({
+                            value: o.value,
+                            text: o.text,
+                        })),
+                    }));
+                }
+                """
+            )
+            results_by_option["__select_구조__"] = select_info
 
-        captured.clear()
-        results_by_option["초기 로드(당일 추정)"] = list(dict.fromkeys(captured))
-
-        # 기간 관련 값으로 추정되는 option value 시도
-        candidate_values = ["TODAY", "5", "20", "DAYS_5", "DAYS_20"]
-
-        for value in candidate_values:
             captured.clear()
-            try:
-                page.select_option("select", value=value, timeout=3000)
-                page.wait_for_timeout(1500)
-                results_by_option[f"value={value}"] = list(
-                    dict.fromkeys(captured)
-                )
-            except Exception as e:
-                results_by_option[f"value={value}"] = [f"선택 실패: {e}"]
+            results_by_option["초기 로드(당일 추정)"] = list(dict.fromkeys(captured))
 
-        browser.close()
+            # 기간 관련 값으로 추정되는 option value 시도
+            candidate_values = ["TODAY", "5", "20", "DAYS_5", "DAYS_20"]
+
+            for value in candidate_values:
+                captured.clear()
+                try:
+                    page.select_option("select", value=value, timeout=3000)
+                    page.wait_for_timeout(1500)
+                    results_by_option[f"value={value}"] = list(
+                        dict.fromkeys(captured)
+                    )
+                except Exception as e:
+                    results_by_option[f"value={value}"] = [f"선택 실패: {e}"]
+
+        finally:
+            browser.close()
 
     return results_by_option

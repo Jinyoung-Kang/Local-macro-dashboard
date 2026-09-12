@@ -5,7 +5,6 @@ ThreadPoolExecutor 기반 I/O 병렬 처리, 원본 로직 완벽 보존 및 전
 """
 import io
 import logging
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -13,47 +12,15 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
 
-from config import MACRO_CATEGORIES
+# FRED 키 로더는 config.get_fred_key() 하나만 사용합니다.
+# (이 모듈과 liquidity_service에 동일 로직이 중복 정의돼 있었습니다.)
+from config import MACRO_CATEGORIES, get_fred_key
+from services.http_client import get_fred_session
 
 logger = logging.getLogger(__name__)
-
-# ==============================================================================
-# 0. FRED API Key 안전 로더
-# ==============================================================================
-def get_fred_key() -> str:
-    """
-    Streamlit Secrets에서 FRED API 키를 안전하게 추출.
-    dict, AttrDict, Mapping 등 어떤 타입으로 반환되든 .get()으로 시도하며,
-    isinstance(val, dict) 검사에 의존하지 않음.
-    """
-    try:
-        if hasattr(st, "secrets") and st.secrets:
-            if "fred" in st.secrets:
-                section = st.secrets["fred"]
-
-                key = None
-                try:
-                    key = section.get("api_key")
-                except AttributeError:
-                    pass
-
-                if key:
-                    return str(key).strip()
-
-                if isinstance(section, str):
-                    return section.strip()
-
-            for k in ["FRED_API_KEY", "fred_api_key", "FRED_KEY", "fred_key"]:
-                if k in st.secrets:
-                    return str(st.secrets[k]).strip()
-    except Exception as e:
-        logger.warning(f"FRED 키 로드 중 예외: {e}")
-    return ""
-
 
 # ==============================================================================
 # 1. UI 헬퍼 및 텍스트 레이블 정제기
@@ -94,6 +61,19 @@ def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
         return None
 
     if symbol in ["^MOVE", "MOVE", "MOVE:INDEX"]:
+        # ----------------------------------------------------------------------
+        # ⚠️ 중요: Yahoo Finance는 ICE BofA MOVE 지수를 제공하지 않습니다.
+        # 아래 값은 실제 MOVE 지수가 아니라, 10년물 금리(^TNX)의 변동성에서
+        # 역산한 **대용(proxy) 추정치**입니다. 실제 MOVE와 수치가 다릅니다.
+        #
+        # 따라서 df.attrs에 is_proxy/source_label을 반드시 심어서, 화면과
+        # AI 리포트가 이 값을 "실제 공식 지표"로 오인하지 않게 합니다.
+        # (MOVE 140 이상 = 채권 발작 같은 임계치 해석을 이 추정치에 그대로
+        #  적용하면 잘못된 투자 판단으로 이어질 수 있습니다.)
+        #
+        # 실제 MOVE 지수가 필요하면 ICE/Bloomberg 등 유료 피드를 연결하고
+        # 이 분기를 제거하세요.
+        # ----------------------------------------------------------------------
         try:
             tnx_tk = yf.Ticker("^TNX")
             tnx_df = tnx_tk.history(period=period if period not in ["1d", "5d"] else "1mo")
@@ -109,11 +89,17 @@ def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
                     proxy_df['High'] = (proxy_df['Close'] * 1.01).round(2)
                     proxy_df['Low'] = (proxy_df['Close'] * 0.99).round(2)
                     proxy_df.attrs["is_intraday"] = False
+                    proxy_df.attrs["is_proxy"] = True
+                    proxy_df.attrs["source_label"] = (
+                        "^TNX 변동성 기반 추정치 (실제 ICE BofA MOVE 아님)"
+                    )
                     return proxy_df
         except Exception as e:
             logger.warning(f"MOVE 프록시 연산 지연: {e}")
 
-        # 비상 Fallback (MOVE 지수 95~110pt 대역 시계열)
+        # 네트워크까지 실패한 경우의 자리표시용 합성 시계열입니다.
+        # 값 자체에 정보가 전혀 없으므로(단순 사인파) is_synthetic으로
+        # 표시해 화면에서 수치를 신뢰하지 않도록 합니다.
         today = datetime.now()
         dates = pd.date_range(end=today, periods=60, freq='B')
         vals = 98.5 + np.sin(np.linspace(0, 10, len(dates))) * 6.5
@@ -125,6 +111,11 @@ def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
             'Volume': 0
         }, index=dates)
         fallback_df.attrs["is_intraday"] = False
+        fallback_df.attrs["is_proxy"] = True
+        fallback_df.attrs["is_synthetic"] = True
+        fallback_df.attrs["source_label"] = (
+            "수집 실패 시 자리표시용 합성 시계열 (실제 시장 데이터 아님)"
+        )
         return fallback_df
 
     try:
@@ -174,7 +165,7 @@ def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = Non
                 f"series_id={series_id}&api_key={key}&file_type=json"
                 f"&observation_start={start_date}"
             )
-            res = requests.get(url, timeout=10)
+            res = get_fred_session().get(url, timeout=10)
             if res.status_code == 200:
                 data = res.json().get("observations", [])
                 if data:
@@ -194,10 +185,7 @@ def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = Non
 
     try:
         csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        res = requests.get(csv_url, headers=headers, timeout=15)
+        res = get_fred_session().get(csv_url, timeout=15)
         if res.status_code == 200 and len(res.text) > 30:
             raw_df = pd.read_csv(io.StringIO(res.text))
 
@@ -327,6 +315,11 @@ def _apply_bond_scanner_override(
             item["price_str"] = f"{price:,.3f}"
             item["status"] = "ok"
             item["source"] = scraped.get("provider", "TradingView Scanner")
+            # Scanner 응답에는 체결 시각이 없으므로 "수집 시각"임을 밝혀 둡니다.
+            item["last_ts"] = (
+                datetime.now(ZoneInfo("Asia/Seoul")).strftime("%H:%M:%S KST")
+                + " (TradingView 수집 시각)"
+            )
 
             if previous_close is not None and float(previous_close) != 0:
                 previous_close = float(previous_close)
@@ -592,10 +585,18 @@ def summarize_series_for_ai(df: pd.DataFrame, value_col: str = None, label: str 
         change = current - previous
         percentile = float(series.rank(pct=True).iloc[-1] * 100)
 
+        # 대용(proxy)/합성 시계열은 AI가 공식 지표로 오인하지 않도록
+        # 요약 문장 자체에 출처 경고를 붙입니다.
+        caveat = ""
+        if df.attrs.get("is_proxy") or df.attrs.get("is_synthetic"):
+            source_label = df.attrs.get("source_label", "추정치")
+            caveat = f" ⚠️ 주의: 공식 지표가 아닌 추정치입니다 — {source_label}"
+
         return (
             f"- {label}: {current:,.2f} "
             f"(직전 대비 {change:+,.2f}, "
             f"최근 표본 내 백분위 {percentile:.1f}%)"
+            f"{caveat}"
         )
     except Exception as e:
         return f"- {label}: 요약 실패 ({str(e)})"

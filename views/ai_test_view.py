@@ -4,7 +4,6 @@ AI 엔진 통합 진단 및 테스트 뷰
 공통 분석 모델 레지스트리 기반 종합 테스트 및 번역기(TRANSLATION_MODELS) 자동 후처리 상태 모니터링 연동
 """
 import streamlit as st
-from config import get_secret
 from services.ai_service import (
     AI_MODEL_REGISTRY,
     TRANSLATION_MODELS,
@@ -76,7 +75,7 @@ def render_ai_test_view():
     """
 
     # 3. 테스트 실행
-    if st.button("🧪 선택 모델 호출", type="primary", use_container_width=True):
+    if st.button("🧪 선택 모델 호출", type="primary", width="stretch"):
         with st.spinner(f"'{format_ai_engine(selected_api)}' 엔진 호출 중..."):
             res = call_selected_ai_engine(
                 engine_name=selected_api,

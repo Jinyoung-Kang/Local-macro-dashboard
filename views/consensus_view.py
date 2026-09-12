@@ -5,7 +5,6 @@ views/consensus_view.py
 """
 import streamlit as st
 import plotly.graph_objects as go
-import pandas as pd
 from config import INSTITUTIONS
 from services.consensus_service import (
     fetch_all_selected_histories,
@@ -132,7 +131,7 @@ def render_consensus_view():
                 yaxis_title="",
                 margin=dict(l=20, r=40, t=40, b=20)
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info(f"`{selected_date}` 기준 최소 {min_overlap}개 기관이 겹치는 공통 보유 종목이 없습니다.")
 
@@ -170,4 +169,4 @@ def render_consensus_view():
         display_tbl.columns = ['종목명 (Issuer)', '보유 기관수', '보유 기관 목록', '합산 평가액($)', '평균 비중(%)', '동시 매수 기관수', '동시 매도 기관수']
         display_tbl['합산 평가액($)'] = display_tbl['합산 평가액($)'].map('${:,.0f}'.format)
         display_tbl['평균 비중(%)'] = display_tbl['평균 비중(%)'].map('{:.2f}%'.format)
-        st.dataframe(display_tbl, use_container_width=True, hide_index=True)
+        st.dataframe(display_tbl, width="stretch", hide_index=True)

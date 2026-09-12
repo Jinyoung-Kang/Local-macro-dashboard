@@ -12,20 +12,13 @@ from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 
+from services.http_client import BROWSER_HEADERS, get_session
+
 logger = logging.getLogger(__name__)
 
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,*/*;q=0.8"
-    ),
-}
+# 공용 세션이 이미 브라우저 UA/Accept 헤더를 들고 있습니다.
+# 외부에서 이 상수를 참조하던 코드를 위해 별칭만 유지합니다.
+REQUEST_HEADERS = BROWSER_HEADERS
 
 
 
@@ -171,11 +164,8 @@ def _is_in_range(
 
 def _fetch_html(url: str) -> str:
     """TradingView 공개 페이지 HTML을 수집합니다."""
-    response = requests.get(
-        url,
-        headers=REQUEST_HEADERS,
-        timeout=10,
-    )
+    # HTML 페이지 수집은 브라우저 헤더를 명시적으로 보냅니다.
+    response = get_session().get(url, headers=BROWSER_HEADERS, timeout=10)
     response.raise_for_status()
     return response.text
 
@@ -194,11 +184,7 @@ def _fetch_yahoo_chart(
         f"{symbol}?range=10d&interval=1d&includePrePost=false"
     )
 
-    response = requests.get(
-        url,
-        headers=REQUEST_HEADERS,
-        timeout=10,
-    )
+    response = get_session().get(url, timeout=10)
     response.raise_for_status()
 
     payload = response.json()
@@ -248,10 +234,9 @@ def _fetch_tradingview_symbol_snapshot(
     }
 
     try:
-        response = requests.get(
+        response = get_session().get(
             TRADINGVIEW_SYMBOL_SCANNER_URL,
             params=params,
-            headers=REQUEST_HEADERS,
             timeout=10,
         )
         response.raise_for_status()
@@ -309,10 +294,9 @@ def _fetch_tradingview_us_treasury_yields() -> dict:
     d[4]는 해당 만기의 최신 수익률(%)입니다.
     """
     try:
-        response = requests.get(
+        response = get_session().get(
             TRADINGVIEW_BONDS_SCANNER_URL,
             params=TRADINGVIEW_BONDS_SCANNER_PARAMS,
-            headers=REQUEST_HEADERS,
             timeout=10,
         )
         response.raise_for_status()
@@ -388,10 +372,15 @@ def _extract_previous_close(text: str) -> float | None:
     TradingView의 Previous close 값을 추출합니다.
     페이지 언어·레이아웃 차이를 고려해 여러 패턴을 시도합니다.
     """
+    # [버그 수정] 기존 패턴은 raw 문자열 안에 \\n / \\d 처럼 백슬래시를 한 번 더
+    # 이스케이프해 두어, 문자 클래스가 "숫자"가 아니라 literal 백슬래시·n·r·s·d
+    # 를 뜻했습니다. 그 결과 이 함수는 어떤 입력에도 절대 매칭되지 않아
+    # 항상 None을 반환했고, TradingView 카드의 전일 종가·등락률이 영구히
+    # "미제공"으로 표시됐습니다. \s, \d 로 정정합니다.
+    # (re.IGNORECASE를 쓰므로 close/Close 패턴을 따로 둘 필요도 없습니다.)
     patterns = [
-        r"Previous\s+close\s*[\\n\\r\\s]*([\\d,]+(?:\\.\\d+)?)",
-        r"Previous\s+Close\s*[\\n\\r\\s]*([\\d,]+(?:\\.\\d+)?)",
-        r"전일\s*종가\s*[\\n\\r\\s]*([\\d,]+(?:\\.\\d+)?)",
+        r"Previous\s+close\s*[\s]*([\d,]+(?:\.\d+)?)",
+        r"전일\s*종가\s*[\s]*([\d,]+(?:\.\d+)?)",
     ]
 
     for pattern in patterns:
@@ -443,123 +432,6 @@ def _extract_tradingview_change(
         change_pct = -change_pct
 
     return change, change_pct
-
-
-def _parse_tradingview_oil(
-    text: str,
-) -> tuple[float | None, float | None]:
-    """
-    TradingView USOIL/UKOIL 전용 파서.
-
-    TradingView 페이지 텍스트는 시점·지역·렌더링 상태에 따라
-    다음과 같이 조금씩 다른 형식으로 내려올 수 있습니다.
-
-    - Market open\\n85.35USD / BLLR
-    - Market closed\\n88.28USD / BLLR
-    - 85.35RUSD / BLL
-    - 88.28RUSD / BLL
-    - Previous close\\n83.45 USD
-
-    R은 TradingView 텍스트 추출 과정에서 섞이는 렌더링 구분 문자입니다.
-    이 함수를 거치면 먼저 R 구분자를 정규화하고, 실제 원유 가격 범위
-    (20~250 USD/bbl)를 검증해 페이지 내부의 다른 숫자를 오인하지 않습니다.
-
-    반환:
-        (현재가, 전일 종가)
-    """
-    if not text:
-        return None, None
-
-    # TradingView 텍스트의 렌더링 구분 문자(R)를 단위 주변에서 정규화.
-    # 숫자 자체의 R은 가격 표시에 쓰이는 구분 문자이므로 제거해도 무방합니다.
-    normalized = text.replace("RUSD", " USD")
-    normalized = normalized.replace("BLLR", "BLL")
-    normalized = normalized.replace("RHKD", " HKD")
-    normalized = normalized.replace("RJPY", " JPY")
-    normalized = normalized.replace("RPOINT", " POINT")
-
-    # 1차: Market open/closed 뒤의 현재가를 가장 신뢰도 높게 추출.
-    market_patterns = [
-        r"Market\s+(?:open|closed)\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD\s*/\s*BLL",
-
-        r"Market\s+(?:open|closed)\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD",
-    ]
-
-    current = None
-
-    for pattern in market_patterns:
-        match = re.search(
-            pattern,
-            normalized,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            candidate = _to_float(match.group(1))
-            if _is_in_range(candidate, 20.0, 250.0):
-                current = candidate
-                break
-
-    # 2차: 페이지 전체에서 '가격 + USD / BLL' 조합을 찾아
-    # 현실적 가격 범위를 통과한 첫 번째 값을 사용.
-    if current is None:
-        oil_candidates = re.findall(
-            r"([0-9][0-9,\.\s]*)\s*USD\s*/\s*BLL",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-
-        for raw_value in oil_candidates:
-            candidate = _to_float(raw_value)
-            if _is_in_range(candidate, 20.0, 250.0):
-                current = candidate
-                break
-
-    # 3차: 일부 HTML 응답은 USD / BLL 앞 단위 사이에 공백/줄바꿈이 다르게
-    # 섞일 수 있으므로 더 느슨한 보조 패턴을 사용.
-    if current is None:
-        loose_candidates = re.findall(
-            r"([0-9]{2,3}(?:\.\d+)?)\s*USD",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-
-        for raw_value in loose_candidates:
-            candidate = _to_float(raw_value)
-            if _is_in_range(candidate, 20.0, 250.0):
-                current = candidate
-                break
-
-    # 전일 종가 파싱.
-    previous_patterns = [
-        r"Previous\s+close\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD",
-
-        r"Previous\s+Close\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD",
-
-        r"전일\s*종가\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD",
-    ]
-
-    previous = None
-
-    for pattern in previous_patterns:
-        match = re.search(
-            pattern,
-            normalized,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            candidate = _to_float(match.group(1))
-            if _is_in_range(candidate, 20.0, 250.0):
-                previous = candidate
-                break
-
-    return current, previous
-
-
 def _parse_tradingview_hsi(
     text: str,
 ) -> tuple[float | None, float | None]:
@@ -715,126 +587,21 @@ def _parse_tradingview(
         change = current - previous
 
     return current, previous, change, change_pct
-
-
-def _parse_investing(
-    text: str,
-) -> tuple[float | None, float | None, float | None, float | None]:
+def _derive_change(
+    price: float | None,
+    previous_close: float | None,
+) -> tuple[float | None, float | None]:
     """
-    Investing.com 공개 페이지에서 현재가, 전일 종가,
-    등락폭 및 등락률을 추출합니다.
+    현재가와 전일 종가로 등락폭·등락률을 계산합니다.
+
+    전일 종가를 모르거나 0이면, "변화 없음(0.00%)"으로 위장하지 않고
+    둘 다 None으로 두어 화면에서 N/A로 표시되게 합니다.
     """
-    current_patterns = [
-        r"(?:live\s+(?:stock\s+)?price\s+is)\s*"
-        r"([\d,]+(?:\.\d+)?)",
+    if price is None or previous_close is None or previous_close == 0:
+        return None, None
 
-        r"Currency\s+in\s+[A-Z]{3}\s*[\n\r\s]+"
-        r"([\d,]+(?:\.\d+)?)",
-
-        r"실시간\s*(?:지수|주가).*?"
-        r"([\d,]+(?:\.\d+)?)에\s*(?:마감|거래|닫음)",
-
-        r"통화\s+\w+\s*[\n\r\s]+"
-        r"([\d,]+(?:\.\d+)?)",
-
-        r"\n([\d,]+(?:\.\d+)?)\s*\n"
-        r"[+\-−]\s*[\d,]+(?:\.\d+)?\s*\(",
-    ]
-
-    current = None
-    for pattern in current_patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            current = _to_float(match.group(1))
-            if current is not None:
-                break
-
-    previous_patterns = [
-        r"Prev\.?\s*Close\s*[\n\r\s\-\*]*"
-        r"([\d,]+(?:\.\d+)?)",
-
-        r"Previous\s+Close\s*[\n\r\s\-\*]*"
-        r"([\d,]+(?:\.\d+)?)",
-
-        r"전일\s*종가\s*[\n\r\s\-\*]*"
-        r"([\d,]+(?:\.\d+)?)",
-    ]
-
-    previous = None
-    for pattern in previous_patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            previous = _to_float(match.group(1))
-            if previous is not None:
-                break
-
-    change_pattern = (
-        r"([+\-−])\s*([\d,]+(?:\.\d+)?)\s*"
-        r"\(\s*([+\-−])?\s*([\d,]+(?:\.\d+)?)%\s*\)"
-    )
-
-    change = None
-    change_pct = None
-
-    match = re.search(
-        change_pattern,
-        text,
-        flags=re.MULTILINE,
-    )
-    if match:
-        change = _to_float(match.group(2))
-        change_pct = _to_float(match.group(4))
-
-        if (
-            change is not None
-            and match.group(1) in ["-", "−"]
-        ):
-            change = -change
-
-        if (
-            change_pct is not None
-            and match.group(3) in ["-", "−"]
-        ):
-            change_pct = -change_pct
-
-    # 전일 종가를 직접 읽지 못했지만 변화율은 있을 경우 역산
-    if (
-        previous is None
-        and current is not None
-        and change_pct is not None
-        and change_pct != -100
-    ):
-        previous = current / (1 + change_pct / 100)
-
-    # 변화율이 없고 현재가/전일 종가가 있으면 계산
-    if (
-        change_pct is None
-        and current is not None
-        and previous not in (None, 0)
-    ):
-        change_pct = (
-            (current - previous)
-            / previous
-            * 100
-        )
-
-    # 등락폭이 없고 현재가/전일 종가가 있으면 계산
-    if (
-        change is None
-        and current is not None
-        and previous is not None
-    ):
-        change = current - previous
-
-    return current, previous, change, change_pct
+    change = price - previous_close
+    return change, (change / previous_close) * 100
 
 
 def _collect_one_market(config: dict) -> dict:
@@ -870,55 +637,14 @@ def _collect_one_market(config: dict) -> dict:
             price, previous_close = _fetch_yahoo_chart(
                 config["symbol"]
             )
-            change = (
-                price - previous_close
-                if price is not None
-                and previous_close is not None
-                else None
-            )
-            change_pct = (
-                (change / previous_close) * 100
-                if change is not None
-                and previous_close not in (None, 0)
-                else None
-            )
+            change, change_pct = _derive_change(price, previous_close)
 
         else:
             html = _fetch_html(config["url"])
 
-            if kind in {"tradingview_usoil", "tradingview_ukoil"}:
-                price, previous_close = _parse_tradingview_oil(
-                    html
-                )
-                change = (
-                    price - previous_close
-                    if price is not None
-                    and previous_close is not None
-                    else None
-                )
-                change_pct = (
-                    (change / previous_close) * 100
-                    if change is not None
-                    and previous_close not in (None, 0)
-                    else None
-                )
-
-            elif kind == "tradingview_hsi":
-                price, previous_close = _parse_tradingview_hsi(
-                    html
-                )
-                change = (
-                    price - previous_close
-                    if price is not None
-                    and previous_close is not None
-                    else None
-                )
-                change_pct = (
-                    (change / previous_close) * 100
-                    if change is not None
-                    and previous_close not in (None, 0)
-                    else None
-                )
+            if kind == "tradingview_hsi":
+                price, previous_close = _parse_tradingview_hsi(html)
+                change, change_pct = _derive_change(price, previous_close)
 
             elif kind.startswith("tradingview"):
                 (
@@ -930,14 +656,6 @@ def _collect_one_market(config: dict) -> dict:
                     html,
                     kind,
                 )
-
-            elif kind == "investing_index":
-                (
-                    price,
-                    previous_close,
-                    change,
-                    change_pct,
-                ) = _parse_investing(html)
 
             else:
                 result["error"] = (
@@ -985,7 +703,15 @@ def get_scraped_macro_markets() -> dict:
     """
     results = []
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # [성능] 기존에는 max_workers=4로 10개 소스를 돌려 3라운드에 걸쳐
+    # 직렬화됐고, bonds scanner 요청은 풀이 닫힌 뒤 별도로 한 번 더
+    # 순차 실행됐습니다. 전부 네트워크 대기(I/O bound)이므로 한 번에
+    # 띄워 총 소요시간을 "가장 느린 한 건"으로 줄입니다.
+    with ThreadPoolExecutor(max_workers=len(SCRAPER_MARKETS) + 1) as executor:
+        scanner_future = executor.submit(
+            _fetch_tradingview_us_treasury_yields
+        )
+
         future_map = {
             executor.submit(
                 _collect_one_market,
@@ -1014,12 +740,16 @@ def get_scraped_macro_markets() -> dict:
                     "error": str(e),
                 })
 
-    # --------------------------------------------------------------------------
-    # 미국채 2Y / 10Y / 30Y는 TradingView HTML 정규표현식 파싱 결과보다
-    # 공개 bonds scanner JSON을 우선 사용합니다.
-    # Scanner 요청이 실패하면 기존 HTML 수집 결과를 그대로 유지합니다.
-    # --------------------------------------------------------------------------
-    scanner_yields = _fetch_tradingview_us_treasury_yields()
+        # --------------------------------------------------------------------
+        # 미국채 2Y / 10Y / 30Y는 TradingView HTML 정규표현식 파싱 결과보다
+        # 공개 bonds scanner JSON을 우선 사용합니다.
+        # Scanner 요청이 실패하면 기존 HTML 수집 결과를 그대로 유지합니다.
+        # --------------------------------------------------------------------
+        try:
+            scanner_yields = scanner_future.result()
+        except Exception as e:
+            logger.warning("TradingView bonds scanner 조회 실패: %s", e)
+            scanner_yields = {}
 
     if scanner_yields:
         for item in results:

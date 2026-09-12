@@ -100,7 +100,7 @@ def render_ai_report_view():
         )
     with c3:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-        generate_btn = st.button("🚀 리포트 생성", type="primary", use_container_width=True)
+        generate_btn = st.button("🚀 리포트 생성", type="primary", width="stretch")
 
     # 제한 컨텍스트 방어 정책
     LONG_CONTEXT_MODELS = {

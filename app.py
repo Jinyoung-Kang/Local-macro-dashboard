@@ -1,6 +1,9 @@
 # app.py
 import streamlit as st
 import base64
+import os
+import threading
+import time
 import urllib3
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -104,7 +107,15 @@ st.markdown("""
 # 1. 간이 인증 (비밀번호 잠금) 시스템
 # ==========================================
 def check_password():
-    correct_password = st.secrets.get("auth", {}).get("password", APP_PASSWORD)
+    # [버그 수정] 기존 코드는 st.secrets.get("auth", {})를 직접 호출했습니다.
+    # st.secrets는 접근 시점에 secrets.toml을 파싱하므로, 파일이 없으면
+    # .get()조차 StreamlitSecretNotFoundError를 던집니다. 그 결과 secrets.toml
+    # 없이 새로 clone한 환경에서는 로그인 화면 자체가 예외로 죽어 앱을
+    # 전혀 쓸 수 없었습니다.
+    #
+    # config.APP_PASSWORD가 이미 [auth] password → APP_PASSWORD 환경변수 →
+    # 기본값 순서로 안전하게 해석하므로 그 결과만 사용합니다.
+    correct_password = APP_PASSWORD
 
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
@@ -189,15 +200,27 @@ if st.sidebar.button(
     st.rerun()
 
 if st.session_state.get("shutdown_requested"):
+    # [버그 수정] 기존 코드는 st.stop() 뒤에 os._exit(0)를 두었습니다.
+    # st.stop()은 즉시 스크립트 실행을 중단시키므로 그 아래 줄은 영원히
+    # 실행되지 않습니다. 즉 "서버가 종료되었다"는 안내만 뜨고 실제
+    # 프로세스는 계속 살아 있었습니다.
+    #
+    # 이제 안내를 먼저 렌더한 뒤, 실제 종료를 별도 스레드에서 약간
+    # 지연 실행합니다. 브라우저가 이 화면을 받아볼 시간을 확보해야
+    # 하기 때문입니다. os._exit()은 Streamlit 런타임의 예외 처리를
+    # 우회해 즉시 프로세스를 끝내므로 의도대로 동작합니다.
     st.sidebar.error("서버를 종료합니다. 터미널 창을 확인하세요.")
     st.warning(
-        "⚠️ 앱 서버가 종료되었습니다. 다시 사용하려면 터미널에서 "
+        "⚠️ 앱 서버를 종료합니다. 다시 사용하려면 터미널에서 "
         "`streamlit run app.py`를 다시 실행하세요."
     )
-    st.stop()
 
-    import os
-    os._exit(0)
+    def _shutdown_after_response() -> None:
+        time.sleep(1.5)
+        os._exit(0)
+
+    threading.Thread(target=_shutdown_after_response, daemon=True).start()
+    st.stop()
 
 st.sidebar.caption("© 2026 Macro Web Dashboard v2.3")
 

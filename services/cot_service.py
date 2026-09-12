@@ -10,6 +10,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
+
+# 공용 커넥션 풀 세션을 사용해 요청마다 TCP/TLS 핸드셰이크를
+# 반복하지 않습니다 (services/http_client.py).
+from services.http_client import get_session
 import streamlit as st
 
 logger = logging.getLogger(__name__)
@@ -53,7 +57,7 @@ def _cftc_get_with_retry(url: str, params: dict, max_attempts: int = 3):
     last_error = None
     for attempt in range(max_attempts):
         try:
-            response = requests.get(
+            response = get_session().get(
                 url,
                 params=params,
                 timeout=(5, 30),

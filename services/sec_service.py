@@ -4,7 +4,6 @@ SEC EDGAR 13F-HR 공시 데이터 수집 및 기관 포트폴리오 분석 엔�
 (강력한 Session 기반 통신 방어, 콤마 수치 정제 및 무적 ElementTree XML 파서 탑재)
 """
 import logging
-import re
 import time
 import xml.etree.ElementTree as ET
 import pandas as pd
@@ -21,8 +20,18 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 # 1. SEC 전용 강행 돌파 통신 세션 설정 (Timeout, Rate Limit 완벽 방어)
 # ==============================================================================
+@st.cache_resource(show_spinner=False)
 def get_sec_session() -> requests.Session:
-    """SEC EDGAR의 연결 끊김 및 Rate Limit을 방어하기 위한 세션 생성기"""
+    """
+    SEC EDGAR의 연결 끊김 및 Rate Limit을 방어하기 위한 전용 세션.
+
+    [성능] @st.cache_resource로 한 번만 생성해 재사용합니다. 기존에는
+    fetch_sec_13f_multi_quarters()가 호출될 때마다 새 Session을 만들어,
+    13F 교집합 화면(기관 12곳)에서 세션과 커넥션 풀이 12벌씩 생겼습니다.
+
+    [주의] SEC는 연락처가 포함된 User-Agent를 요구합니다(미준수 시 403).
+    초당 10건 제한은 호출부의 time.sleep(0.2)로 지킵니다.
+    """
     session = requests.Session()
     retries = Retry(
         total=5,
@@ -30,12 +39,17 @@ def get_sec_session() -> requests.Session:
         status_forcelist=[403, 408, 429, 500, 502, 503, 504],
         allowed_methods=["GET"]
     )
-    session.mount("https://", HTTPAdapter(max_retries=retries))
+    session.mount(
+        "https://",
+        HTTPAdapter(max_retries=retries, pool_connections=4, pool_maxsize=10),
+    )
     session.headers.update({
         "User-Agent": "MacroQuantResearchApp/3.0 (research_analytics@macrofintechhub.com)",
         "Accept-Encoding": "gzip, deflate",
-        "Host": "www.sec.gov",
     })
+    # Host 헤더는 고정하지 않습니다. www.sec.gov 외의 호스트
+    # (예: data.sec.gov)로 요청할 때 잘못된 Host가 붙어 실패하기 때문에,
+    # requests가 URL에서 자동으로 채우게 둡니다.
     return session
 
 

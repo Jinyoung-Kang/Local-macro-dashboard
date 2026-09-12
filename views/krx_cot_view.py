@@ -571,7 +571,7 @@ def render_krx_cot_view():
     fig.update_yaxes(title_text="베이시스 (pt)", row=2, col=1, gridcolor="#21262D")
     fig.update_yaxes(title_text="거래량", row=3, col=1, gridcolor="#21262D")
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     if basis_series.isna().all():
         st.caption("💡 베이시스 데이터는 pykrx 원본에서 확인되지 않아 이번 조회 기간에는 표시되지 않았습니다.")
@@ -812,7 +812,7 @@ def render_krx_cot_view():
     ai_res = None
     with col_ai1:
         selected_engine = st.selectbox("AI 엔진 선택", options=engine_options, index=0)
-        if st.button("🤖 AI 해설 생성", use_container_width=True):
+        if st.button("🤖 AI 해설 생성", width="stretch"):
             with st.spinner(f"{selected_engine}로 분석 중..."):
                 prompt = f"""
 KOSPI 200 Derivatives Market Data

@@ -9,61 +9,15 @@ import io
 import logging
 import numpy as np
 import pandas as pd
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import streamlit as st
 
+# FRED 키 로더와 세션은 프로젝트 전체에서 하나만 씁니다.
+# (기존에는 macro_service / liquidity_service에 같은 get_fred_key()가
+#  중복 정의되어 있었고, 세션은 요청마다 새로 생성됐습니다.)
+from config import get_fred_key
+from services.http_client import get_fred_session
+
 logger = logging.getLogger(__name__)
-
-
-def get_fred_key() -> str:
-    """
-    Streamlit Secrets에서 FRED API 키를 안전하게 추출.
-    dict, AttrDict, Mapping 등 어떤 타입으로 반환되든 .get()으로 시도하며,
-    isinstance(val, dict) 검사에 의존하지 않음.
-    """
-    try:
-        if hasattr(st, "secrets") and st.secrets:
-            if "fred" in st.secrets:
-                section = st.secrets["fred"]
-
-                key = None
-                try:
-                    key = section.get("api_key")
-                except AttributeError:
-                    pass
-
-                if key:
-                    return str(key).strip()
-
-                if isinstance(section, str):
-                    return section.strip()
-
-            for k in ["FRED_API_KEY", "fred_api_key", "FRED_KEY", "fred_key"]:
-                if k in st.secrets:
-                    return str(st.secrets[k]).strip()
-    except Exception as e:
-        logger.warning(f"FRED 키 로드 중 예외: {e}")
-    return ""
-
-
-def get_fred_session() -> requests.Session:
-    """FRED 403 차단 방어용 세션 생성기"""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
-    })
-    retries = Retry(
-        total=3,
-        backoff_factor=1.0,
-        status_forcelist=[403, 429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    return session
 
 
 def _parse_fred_csv(csv_text: str, series_id: str) -> pd.DataFrame:

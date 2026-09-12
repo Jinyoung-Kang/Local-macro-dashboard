@@ -84,7 +84,7 @@ def render_cot_view():
         st.caption(f"⏰ 시스템 현재 시각: {now_str}")
     with col3:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        if st.button("🔄 최신 데이터 새로고침", use_container_width=True):
+        if st.button("🔄 최신 데이터 새로고침", width="stretch"):
             st.cache_data.clear()
             st.rerun()
 
@@ -250,7 +250,7 @@ def render_cot_view():
     fig.update_yaxes(title_text="순포지션 (계약)", row=1, col=1, gridcolor="#21262D")
     fig.update_yaxes(title_text="순포지션 (계약)", row=2, col=1, gridcolor="#21262D")
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     with st.expander("📄 COT 원본 데이터 (최근 15주)", expanded=False):
         df_display = df.tail(15).sort_values(by="date", ascending=False).copy()
@@ -259,6 +259,6 @@ def render_cot_view():
             df_display[col] = df_display[col].apply(lambda x: f"{int(x):,}")
         st.dataframe(
             df_display[["date", "nc_net", "nc_long", "nc_short", "comm_net", "comm_long", "comm_short"]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )

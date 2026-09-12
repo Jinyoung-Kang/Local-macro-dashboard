@@ -24,7 +24,6 @@ from services.radar_service import (
     test_pykrx_connection,
     test_naver_scraping,
     test_daum_scraping,
-    PYKRX_AVAILABLE,
 )
 
 
@@ -190,7 +189,7 @@ def render_radar_view():
             f"{INTERVAL_LABELS.get(interval_sel, interval_sel)}"
         )
     with refresh_col:
-        if st.button("새로고침", use_container_width=True):
+        if st.button("새로고침", width="stretch"):
             get_market_radar_scanner.clear()
             st.rerun()
 
@@ -317,7 +316,7 @@ def render_radar_view():
         margin=dict(t=30, l=10, r=10, b=10),
         height=450,
     )
-    st.plotly_chart(fig_treemap, use_container_width=True)
+    st.plotly_chart(fig_treemap, width="stretch")
 
     # ==========================================================================
     # 데이터 테이블
@@ -347,7 +346,7 @@ def render_radar_view():
             subset=["순매수대금(억)"],
             cmap="Reds" if trade_type_sel == "순매수" else "Blues",
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -365,7 +364,7 @@ def render_radar_view():
         ]
         st.dataframe(
             df_radar[[col for col in debug_cols if col in df_radar.columns]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -967,7 +966,7 @@ def render_radar_view():
                 ),
                 hovermode="x unified",
             )
-            st.plotly_chart(fig_cum, use_container_width=True)
+            st.plotly_chart(fig_cum, width="stretch")
             st.caption(
                 "KIS API, Daum API, Naver API, PyKrx 데이터의 제공 시점·집계 방식 차이로 "
                 "인해 수급 값은 거래소 최종 확정치와 다를 수 있습니다."
