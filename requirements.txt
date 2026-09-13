@@ -1,10 +1,44 @@
-streamlit
-requests
-pandas
-numpy
-yfinance
-plotly
-streamlit-autorefresh
-urllib3
-pykrx
-playwright
+# Local Macro Dashboard 의존성
+#
+# 하한 버전을 명시하는 이유:
+#  - streamlit 1.49부터 use_container_width 대신 width="stretch"를 사용합니다.
+#    이 프로젝트는 width= API를 쓰므로 1.49 미만에서는 TypeError가 납니다.
+#  - pandas 2.x / numpy 2.x API를 전제로 작성돼 있습니다.
+#
+# 갱신: pip install -r requirements.txt
+#      playwright install chromium   # ← 최초 1회 필수 (별도 브라우저 다운로드)
+
+# --- 웹 UI ---
+streamlit>=1.49
+streamlit-autorefresh>=1.0.1
+
+# --- 데이터 처리 ---
+pandas>=2.0
+numpy>=1.26
+
+# --- 시각화 ---
+plotly>=5.18
+
+# --- 시세/지표 수집 ---
+yfinance>=0.2.40
+pykrx>=1.0.45
+
+# --- HTTP ---
+requests>=2.31
+urllib3>=2.0
+
+# --- HTML 파싱 (services/sec_service.py, services/radar_service.py) ---
+# 기존 requirements.txt에 누락돼 있었습니다. yfinance가 우연히 끌어오던
+# 전이 의존성에 기대고 있었을 뿐이라, yfinance가 의존성을 정리하면
+# ModuleNotFoundError로 앱 전체가 죽습니다. 명시적으로 선언합니다.
+beautifulsoup4>=4.12
+lxml>=5.0
+
+# --- JS 렌더링 스크래핑 (services/browser_pool.py) ---
+playwright>=1.40
+
+# --- KIS 실시간 웹소켓 (services/kis_websocket_service.py) ---
+# `import websocket`은 websocket-client 패키지입니다.
+# (websockets 패키지와 다릅니다. 혼동하면 ImportError가 납니다.)
+# 이 패키지도 기존 requirements.txt에 누락돼 있었습니다.
+websocket-client>=1.7

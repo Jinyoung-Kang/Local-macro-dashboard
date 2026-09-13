@@ -5,9 +5,31 @@ config.py
 import os
 import streamlit as st
 
-for key, value in st.secrets.items():
-    os.environ.setdefault(key, str(value))
-    
+
+def _export_secrets_to_env() -> None:
+    """
+    Streamlit Secrets의 "단일 스칼라 키"만 환경변수로 승격합니다.
+
+    - secrets.toml이 아예 없는 환경(새로 clone한 로컬, CI)에서 st.secrets를
+      순회하면 StreamlitSecretNotFoundError가 발생해 앱 전체가 import 단계에서
+      죽습니다. 반드시 예외를 흡수해야 합니다.
+    - [section] 형태의 중첩 테이블을 str()로 변환하면 "{'password': '...'}"
+      같은 문자열이 환경변수에 그대로 박혀 쓸모가 없을 뿐 아니라, 하위
+      프로세스에 자격증명이 노출됩니다. 스칼라 값만 승격합니다.
+    """
+    try:
+        items = list(st.secrets.items())
+    except Exception:
+        # secrets.toml 미존재/파싱 실패: 환경변수만으로 동작하도록 조용히 통과
+        return
+
+    for key, value in items:
+        if isinstance(value, (str, int, float, bool)):
+            os.environ.setdefault(str(key), str(value))
+
+
+_export_secrets_to_env()
+
 # ==============================================================================
 # 0. Secret & 환경 변수 로드 헬퍼 및 API 설정
 # ==============================================================================

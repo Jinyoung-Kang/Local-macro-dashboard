@@ -17,12 +17,12 @@ views/macro_view.py
   FRED DGS30(30년물) 공식치와 TradingView us30y 실시간 참고치를 함께
   제공합니다.
 """
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
-import pytz
 import streamlit as st
 import yfinance as yf
 
@@ -42,32 +42,43 @@ from services.dashboard_snapshot_service import (
 from services.market_scraper_service import (
     get_scraped_macro_markets,
 )
+from services.advanced_macro_service import (
+    ADVANCED_DISPLAY_ORDER,
+    ADVANCED_SERIES,
+    get_advanced_macro_indicators,
+)
+
+logger = logging.getLogger(__name__)
 
 
-# 미국채 카드 항목명 → TradingView 스크래핑 키 매핑
-BOND_SCRAPER_KEY_MAP = {
-    "미국채 2년물 수익률(%) :gray[[TradingView 참고]]": "us02y",
-    "미국채 10년물 수익률(%) :gray[[TradingView 참고]]": "us10y",
-    "미국채 30년물 수익률(%) :gray[[TradingView 참고]]": "us30y",
-}
-
-# config.py의 MACRO_CATEGORIES 키와 반드시 완전히 일치해야 합니다.
-BOND_CATEGORY_NAME = "🏛️ 미국 국채 수익률 :gray[(TradingView 참고 시세)]"
+# 미국채 카드의 TradingView 보정 매핑(BOND_SCRAPER_KEY_MAP)은
+# services/macro_service.py 한 곳에만 둡니다. 이 뷰는 보정된 결과를
+# 그대로 표시하고, 실시간 스프레드 비교 카드에만 원본 스크래핑 값을
+# 별도로 조회합니다.
 
 
 @st.cache_data(ttl=60)
 def get_us_market_status() -> str:
+    """
+    yfinance의 marketState로 미국 장 개장 여부를 판정합니다.
+
+    .info는 추가 네트워크 왕복이 필요하고 실패가 잦으므로, 실패 시에는
+    보수적으로 "마감"으로 간주합니다. (bare except는 KeyboardInterrupt /
+    SystemExit까지 삼켜 Ctrl+C로 앱을 끌 수 없게 만들기 때문에
+    Exception으로 좁혔습니다.)
+    """
     try:
         state = yf.Ticker("^GSPC").info.get("marketState", "CLOSED").upper()
         if state in ["REGULAR", "PRE", "POST"]:
             return "개장"
         return "마감"
-    except:
+    except Exception as e:
+        logger.warning("미국 장 상태 조회 실패, '마감'으로 간주합니다: %s", e)
         return "마감"
 
 
 def inject_market_status(name: str) -> str:
-    now = datetime.now(pytz.timezone('Asia/Seoul'))
+    now = datetime.now(ZoneInfo('Asia/Seoul'))
     wd = now.weekday()
     hm = now.hour * 100 + now.minute
     is_weekend = wd >= 5
@@ -123,57 +134,6 @@ def inject_market_status(name: str) -> str:
         return f"{name} :gray[({status})]"
 
 
-def _override_with_scraper_bond(
-    item: dict,
-    scraper_items_for_bonds: dict,
-) -> dict:
-    """
-    상단 미국채 카드에 TradingView 참고 시세를 적용합니다.
-    TradingView 수집이 실패하면 기존 yfinance 값을 그대로 유지합니다.
-
-    이 함수는 카드 표기용 데이터만 교체하며, 공식 장단기 금리차 계산에는
-    FRED DGS2/DGS10/DGS30을 별도로 사용합니다.
-    """
-    scraper_key = BOND_SCRAPER_KEY_MAP.get(item.get("name"))
-    if not scraper_key:
-        return item
-
-    scraped = scraper_items_for_bonds.get(scraper_key)
-    if not scraped or scraped.get("status") != "ok":
-        return item
-
-    price = scraped.get("price")
-    previous_close = scraped.get("previous_close")
-    if price is None:
-        return item
-
-    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
-    new_item = dict(item)
-    new_item["price"] = float(price)
-    new_item["price_str"] = f"{float(price):,.3f}"
-    new_item["status"] = "ok"
-    new_item["source"] = "TradingView 비공식 참고"
-    new_item["last_ts"] = (
-        now_kst.strftime("%H:%M:%S KST") + " (TradingView 참고)"
-    )
-
-    if previous_close is not None and float(previous_close) != 0:
-        previous_close = float(previous_close)
-        delta = float(price) - previous_close
-        pct = (delta / previous_close) * 100.0
-        new_item["delta"] = delta
-        new_item["pct"] = pct
-        new_item["prev_str"] = f"{previous_close:,.3f}"
-        new_item["delta_str"] = f"{delta:+.3f} ({pct:+.2f}%)"
-    else:
-        # TradingView 페이지에서 Previous close를 읽지 못할 수 있으므로,
-        # 기존 yfinance 전일값과 섞지 않고 변화율도 표시하지 않습니다.
-        new_item["prev_str"] = "TradingView 전일값 미제공"
-        new_item["delta_str"] = "전일비 미제공"
-
-    return new_item
-
-
 def _get_realtime_bond_yield(scraper_items_for_bonds: dict, key: str):
     """
     TradingView 스크래핑 결과에서 실시간(참고) 국채 수익률과 전일 종가를
@@ -192,6 +152,279 @@ def _get_realtime_bond_yield(scraper_items_for_bonds: dict, key: str):
     curr = float(price)
     prev = float(previous_close) if previous_close is not None else None
     return curr, prev
+
+
+def _usable_delta(delta_str) -> str | None:
+    """
+    st.metric의 delta로 넘겨도 안전한 값인지 판정합니다.
+
+    Streamlit은 delta 문자열을 숫자로 파싱해 화살표 색을 정합니다.
+    "N/A" 같은 비수치 문자열을 넘기면 파싱에 실패한 채 기본값(녹색 상승)으로
+    렌더링되어, 데이터가 없는 것이 상승으로 보입니다.
+    """
+    if delta_str is None:
+        return None
+    text = str(delta_str).strip()
+    if not text or text.upper() in {"N/A", "NA", "NONE", "-"}:
+        return None
+    # 숫자가 하나도 없으면 delta로 쓸 수 없습니다.
+    if not any(ch.isdigit() for ch in text):
+        return None
+    return text
+
+
+# 심화 지표 카드 배치: 한 행에 3개 (5개 → 3 + 2)
+_ADVANCED_COLS = 3
+
+
+def _render_advanced_card(container, entry: dict) -> None:
+    """
+    심화 지표 카드 1장.
+
+    [UI 수정] 이전에는 metric 아래에 상태·기준일을 col.markdown/col.caption으로
+    따로 그려서, 테두리 박스 밖으로 흘러나오고 그룹마다 컬럼 수가 달라져
+    (신용·금융상황은 항목이 1개라) 박스가 화면 폭 전체로 늘어났습니다.
+    이제 항목 수와 무관하게 고정 3열 그리드를 쓰고, 카드 내용은
+    st.container(border=True) 안에 함께 담습니다.
+    """
+    with container:
+        box = st.container(border=True)
+        with box:
+            label = entry.get("label", entry["id"])
+
+            if not entry.get("available"):
+                st.metric(label, "수집 실패", help=entry.get("why", ""))
+                st.caption(f":gray[{entry.get('source', '')}]")
+                return
+
+            digits = entry.get("digits", 2)
+            unit = entry.get("unit", "")
+            delta = entry.get("delta")
+
+            st.metric(
+                label=label,
+                value=f"{entry['value']:.{digits}f}{unit}",
+                delta=(
+                    f"{delta:+.{digits}f}{unit}" if delta is not None else None
+                ),
+                help=entry.get("why", ""),
+            )
+
+            meta_bits = []
+            if entry.get("status"):
+                color = entry.get("color", "gray")
+                meta_bits.append(f":{color}[**{entry['status']}**]")
+
+            as_of = entry.get("as_of")
+            if as_of is not None and hasattr(as_of, "strftime"):
+                meta_bits.append(f":gray[{as_of.strftime('%m-%d')} 기준]")
+
+            pct = entry.get("percentile")
+            if pct is not None:
+                meta_bits.append(f":gray[10y {pct:.0f}%]")
+
+            if meta_bits:
+                st.markdown(
+                    " · ".join(meta_bits),
+                    help="10y = 최근 10년 표본 내 백분위",
+                )
+
+
+def _build_rate_structure_chart(series: dict, targets: list[str]):
+    """
+    금리 구조 추이 차트.
+
+    [UI 수정] 이전에는 y축이 데이터 범위와 무관하게 -2~2로 잡혀 실제 변동이
+    납작하게 눌렸고, 범례가 우상단 제목과 겹쳤습니다. 데이터에 맞춰 y축을
+    잡고, 범례를 아래로 내리고, 10Y-3M이 음수인 구간(=역전)을 음영으로
+    표시해 침체 신호가 한눈에 보이게 했습니다.
+    """
+    colors = {"T10Y3M": "#F59E0B", "DFII10": "#60A5FA", "T10YIE": "#34D399"}
+
+    fig = go.Figure()
+    y_min, y_max = None, None
+
+    for sid in targets:
+        df = series[sid]
+        values = df[sid].dropna()
+        if values.empty:
+            continue
+
+        y_min = values.min() if y_min is None else min(y_min, values.min())
+        y_max = values.max() if y_max is None else max(y_max, values.max())
+
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df[sid],
+            mode="lines",
+            name=ADVANCED_SERIES[sid]["label"],
+            line=dict(color=colors.get(sid), width=2),
+            hovertemplate="%{y:.3f}%<extra>%{fullData.name}</extra>",
+        ))
+
+    # 역전 구간(10Y-3M < 0) 음영 — 침체 선행 신호를 눈으로 잡을 수 있게
+    if "T10Y3M" in targets:
+        spread = series["T10Y3M"]["T10Y3M"].dropna()
+        inverted = spread < 0
+        if inverted.any():
+            block_start = None
+            for ts, is_inv in inverted.items():
+                if is_inv and block_start is None:
+                    block_start = ts
+                elif not is_inv and block_start is not None:
+                    fig.add_vrect(
+                        x0=block_start, x1=ts,
+                        fillcolor="#EF4444", opacity=0.10,
+                        layer="below", line_width=0,
+                    )
+                    block_start = None
+            if block_start is not None:
+                fig.add_vrect(
+                    x0=block_start, x1=inverted.index[-1],
+                    fillcolor="#EF4444", opacity=0.10,
+                    layer="below", line_width=0,
+                )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#6B7280", opacity=0.8)
+
+    # y축을 데이터 범위 + 여백으로 한정 (기본 자동범위는 너무 넓게 잡힙니다)
+    if y_min is not None and y_max is not None:
+        pad = max((y_max - y_min) * 0.12, 0.1)
+        y_range = [y_min - pad, y_max + pad]
+    else:
+        y_range = None
+
+    fig.update_layout(
+        height=380,
+        margin=dict(l=10, r=10, t=10, b=10),
+        hovermode="x unified",
+        yaxis=dict(
+            title="%",
+            range=y_range,
+            gridcolor="rgba(255,255,255,0.06)",
+            zeroline=False,
+        ),
+        xaxis=dict(
+            title=None,
+            gridcolor="rgba(255,255,255,0.04)",
+            rangeslider=dict(visible=False),
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="top", y=-0.08,
+            xanchor="center", x=0.5,
+        ),
+    )
+    return fig
+
+
+def _render_advanced_macro_section() -> None:
+    """
+    심화 매크로 지표 섹션.
+
+    기존 화면이 답하지 못하던 세 질문을 메웁니다.
+      - 금리 상승이 "실질 긴축"인가 "인플레 기대"인가? → DFII10 / T10YIE
+      - 침체 신호는? → T10Y3M (뉴욕 연준 모델 기준)
+      - 신용 스트레스가 IG까지 번졌는가? → BAMLC0A0CM
+    """
+    st.subheader("🧭 심화 매크로 지표")
+    st.caption(
+        "명목금리·하이일드만으로는 보이지 않는 구조를 봅니다. "
+        "모두 FRED 공식 시계열이며, 수집 실패 시 값을 만들어내지 않습니다."
+    )
+
+    try:
+        result = get_advanced_macro_indicators()
+    except Exception as e:
+        st.warning(f"심화 지표를 불러오지 못했습니다: {e}", icon="⚠️")
+        return
+
+    latest = result.get("latest") or {}
+    if not latest:
+        st.info("심화 지표 데이터가 없습니다.")
+        return
+
+    # ----------------------------------------------------------- 카드 그리드
+    # 그룹 순서는 유지하되 레이아웃은 고정 3열입니다. 그룹마다 컬럼을
+    # 새로 만들면 항목 1개짜리 그룹이 화면 폭을 독차지합니다.
+    ordered = [latest[sid] for sid in ADVANCED_DISPLAY_ORDER if sid in latest]
+    # 정의에 없는 지표가 추가돼도 빠뜨리지 않습니다.
+    ordered += [e for sid, e in latest.items() if sid not in ADVANCED_DISPLAY_ORDER]
+
+    for row_start in range(0, len(ordered), _ADVANCED_COLS):
+        row = ordered[row_start: row_start + _ADVANCED_COLS]
+        cols = st.columns(_ADVANCED_COLS, gap="small")
+        for col, entry in zip(cols, row):
+            _render_advanced_card(col, entry)
+        for filler in cols[len(row):]:
+            filler.empty()
+
+    # ------------------------------------------------------- 금리 분해 해설
+    decomposition = (result.get("derived") or {}).get("decomposition")
+    if decomposition:
+        st.caption(
+            f"🧮 **금리 분해** — {decomposition}. "
+            "명목금리가 올라도 원인이 실질금리인지 기대인플레인지에 따라 "
+            "자산군 영향이 정반대입니다 "
+            "(실질금리↑ = 금·성장주 역풍, 기대인플레↑ = 실물·원자재 순풍)."
+        )
+
+    # ------------------------------------------------------------ 추이 차트
+    series = result.get("series") or {}
+    chart_targets = [
+        sid for sid in ("T10Y3M", "DFII10", "T10YIE")
+        if isinstance(series.get(sid), pd.DataFrame) and not series[sid].empty
+    ]
+
+    tab_chart, tab_guide = st.tabs(["📈 금리 구조 추이", "📘 해석 가이드"])
+
+    with tab_chart:
+        if not chart_targets:
+            st.info("차트를 그릴 시계열이 없습니다.")
+        else:
+            st.caption(
+                "붉은 음영은 10Y-3M 스프레드가 **역전(음수)** 된 구간입니다. "
+                "역사적으로 역전 이후 1~2년 내 침체가 뒤따른 사례가 많습니다."
+            )
+            st.plotly_chart(
+                _build_rate_structure_chart(series, chart_targets),
+                width="stretch",
+                config={"displayModeBar": False},
+            )
+
+    with tab_guide:
+        rows = []
+        for entry in ordered:
+            rows.append({
+                "지표": entry.get("label", entry["id"]),
+                "FRED ID": entry["id"],
+                "현재값": (
+                    f"{entry['value']:.{entry.get('digits', 2)}f}"
+                    f"{entry.get('unit', '')}"
+                    if entry.get("available") else "수집 실패"
+                ),
+                "상태": entry.get("status", "-"),
+                "왜 보는가": entry.get("why", ""),
+            })
+        st.dataframe(
+            pd.DataFrame(rows),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "왜 보는가": st.column_config.TextColumn(width="large"),
+            },
+        )
+
+        st.markdown(
+            "**임계치 요약** (역사적 분포 기반 참고치이며 투자 판단 근거가 "
+            "아닙니다)\n\n"
+            "| 지표 | 정상 | 경계 | 위험 |\n"
+            "|---|---|---|---|\n"
+            "| 10Y-3M 스프레드 | > +0.5%p | 0 ~ +0.5%p | 음수 (역전) |\n"
+            "| 10년 실질금리 | < 1.0% | 1.0 ~ 2.0% | > 2.0% |\n"
+            "| IG 스프레드 | 1.0 ~ 1.5% | 1.5 ~ 2.0% | > 2.0% |\n"
+            "| NFCI | < 0 | 0 ~ 0.5 | > 0.5 |"
+        )
 
 
 def render_macro_view(now_str_kst: str, refresh_interval: int):
@@ -237,7 +470,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         st.caption(f"최근 데이터 갱신 시각: {now_str_kst} (KST) | 갱신 주기: {refresh_interval}초")
     with header_right:
         st.write("")
-        with st.popover("📋 매크로 텍스트 브리핑 보기 / 복사", use_container_width=True):
+        with st.popover("📋 매크로 텍스트 브리핑 보기 / 복사", width="stretch"):
             st.markdown("**거시경제 매크로 지표 전체 원본 데이터**")
             st.caption(
                 "환율·국채·원자재·미국/아시아 지수·선물·장단기 금리차·"
@@ -249,7 +482,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
         with st.popover(
             "📚 전체 대시보드 원본 데이터 보기 / 복사",
-            use_container_width=True,
+            width="stretch",
         ):
             st.markdown("**AI 분석 없이 수집한 전체 대시보드 최신 원본 데이터**")
             st.caption(
@@ -262,7 +495,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             if st.button(
                 "🔄 전체 데이터 수집 및 텍스트 생성",
                 key="collect_dashboard_raw_snapshot",
-                use_container_width=True,
+                width="stretch",
             ):
                 with st.spinner("전체 대시보드 원본 데이터를 병렬 수집 중입니다..."):
                     snapshot = collect_dashboard_snapshot()
@@ -303,20 +536,40 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             row_items = items[row_start: row_start + MAX_COLS_PER_ROW]
             cols = st.columns(MAX_COLS_PER_ROW)
             for idx, item in enumerate(row_items):
-                # [수정] 미국채 금리 카테고리만 스크래핑 값으로 교체
-                if cat_name == BOND_CATEGORY_NAME:
-                    item = _override_with_scraper_bond(item, scraper_items_for_bonds)
-
+                # 미국채 카드의 TradingView 보정은 이미 수집 단계
+                # (macro_service._apply_bond_scanner_override)에서 끝났습니다.
+                # 여기서 한 번 더 덮어쓰면 같은 로직이 두 곳에 존재해
+                # 전일값 표기 문구가 서로 달라지는 문제가 생기므로
+                # 중복 보정을 제거했습니다.
                 display_name = inject_market_status(item["name"])
                 col = cols[idx]
                 if item["status"] == "ok":
+                    # [UI 버그 수정] delta에 "N/A" 문자열을 넘기면 Streamlit이
+                    # 숫자로 파싱하지 못한 채 **녹색 상승 화살표**로 그립니다.
+                    # 전일 종가를 모르는 미국채 카드가 "↑ N/A"로 보여서
+                    # 상승한 것처럼 읽혔습니다. 값이 없으면 delta를 아예
+                    # 넘기지 않고 캡션으로만 알립니다.
+                    delta_value = _usable_delta(item.get("delta_str"))
                     col.metric(
                         label=display_name,
                         value=item["price_str"],
-                        delta=item["delta_str"],
-                        help=f"직전 거래일 종가: {item['prev_str']}"
+                        delta=delta_value,
+                        help=f"직전 거래일 종가: {item['prev_str']}",
                     )
-                    extra_caption_parts = [f"전일 종가: `{item['prev_str']}`"]
+                    if delta_value is None:
+                        col.caption(":gray[전일 대비 미제공]")
+                    prev_label = f"전일 종가: `{item['prev_str']}`"
+                    prev_source = item.get("prev_source")
+                    if prev_source == "FRED 공식 확정치":
+                        # 현재가(TradingView 실시간)와 전일값(FRED 확정치)의
+                        # 출처가 다르다는 점을 반드시 밝힙니다.
+                        prev_label += " :gray[(FRED 확정치)]"
+                    elif prev_source == "일봉 직전 거래일 종가":
+                        # 분봉이 마지막 봉을 반복해 전일 대비를 못 줄 때,
+                        # 같은 심볼의 일봉에서 직전 거래일 종가를 가져온
+                        # 경우입니다. 현재가(분봉)와 기준이 다릅니다.
+                        prev_label += " :gray[(일봉 종가)]"
+                    extra_caption_parts = [prev_label]
                     if item.get("contract_month"):
                         extra_caption_parts.append(f"월물: `{item['contract_month']}`")
                     if item.get("source"):
@@ -355,9 +608,9 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         "실제로 사용하고 있습니다 (yfinance 일봉 지연 문제 회피)."
     )
 
-    scraper_result = get_scraped_macro_markets()
-    scraper_items = scraper_result.get("items", [])
-    scraper_updated_at = scraper_result.get(
+    # 위에서 이미 조회한 동일 캐시 결과를 재사용합니다.
+    scraper_items = list(scraper_result_for_bonds.get("items", []))
+    scraper_updated_at = scraper_result_for_bonds.get(
         "updated_at",
         "알 수 없음",
     )
@@ -494,7 +747,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         scraper_df = pd.DataFrame(scraper_rows)
         st.dataframe(
             scraper_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "현재값": st.column_config.NumberColumn(
@@ -655,7 +908,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     st.dataframe(
         pd.DataFrame(SPREAD_TABLE_DATA),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -715,7 +968,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             )
             st.plotly_chart(
                 fig_spread,
-                use_container_width=True,
+                width="stretch",
             )
 
     st.divider()
@@ -915,7 +1168,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             )
             st.plotly_chart(
                 fig_spread_30,
-                use_container_width=True,
+                width="stretch",
             )
 
     st.divider()
@@ -946,10 +1199,29 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             m_delta = m_curr - m_prev
             m_pct = (m_delta / m_prev) * 100 if m_prev != 0 else 0.0
             m_status, m_color = ("안정", "green") if m_curr < 80 else ("정상", "blue") if m_curr <= 120 else ("경계", "orange") if m_curr <= 140 else ("위기", "red")
-            st.metric("ICE BofA MOVE (채권 변동성) :gray[[지연/마감]]", f"{m_curr:.2f}", f"{m_delta:+.2f} ({m_pct:+.2f}%)")
+
+            # Yahoo Finance는 실제 ICE BofA MOVE 지수를 제공하지 않습니다.
+            # macro_service가 ^TNX 변동성으로 역산한 대용치를 쓰고 있으므로,
+            # 라벨과 캡션에서 "추정치"임을 분명히 밝힙니다.
+            is_move_proxy = bool(move_hist.attrs.get("is_proxy"))
+            move_label = (
+                "MOVE 대용 추정치 (채권 변동성) :gray[[비공식 추정]]"
+                if is_move_proxy
+                else "ICE BofA MOVE (채권 변동성) :gray[[지연/마감]]"
+            )
+
+            st.metric(move_label, f"{m_curr:.2f}", f"{m_delta:+.2f} ({m_pct:+.2f}%)")
             st.markdown(f"상태: :{m_color}[**{m_status}**] (전일: `{m_prev:.2f}`)")
+
+            if is_move_proxy:
+                st.caption(
+                    "⚠️ 실제 ICE BofA MOVE 지수가 아닙니다. "
+                    f"`{move_hist.attrs.get('source_label', '추정치')}`. "
+                    "아래 임계치 해석 표(80/120/140)는 실제 MOVE 기준이므로 "
+                    "이 추정치에 그대로 적용하지 마세요."
+                )
         else:
-            st.metric("ICE BofA MOVE", "로드 실패")
+            st.metric("MOVE (채권 변동성)", "로드 실패")
 
     with col_h:
         if hy_df is not None and len(hy_df) >= 2:
@@ -989,7 +1261,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             st.metric("STLFSI4 금융스트레스지수", "로드 실패")
 
     st.markdown("#### 📖 신용, 은행권 및 변동성 핵심 해석 기준표")
-    st.dataframe(pd.DataFrame(RISK_MODEL_TABLE), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(RISK_MODEL_TABLE), width="stretch", hide_index=True)
 
     st.markdown("#### 📈 위험 지표 상세 과거 추이")
     risk_tab1, risk_tab2, risk_tab3, risk_tab4 = st.tabs([
@@ -1004,9 +1276,9 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             fig_vol = go.Figure()
             fig_vol.add_trace(go.Scatter(x=v_chart.index, y=v_chart['Close'], mode='lines', name='VIX (주식 변동성)', line=dict(color='#FF5722', width=2)))
             if m_chart is not None and not m_chart.empty:
-                fig_vol.add_trace(go.Scatter(x=m_chart.index, y=m_chart['Close'], mode='lines', name='MOVE (채권 변동성)', line=dict(color='#3F51B5', width=2), yaxis="y2"))
+                fig_vol.add_trace(go.Scatter(x=m_chart.index, y=m_chart['Close'], mode='lines', name='MOVE 대용 추정치 (채권 변동성)', line=dict(color='#3F51B5', width=2), yaxis="y2"))
             fig_vol.update_layout(
-                title=f"VIX 및 MOVE 지수 비교 추이 ({vix_period})",
+                title=f"VIX(실제) 및 MOVE 대용 추정치 비교 추이 ({vix_period})",
                 xaxis_title="일자",
                 yaxis=dict(title=dict(text="VIX (pt)", font=dict(color="#FF5722")), tickfont=dict(color="#FF5722")),
                 yaxis2=dict(title=dict(text="MOVE (pt)", font=dict(color="#3F51B5")), tickfont=dict(color="#3F51B5"), overlaying="y", side="right"),
@@ -1014,7 +1286,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                 margin=dict(l=20, r=20, t=40, b=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
-            st.plotly_chart(fig_vol, use_container_width=True)
+            st.plotly_chart(fig_vol, width="stretch")
 
     with risk_tab2:
         if hy_df is not None and not hy_df.empty:
@@ -1026,7 +1298,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             fig_hy.add_hline(y=5.0, line_dash="dot", line_color="orange", annotation_text="경계선 (5.0%p)")
             fig_hy.add_hline(y=7.0, line_dash="dash", line_color="red", annotation_text="위기/침체선 (7.0%p)")
             fig_hy.update_layout(title=f"미국 하이일드 채권 스프레드 (HY OAS) 추이 (최근 {hy_period_years}년)", xaxis_title="일자", yaxis_title="스프레드 (%p)", hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20))
-            st.plotly_chart(fig_hy, use_container_width=True)
+            st.plotly_chart(fig_hy, width="stretch")
 
     with risk_tab3:
         if cp_spread_df is not None and not cp_spread_df.empty:
@@ -1038,7 +1310,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             fig_cp.add_hline(y=0.50, line_dash="dot", line_color="orange", annotation_text="주의선 (0.50%p)")
             fig_cp.add_hline(y=0.80, line_dash="dash", line_color="red", annotation_text="위기 경계선 (0.80%p)")
             fig_cp.update_layout(title=f"3개월 금융 CP 스프레드 추이 (현대판 TED 스프레드, 최근 {cp_period_years}년)", xaxis_title="일자", yaxis_title="스프레드 (%p)", hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20))
-            st.plotly_chart(fig_cp, use_container_width=True)
+            st.plotly_chart(fig_cp, width="stretch")
 
     with risk_tab4:
         if stlfsi_df is not None and not stlfsi_df.empty:
@@ -1050,7 +1322,14 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
             fig_fsi.add_hline(y=0.0, line_dash="dash", line_color="white", opacity=0.8, annotation_text="평균 기준선 (0.0 pt)")
             fig_fsi.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="시스템 위기 경보선 (+1.0 pt)")
             fig_fsi.update_layout(title=f"세인트루이스 연준 금융스트레스지수 (STLFSI4) 추이 (최근 {fsi_period_years}년)", xaxis_title="일자", yaxis_title="스트레스 지수 (pt)", hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20))
-            st.plotly_chart(fig_fsi, use_container_width=True)
+            st.plotly_chart(fig_fsi, width="stretch")
+
+    st.divider()
+
+    # ==========================================================================
+    # 3-1. 심화 매크로 지표
+    # ==========================================================================
+    _render_advanced_macro_section()
 
     st.divider()
 
@@ -1074,7 +1353,7 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name=clean_tag_ui(selected_name), line=dict(color='#0066FF', width=2)))
         fig.update_layout(title=f"{clean_tag_ui(selected_name)} ({selected_symbol}) 상세 차트", xaxis_title="일자", yaxis_title="수치/가격", hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.divider()
 
@@ -1094,6 +1373,19 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
 
     if multi_selected:
         fig_multi = go.Figure()
+
+        # [버그 수정] y_title은 기존에 루프 안에서만 대입됐습니다. 선택한
+        # 지표가 전부 수집 실패하면(야후 레이트리밋·휴장·심볼 변경 등)
+        # 루프 본문이 한 번도 실행되지 않아 아래 update_layout에서
+        # UnboundLocalError가 나고 매크로 페이지 전체가 죽었습니다.
+        # y_title은 데이터가 아니라 norm_mode에만 의존하므로 루프 밖에서
+        # 한 번만 결정합니다.
+        is_normalized = norm_mode == "수익률/변동률(%) 기준"
+        y_title = (
+            "기준일 대비 누적 변동률 (%)" if is_normalized else "실제 수치 / 가격"
+        )
+
+        plotted_count = 0
         for name in multi_selected:
             sym = ALL_TICKERS[name]
             m_df = fetch_ticker_data(sym, period=multi_period)
@@ -1101,14 +1393,19 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                 y_data = m_df['Close']
                 if "JPY/KRW" in name and y_data.iloc[-1] < 50:
                     y_data = y_data * 100
-                if norm_mode == "수익률/변동률(%) 기준":
+                if is_normalized:
                     base_val = y_data.iloc[0]
                     y_data = ((y_data - base_val) / base_val) * 100 if base_val != 0 else y_data
-                    y_title = "기준일 대비 누적 변동률 (%)"
-                else:
-                    y_title = "실제 수치 / 가격"
                 fig_multi.add_trace(go.Scatter(x=m_df.index, y=y_data, mode='lines', name=clean_tag_ui(name), line=dict(width=2)))
-        fig_multi.update_layout(title=f"다중 지표 비교 추이 ({multi_period} 기준)", xaxis_title="일자", yaxis_title=y_title, hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        if norm_mode == "수익률/변동률(%) 기준":
-            fig_multi.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.7)
-        st.plotly_chart(fig_multi, use_container_width=True)
+                plotted_count += 1
+
+        if plotted_count == 0:
+            st.warning(
+                "선택한 지표를 하나도 불러오지 못했습니다. "
+                "잠시 후 다시 시도하거나 다른 지표를 선택해 주세요."
+            )
+        else:
+            fig_multi.update_layout(title=f"다중 지표 비교 추이 ({multi_period} 기준)", xaxis_title="일자", yaxis_title=y_title, hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+            if is_normalized:
+                fig_multi.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.7)
+            st.plotly_chart(fig_multi, width="stretch")

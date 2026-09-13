@@ -9,61 +9,16 @@ import io
 import logging
 import numpy as np
 import pandas as pd
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import streamlit as st
 
+# FRED 키 로더와 세션은 프로젝트 전체에서 하나만 씁니다.
+# (기존에는 macro_service / liquidity_service에 같은 get_fred_key()가
+#  중복 정의되어 있었고, 세션은 요청마다 새로 생성됐습니다.)
+from config import get_fred_key
+from services.http_client import get_fred_session
+from services import datasets, store
+
 logger = logging.getLogger(__name__)
-
-
-def get_fred_key() -> str:
-    """
-    Streamlit Secrets에서 FRED API 키를 안전하게 추출.
-    dict, AttrDict, Mapping 등 어떤 타입으로 반환되든 .get()으로 시도하며,
-    isinstance(val, dict) 검사에 의존하지 않음.
-    """
-    try:
-        if hasattr(st, "secrets") and st.secrets:
-            if "fred" in st.secrets:
-                section = st.secrets["fred"]
-
-                key = None
-                try:
-                    key = section.get("api_key")
-                except AttributeError:
-                    pass
-
-                if key:
-                    return str(key).strip()
-
-                if isinstance(section, str):
-                    return section.strip()
-
-            for k in ["FRED_API_KEY", "fred_api_key", "FRED_KEY", "fred_key"]:
-                if k in st.secrets:
-                    return str(st.secrets[k]).strip()
-    except Exception as e:
-        logger.warning(f"FRED 키 로드 중 예외: {e}")
-    return ""
-
-
-def get_fred_session() -> requests.Session:
-    """FRED 403 차단 방어용 세션 생성기"""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
-    })
-    retries = Retry(
-        total=3,
-        backoff_factor=1.0,
-        status_forcelist=[403, 429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    return session
 
 
 def _parse_fred_csv(csv_text: str, series_id: str) -> pd.DataFrame:
@@ -184,8 +139,7 @@ def fetch_fred_series_raw(series_id: str, period_years: int = 10) -> tuple[pd.Da
     return fallback_df, True
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_fed_liquidity_data(period_years: int = 10) -> pd.DataFrame:
+def collect_fed_liquidity_data(period_years: int = 10) -> pd.DataFrame:
     """
     연준 순유동성(Net Liquidity = WALCL - WTREGEN - ON_RRP) 시계열 데이터프레임 생성
     단위: WALCL($M), WTREGEN($M), ON_RRP($B -> $M 변환 후 차감)
@@ -254,6 +208,52 @@ def get_fed_liquidity_data(period_years: int = 10) -> pd.DataFrame:
     combined['is_estimated'] = any_estimated
 
     return combined
+
+
+# ==============================================================================
+# 저장본 우선 읽기 경로
+# ==============================================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_fed_liquidity_data(period_years: int = 10) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본이 신선하면 그것을 쓰고, 아니면 직접 수집 후 저장합니다.
+
+    순유동성은 FRED 3개 시계열(WALCL/WTREGEN/RRPONTSYD)을 합성해 만들며,
+    주간 갱신이라 하루에 몇 번만 수집해도 충분합니다.
+    """
+    def _collect():
+        df = collect_fed_liquidity_data(period_years)
+        # ⚠️ is_estimated=True는 FRED 접속 실패 시의 통계적 추정치입니다.
+        # 누적 이력에 섞이면 실제 연준 대차대조표와 구분할 수 없게 되므로
+        # 절대 저장하지 않습니다.
+        is_estimated = (
+            "is_estimated" in df.columns and bool(df["is_estimated"].any())
+            if df is not None and not df.empty else False
+        )
+        if df is not None and not df.empty and not is_estimated:
+            try:
+                store.put_frame_as_timeseries(
+                    datasets.TS_LIQUIDITY,
+                    df,
+                    columns=["WALCL", "WTREGEN", "RRP_M", "Net_Liquidity_M"],
+                )
+            except Exception as e:
+                logger.warning("순유동성 누적 저장 실패: %s", e)
+        return df
+
+    df = store.cached_or_live(
+        datasets.SNAP_FED_LIQUIDITY,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_DAILY,
+        as_frame=True,
+        # views/liquidity_view.py가 기대하는 핵심 컬럼들
+        required_columns=(
+            "WALCL", "WTREGEN", "RRP_M", "RRP_B",
+            "Net_Liquidity_M", "Net_Liquidity_T", "Net_Liquidity",
+            "WALCL_T", "WTREGEN_B", "Date", "is_estimated",
+        ),
+    )
+    return df if df is not None else pd.DataFrame()
 
 
 # 별칭 지원

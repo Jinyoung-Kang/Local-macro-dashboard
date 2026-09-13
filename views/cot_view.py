@@ -15,6 +15,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from services import store
 from services.cot_service import fetch_cftc_cot_legacy, CFTCTransientError, COT_ASSETS
 
 
@@ -84,8 +85,18 @@ def render_cot_view():
         st.caption(f"⏰ 시스템 현재 시각: {now_str}")
     with col3:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        if st.button("🔄 최신 데이터 새로고침", use_container_width=True):
+        if st.button("🔄 최신 데이터 새로고침", width="stretch"):
+            # [버그 수정] st.cache_data.clear()만으로는 아직 신선한 SQLite
+            # 저장본이 그대로 반환돼 화면이 전혀 바뀌지 않았습니다.
+            # request_refresh()가 저장본을 낡은 것으로 만들어 실제로 다시
+            # 수집하게 합니다.
+            store.request_refresh()
             st.cache_data.clear()
+            if store.get_read_mode() == store.READ_MODE_STORE_ONLY:
+                st.toast(
+                    "store_only 모드입니다. 저장본만 다시 읽었습니다.",
+                    icon="ℹ️",
+                )
             st.rerun()
 
     weeks_to_fetch = 156
@@ -250,7 +261,7 @@ def render_cot_view():
     fig.update_yaxes(title_text="순포지션 (계약)", row=1, col=1, gridcolor="#21262D")
     fig.update_yaxes(title_text="순포지션 (계약)", row=2, col=1, gridcolor="#21262D")
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     with st.expander("📄 COT 원본 데이터 (최근 15주)", expanded=False):
         df_display = df.tail(15).sort_values(by="date", ascending=False).copy()
@@ -259,6 +270,6 @@ def render_cot_view():
             df_display[col] = df_display[col].apply(lambda x: f"{int(x):,}")
         st.dataframe(
             df_display[["date", "nc_net", "nc_long", "nc_short", "comm_net", "comm_long", "comm_short"]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )

@@ -12,20 +12,14 @@ from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 
+from services.http_client import BROWSER_HEADERS, get_session
+from services import datasets, store
+
 logger = logging.getLogger(__name__)
 
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,*/*;q=0.8"
-    ),
-}
+# 공용 세션이 이미 브라우저 UA/Accept 헤더를 들고 있습니다.
+# 외부에서 이 상수를 참조하던 코드를 위해 별칭만 유지합니다.
+REQUEST_HEADERS = BROWSER_HEADERS
 
 
 
@@ -45,6 +39,9 @@ TRADINGVIEW_SYMBOL_SCANNER_URL = (
 TRADINGVIEW_BONDS_SCANNER_PARAMS = {
     "label-product": "bonds-yield-curve",
 }
+
+# 미국채 보강 대상 (bonds scanner / Symbol Scanner 공통)
+TREASURY_KEYS = ("us02y", "us10y", "us30y")
 
 TRADINGVIEW_US_TREASURY_SYMBOLS = {
     "TVC:US02Y": "us02y",
@@ -171,11 +168,8 @@ def _is_in_range(
 
 def _fetch_html(url: str) -> str:
     """TradingView 공개 페이지 HTML을 수집합니다."""
-    response = requests.get(
-        url,
-        headers=REQUEST_HEADERS,
-        timeout=10,
-    )
+    # HTML 페이지 수집은 브라우저 헤더를 명시적으로 보냅니다.
+    response = get_session().get(url, headers=BROWSER_HEADERS, timeout=10)
     response.raise_for_status()
     return response.text
 
@@ -194,11 +188,7 @@ def _fetch_yahoo_chart(
         f"{symbol}?range=10d&interval=1d&includePrePost=false"
     )
 
-    response = requests.get(
-        url,
-        headers=REQUEST_HEADERS,
-        timeout=10,
-    )
+    response = get_session().get(url, timeout=10)
     response.raise_for_status()
 
     payload = response.json()
@@ -248,10 +238,9 @@ def _fetch_tradingview_symbol_snapshot(
     }
 
     try:
-        response = requests.get(
+        response = get_session().get(
             TRADINGVIEW_SYMBOL_SCANNER_URL,
             params=params,
-            headers=REQUEST_HEADERS,
             timeout=10,
         )
         response.raise_for_status()
@@ -309,10 +298,9 @@ def _fetch_tradingview_us_treasury_yields() -> dict:
     d[4]는 해당 만기의 최신 수익률(%)입니다.
     """
     try:
-        response = requests.get(
+        response = get_session().get(
             TRADINGVIEW_BONDS_SCANNER_URL,
             params=TRADINGVIEW_BONDS_SCANNER_PARAMS,
-            headers=REQUEST_HEADERS,
             timeout=10,
         )
         response.raise_for_status()
@@ -337,11 +325,11 @@ def _fetch_tradingview_us_treasury_yields() -> dict:
 
             values = row.get("d", [])
             if not isinstance(values, list) or len(values) < 5:
-                logger.warning(
-                    "TradingView bonds scanner 응답 형식이 예상과 다릅니다: "
-                    "symbol=%s, data=%s",
-                    symbol,
-                    values,
+                # 행마다 경고를 찍으면 매 수집마다 로그가 도배됩니다.
+                # 아래 요약 한 줄로 충분하므로 상세는 debug로 내립니다.
+                logger.debug(
+                    "TradingView bonds scanner 행 형식 불일치: symbol=%s, d=%s",
+                    symbol, values,
                 )
                 continue
 
@@ -362,11 +350,15 @@ def _fetch_tradingview_us_treasury_yields() -> dict:
                 "symbol": symbol,
             }
 
-        expected_keys = {"us02y", "us10y", "us30y"}
-        missing_keys = expected_keys - set(result.keys())
+        missing_keys = set(TREASURY_KEYS) - set(result.keys())
         if missing_keys:
-            logger.warning(
-                "TradingView bonds scanner 일부 만기 수집 실패: missing=%s",
+            # bonds scanner는 "있으면 좋은" 보조 출처입니다. 실패해도
+            # Symbol Scanner와 HTML 파서, 그리고 화면의 FRED 폴백이
+            # 값을 채우므로 info 수준으로 남깁니다.
+            # (2026-09 기준 TradingView가 d=[]를 돌려주는 상태입니다.)
+            logger.info(
+                "TradingView bonds scanner 미수집: %s "
+                "— Symbol Scanner/HTML 파서로 대체합니다.",
                 sorted(missing_keys),
             )
 
@@ -388,10 +380,15 @@ def _extract_previous_close(text: str) -> float | None:
     TradingView의 Previous close 값을 추출합니다.
     페이지 언어·레이아웃 차이를 고려해 여러 패턴을 시도합니다.
     """
+    # [버그 수정] 기존 패턴은 raw 문자열 안에 \\n / \\d 처럼 백슬래시를 한 번 더
+    # 이스케이프해 두어, 문자 클래스가 "숫자"가 아니라 literal 백슬래시·n·r·s·d
+    # 를 뜻했습니다. 그 결과 이 함수는 어떤 입력에도 절대 매칭되지 않아
+    # 항상 None을 반환했고, TradingView 카드의 전일 종가·등락률이 영구히
+    # "미제공"으로 표시됐습니다. \s, \d 로 정정합니다.
+    # (re.IGNORECASE를 쓰므로 close/Close 패턴을 따로 둘 필요도 없습니다.)
     patterns = [
-        r"Previous\s+close\s*[\\n\\r\\s]*([\\d,]+(?:\\.\\d+)?)",
-        r"Previous\s+Close\s*[\\n\\r\\s]*([\\d,]+(?:\\.\\d+)?)",
-        r"전일\s*종가\s*[\\n\\r\\s]*([\\d,]+(?:\\.\\d+)?)",
+        r"Previous\s+close\s*[\s]*([\d,]+(?:\.\d+)?)",
+        r"전일\s*종가\s*[\s]*([\d,]+(?:\.\d+)?)",
     ]
 
     for pattern in patterns:
@@ -443,123 +440,6 @@ def _extract_tradingview_change(
         change_pct = -change_pct
 
     return change, change_pct
-
-
-def _parse_tradingview_oil(
-    text: str,
-) -> tuple[float | None, float | None]:
-    """
-    TradingView USOIL/UKOIL 전용 파서.
-
-    TradingView 페이지 텍스트는 시점·지역·렌더링 상태에 따라
-    다음과 같이 조금씩 다른 형식으로 내려올 수 있습니다.
-
-    - Market open\\n85.35USD / BLLR
-    - Market closed\\n88.28USD / BLLR
-    - 85.35RUSD / BLL
-    - 88.28RUSD / BLL
-    - Previous close\\n83.45 USD
-
-    R은 TradingView 텍스트 추출 과정에서 섞이는 렌더링 구분 문자입니다.
-    이 함수를 거치면 먼저 R 구분자를 정규화하고, 실제 원유 가격 범위
-    (20~250 USD/bbl)를 검증해 페이지 내부의 다른 숫자를 오인하지 않습니다.
-
-    반환:
-        (현재가, 전일 종가)
-    """
-    if not text:
-        return None, None
-
-    # TradingView 텍스트의 렌더링 구분 문자(R)를 단위 주변에서 정규화.
-    # 숫자 자체의 R은 가격 표시에 쓰이는 구분 문자이므로 제거해도 무방합니다.
-    normalized = text.replace("RUSD", " USD")
-    normalized = normalized.replace("BLLR", "BLL")
-    normalized = normalized.replace("RHKD", " HKD")
-    normalized = normalized.replace("RJPY", " JPY")
-    normalized = normalized.replace("RPOINT", " POINT")
-
-    # 1차: Market open/closed 뒤의 현재가를 가장 신뢰도 높게 추출.
-    market_patterns = [
-        r"Market\s+(?:open|closed)\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD\s*/\s*BLL",
-
-        r"Market\s+(?:open|closed)\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD",
-    ]
-
-    current = None
-
-    for pattern in market_patterns:
-        match = re.search(
-            pattern,
-            normalized,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            candidate = _to_float(match.group(1))
-            if _is_in_range(candidate, 20.0, 250.0):
-                current = candidate
-                break
-
-    # 2차: 페이지 전체에서 '가격 + USD / BLL' 조합을 찾아
-    # 현실적 가격 범위를 통과한 첫 번째 값을 사용.
-    if current is None:
-        oil_candidates = re.findall(
-            r"([0-9][0-9,\.\s]*)\s*USD\s*/\s*BLL",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-
-        for raw_value in oil_candidates:
-            candidate = _to_float(raw_value)
-            if _is_in_range(candidate, 20.0, 250.0):
-                current = candidate
-                break
-
-    # 3차: 일부 HTML 응답은 USD / BLL 앞 단위 사이에 공백/줄바꿈이 다르게
-    # 섞일 수 있으므로 더 느슨한 보조 패턴을 사용.
-    if current is None:
-        loose_candidates = re.findall(
-            r"([0-9]{2,3}(?:\.\d+)?)\s*USD",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-
-        for raw_value in loose_candidates:
-            candidate = _to_float(raw_value)
-            if _is_in_range(candidate, 20.0, 250.0):
-                current = candidate
-                break
-
-    # 전일 종가 파싱.
-    previous_patterns = [
-        r"Previous\s+close\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD",
-
-        r"Previous\s+Close\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD",
-
-        r"전일\s*종가\s*"
-        r"([0-9][0-9,\.\s]*)\s*USD",
-    ]
-
-    previous = None
-
-    for pattern in previous_patterns:
-        match = re.search(
-            pattern,
-            normalized,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            candidate = _to_float(match.group(1))
-            if _is_in_range(candidate, 20.0, 250.0):
-                previous = candidate
-                break
-
-    return current, previous
-
-
 def _parse_tradingview_hsi(
     text: str,
 ) -> tuple[float | None, float | None]:
@@ -715,126 +595,21 @@ def _parse_tradingview(
         change = current - previous
 
     return current, previous, change, change_pct
-
-
-def _parse_investing(
-    text: str,
-) -> tuple[float | None, float | None, float | None, float | None]:
+def _derive_change(
+    price: float | None,
+    previous_close: float | None,
+) -> tuple[float | None, float | None]:
     """
-    Investing.com 공개 페이지에서 현재가, 전일 종가,
-    등락폭 및 등락률을 추출합니다.
+    현재가와 전일 종가로 등락폭·등락률을 계산합니다.
+
+    전일 종가를 모르거나 0이면, "변화 없음(0.00%)"으로 위장하지 않고
+    둘 다 None으로 두어 화면에서 N/A로 표시되게 합니다.
     """
-    current_patterns = [
-        r"(?:live\s+(?:stock\s+)?price\s+is)\s*"
-        r"([\d,]+(?:\.\d+)?)",
+    if price is None or previous_close is None or previous_close == 0:
+        return None, None
 
-        r"Currency\s+in\s+[A-Z]{3}\s*[\n\r\s]+"
-        r"([\d,]+(?:\.\d+)?)",
-
-        r"실시간\s*(?:지수|주가).*?"
-        r"([\d,]+(?:\.\d+)?)에\s*(?:마감|거래|닫음)",
-
-        r"통화\s+\w+\s*[\n\r\s]+"
-        r"([\d,]+(?:\.\d+)?)",
-
-        r"\n([\d,]+(?:\.\d+)?)\s*\n"
-        r"[+\-−]\s*[\d,]+(?:\.\d+)?\s*\(",
-    ]
-
-    current = None
-    for pattern in current_patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            current = _to_float(match.group(1))
-            if current is not None:
-                break
-
-    previous_patterns = [
-        r"Prev\.?\s*Close\s*[\n\r\s\-\*]*"
-        r"([\d,]+(?:\.\d+)?)",
-
-        r"Previous\s+Close\s*[\n\r\s\-\*]*"
-        r"([\d,]+(?:\.\d+)?)",
-
-        r"전일\s*종가\s*[\n\r\s\-\*]*"
-        r"([\d,]+(?:\.\d+)?)",
-    ]
-
-    previous = None
-    for pattern in previous_patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            previous = _to_float(match.group(1))
-            if previous is not None:
-                break
-
-    change_pattern = (
-        r"([+\-−])\s*([\d,]+(?:\.\d+)?)\s*"
-        r"\(\s*([+\-−])?\s*([\d,]+(?:\.\d+)?)%\s*\)"
-    )
-
-    change = None
-    change_pct = None
-
-    match = re.search(
-        change_pattern,
-        text,
-        flags=re.MULTILINE,
-    )
-    if match:
-        change = _to_float(match.group(2))
-        change_pct = _to_float(match.group(4))
-
-        if (
-            change is not None
-            and match.group(1) in ["-", "−"]
-        ):
-            change = -change
-
-        if (
-            change_pct is not None
-            and match.group(3) in ["-", "−"]
-        ):
-            change_pct = -change_pct
-
-    # 전일 종가를 직접 읽지 못했지만 변화율은 있을 경우 역산
-    if (
-        previous is None
-        and current is not None
-        and change_pct is not None
-        and change_pct != -100
-    ):
-        previous = current / (1 + change_pct / 100)
-
-    # 변화율이 없고 현재가/전일 종가가 있으면 계산
-    if (
-        change_pct is None
-        and current is not None
-        and previous not in (None, 0)
-    ):
-        change_pct = (
-            (current - previous)
-            / previous
-            * 100
-        )
-
-    # 등락폭이 없고 현재가/전일 종가가 있으면 계산
-    if (
-        change is None
-        and current is not None
-        and previous is not None
-    ):
-        change = current - previous
-
-    return current, previous, change, change_pct
+    change = price - previous_close
+    return change, (change / previous_close) * 100
 
 
 def _collect_one_market(config: dict) -> dict:
@@ -870,55 +645,14 @@ def _collect_one_market(config: dict) -> dict:
             price, previous_close = _fetch_yahoo_chart(
                 config["symbol"]
             )
-            change = (
-                price - previous_close
-                if price is not None
-                and previous_close is not None
-                else None
-            )
-            change_pct = (
-                (change / previous_close) * 100
-                if change is not None
-                and previous_close not in (None, 0)
-                else None
-            )
+            change, change_pct = _derive_change(price, previous_close)
 
         else:
             html = _fetch_html(config["url"])
 
-            if kind in {"tradingview_usoil", "tradingview_ukoil"}:
-                price, previous_close = _parse_tradingview_oil(
-                    html
-                )
-                change = (
-                    price - previous_close
-                    if price is not None
-                    and previous_close is not None
-                    else None
-                )
-                change_pct = (
-                    (change / previous_close) * 100
-                    if change is not None
-                    and previous_close not in (None, 0)
-                    else None
-                )
-
-            elif kind == "tradingview_hsi":
-                price, previous_close = _parse_tradingview_hsi(
-                    html
-                )
-                change = (
-                    price - previous_close
-                    if price is not None
-                    and previous_close is not None
-                    else None
-                )
-                change_pct = (
-                    (change / previous_close) * 100
-                    if change is not None
-                    and previous_close not in (None, 0)
-                    else None
-                )
+            if kind == "tradingview_hsi":
+                price, previous_close = _parse_tradingview_hsi(html)
+                change, change_pct = _derive_change(price, previous_close)
 
             elif kind.startswith("tradingview"):
                 (
@@ -930,14 +664,6 @@ def _collect_one_market(config: dict) -> dict:
                     html,
                     kind,
                 )
-
-            elif kind == "investing_index":
-                (
-                    price,
-                    previous_close,
-                    change,
-                    change_pct,
-                ) = _parse_investing(html)
 
             else:
                 result["error"] = (
@@ -972,10 +698,13 @@ def _collect_one_market(config: dict) -> dict:
         return result
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_scraped_macro_markets() -> dict:
+def collect_scraped_macro_markets() -> dict:
     """
-    외부 참고 시세를 병렬 수집합니다.
+    외부 참고 시세를 실제로 병렬 수집합니다 (항상 네트워크를 씁니다).
+
+    화면에서 직접 부르지 마세요. 화면은 저장본을 우선 읽는
+    get_scraped_macro_markets()를 사용하고, 이 함수는 collector.py가
+    주기적으로 호출합니다.
 
     반환:
     {
@@ -985,7 +714,24 @@ def get_scraped_macro_markets() -> dict:
     """
     results = []
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # [성능] 기존에는 max_workers=4로 10개 소스를 돌려 3라운드에 걸쳐
+    # 직렬화됐고, bonds scanner 요청은 풀이 닫힌 뒤 별도로 한 번 더
+    # 순차 실행됐습니다. 전부 네트워크 대기(I/O bound)이므로 한 번에
+    # 띄워 총 소요시간을 "가장 느린 한 건"으로 줄입니다.
+    with ThreadPoolExecutor(max_workers=len(SCRAPER_MARKETS) + 1) as executor:
+        scanner_future = executor.submit(
+            _fetch_tradingview_us_treasury_yields
+        )
+
+        # [추가] bonds scanner는 "현재 수익률"만 주고 전일 종가가 없어서,
+        # 화면의 미국채 카드가 계속 "전일 종가 N/A · 전일비 미제공"으로
+        # 표시됐습니다. Symbol Scanner는 change/change_abs를 주므로
+        # 전일 종가를 역산할 수 있습니다(KOSPI에서 이미 쓰는 경로).
+        symbol_futures = {
+            key: executor.submit(_fetch_tradingview_symbol_snapshot, symbol)
+            for symbol, key in TRADINGVIEW_US_TREASURY_SYMBOLS.items()
+        }
+
         future_map = {
             executor.submit(
                 _collect_one_market,
@@ -1014,52 +760,95 @@ def get_scraped_macro_markets() -> dict:
                     "error": str(e),
                 })
 
-    # --------------------------------------------------------------------------
-    # 미국채 2Y / 10Y / 30Y는 TradingView HTML 정규표현식 파싱 결과보다
-    # 공개 bonds scanner JSON을 우선 사용합니다.
-    # Scanner 요청이 실패하면 기존 HTML 수집 결과를 그대로 유지합니다.
-    # --------------------------------------------------------------------------
-    scanner_yields = _fetch_tradingview_us_treasury_yields()
+        # --------------------------------------------------------------------
+        # 미국채 2Y / 10Y / 30Y는 TradingView HTML 정규표현식 파싱 결과보다
+        # 공개 bonds scanner JSON을 우선 사용합니다.
+        # Scanner 요청이 실패하면 기존 HTML 수집 결과를 그대로 유지합니다.
+        # --------------------------------------------------------------------
+        try:
+            scanner_yields = scanner_future.result()
+        except Exception as e:
+            logger.warning("TradingView bonds scanner 조회 실패: %s", e)
+            scanner_yields = {}
 
-    if scanner_yields:
-        for item in results:
-            scraper_key = item.get("key")
-            if scraper_key not in scanner_yields:
-                continue
+        treasury_changes: dict[str, tuple] = {}
+        for key, fut in symbol_futures.items():
+            try:
+                treasury_changes[key] = fut.result()
+            except Exception as e:
+                logger.warning(
+                    "TradingView Symbol Scanner 조회 실패 (%s): %s", key, e,
+                )
 
-            scanner_item = scanner_yields[scraper_key]
+    # --------------------------------------------------------------------------
+    # 미국채 보강.
+    #
+    # [버그 수정] 예전에는 이 블록 전체가 `if scanner_yields:` 안에 있어서,
+    # bonds scanner가 실패하면(현재 TradingView가 d=[]를 돌려주는 상태)
+    # **Symbol Scanner로 받아 둔 전일 종가까지 통째로 버려졌습니다.**
+    # 두 출처는 서로 독립이므로 각각 있는 만큼만 반영합니다.
+    #
+    # 현재가 우선순위 : bonds scanner → Symbol Scanner → HTML 파서
+    # 전일 종가 우선순위: Symbol Scanner → HTML 파서
+    # --------------------------------------------------------------------------
+    for item in results:
+        scraper_key = item.get("key")
+        if scraper_key not in TREASURY_KEYS:
+            continue
+
+        sym = treasury_changes.get(scraper_key) or (None, None, None, None)
+        sym_price, sym_prev, _sym_chg, _sym_pct = sym
+
+        # ---- 현재가 -----------------------------------------------------
+        current_price = item.get("price")
+        scanner_item = scanner_yields.get(scraper_key)
+
+        if scanner_item and scanner_item.get("price") is not None:
             current_price = scanner_item["price"]
-            previous_close = item.get("previous_close")
-
-            item["price"] = current_price
             item["provider"] = "TradingView Scanner"
-            item["status"] = "ok"
-            item["error"] = None
             item["reference_source"] = "TradingView bonds-yield-curve"
             item["scanner_symbol"] = scanner_item["symbol"]
+        elif sym_price is not None:
+            current_price = float(sym_price)
+            item["provider"] = "TradingView Symbol Scanner"
+            item["reference_source"] = "TradingView symbols-performance"
 
-            # Scanner 응답에서 전일 종가 필드는 확정하지 않았으므로,
-            # 기존 HTML 파서가 확보한 전일값이 있을 때만 변화율을 계산합니다.
-            if previous_close is not None and float(previous_close) != 0:
-                previous_close = float(previous_close)
-                change = current_price - previous_close
-                change_pct = (change / previous_close) * 100.0
+        if current_price is None:
+            continue
 
-                item["previous_close"] = previous_close
-                item["change"] = change
-                item["change_pct"] = change_pct
-            else:
-                item["previous_close"] = None
-                item["change"] = None
-                item["change_pct"] = None
+        item["price"] = current_price
+        item["status"] = "ok"
+        item["error"] = None
 
-            logger.info(
-                "TradingView Scanner 미국채 수익률 적용: "
-                "key=%s, symbol=%s, yield=%.4f",
-                scraper_key,
-                scanner_item["symbol"],
-                current_price,
-            )
+        # ---- 전일 종가 ---------------------------------------------------
+        previous_close = None
+        if sym_prev is not None and float(sym_prev) != 0:
+            previous_close = float(sym_prev)
+            item["prev_source"] = "TradingView Symbol Scanner"
+        else:
+            html_prev = item.get("previous_close")
+            if html_prev is not None and float(html_prev) != 0:
+                previous_close = float(html_prev)
+                item["prev_source"] = "TradingView 페이지"
+
+        if previous_close is not None:
+            change, change_pct = _derive_change(current_price, previous_close)
+            item["previous_close"] = previous_close
+            item["change"] = change
+            item["change_pct"] = change_pct
+        else:
+            # 여기서 0.00%로 위장하지 않습니다. 화면(macro_view)은 이 경우
+            # FRED 공식 확정치로 전일값을 보완합니다.
+            item["previous_close"] = None
+            item["change"] = None
+            item["change_pct"] = None
+            item["prev_source"] = None
+
+        logger.debug(
+            "미국채 보강: key=%s, yield=%.4f, 전일=%s (%s)",
+            scraper_key, current_price, previous_close,
+            item.get("prev_source") or "미제공",
+        )
 
     sort_order = {
         config["key"]: index
@@ -1080,3 +869,24 @@ def get_scraped_macro_markets() -> dict:
         ).strftime("%Y-%m-%d %H:%M:%S KST"),
         "items": results,
     }
+
+
+# ==============================================================================
+# 저장본 우선 읽기 경로
+# ==============================================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def get_scraped_macro_markets() -> dict:
+    """
+    화면용 진입점. SQLite 저장본이 신선하면 그것을 쓰고, 오래됐으면
+    직접 수집한 뒤 저장합니다 (읽기 모드에 따라 동작은 services/store.py 참고).
+
+    st.cache_data(ttl=60)은 한 번의 rerun 안에서 같은 값을 여러 번 읽을 때
+    DB 조회조차 반복하지 않기 위한 얇은 메모이즈입니다.
+    """
+    empty = {"updated_at": "수집 이력 없음", "items": []}
+    return store.cached_or_live(
+        datasets.SNAP_SCRAPER_MARKETS,
+        collect_scraped_macro_markets,
+        max_age_seconds=datasets.MAX_AGE_REALTIME,
+        empty_value=empty,
+    ) or empty

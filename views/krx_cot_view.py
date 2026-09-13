@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+from services import store
 from config import get_krx_key
 from services.ai_service import ask_krx_cot_agent
 from services.krx_service import (
@@ -98,7 +99,13 @@ def render_krx_cot_view():
     # 하나의 툴바처럼 보이도록 정돈했습니다.
     # ==========================================================================
     with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([1.2, 1.3, 1.8, 1])
+        # [제거] "수급 표시 기준(계약수 / 금액(억원))" 라디오를 없앴습니다.
+        # Daum의 선물 투자자별 API(/api/investor/future/days)는 계약수만
+        # 제공합니다. 금액 모드는 type=PRICE 파라미터가 먹힌다는 가정 위에
+        # 있었으나 응답은 계약수 그대로였고, 그 값을 1억으로 나눠 화면이
+        # 전부 0으로 표시됐습니다. 확인할 수 없는 선택지를 남겨 두는 대신
+        # 실제로 제공되는 계약수 기준만 표시합니다.
+        c1, c3, c4 = st.columns([1.5, 2.5, 1.2])
         with c1:
             lookback_days = st.selectbox(
                 "조회 기간 (일)",
@@ -106,20 +113,7 @@ def render_krx_cot_view():
                 index=1,
                 help="최근 며칠간의 KOSPI 200 선물 데이터를 조회할지 선택합니다.",
             )
-    
-        with c2:
-            investor_measure_label = st.radio(
-                "수급 표시 기준",
-                options=["계약수", "금액(억원)"],
-                horizontal=True,
-                index=0,
-                key="krx_investor_measure",
-                help=(
-                    "계약수는 순매수 계약 수량입니다. "
-                    "금액은 Daum 원 단위 응답을 억 원으로 변환한 순매수 금액입니다."
-                ),
-            )
-    
+
         with c3:
             st.markdown(
                 "<div style='height:28px'></div>",
@@ -136,36 +130,30 @@ def render_krx_cot_view():
                 "🔄 최신 데이터 새로고침",
                 width="stretch",
             ):
+                # [버그 수정] st.cache_data.clear()만으로는 아직 신선한 SQLite
+                # 저장본이 그대로 반환돼 화면이 전혀 바뀌지 않았습니다.
+                # request_refresh()가 저장본을 낡은 것으로 만들어 실제로 다시
+                # 수집하게 합니다.
+                store.request_refresh()
                 st.cache_data.clear()
+                if store.get_read_mode() == store.READ_MODE_STORE_ONLY:
+                    st.toast(
+                        "store_only 모드입니다. 저장본만 다시 읽었습니다.",
+                        icon="ℹ️",
+                    )
                 st.rerun()
 
     df_hist = get_krx_futures_history(days=lookback_days)
 
     # Daum 선물 투자주체별 매매동향(실제 데이터)을 우선 사용하고,
     # 수집에 실패하면 기존 placeholder 데이터로 안전하게 폴백합니다.
-    investor_measure = (
-        "PRICE"
-        if investor_measure_label == "금액(억원)"
-        else "CONTRACT"
-    )
-    
-    # 화면에 실제로 표시되는 데이터의 단위입니다.
-    # Daum 호출 성공 시 사용자가 선택한 단위와 같고,
-    # placeholder 폴백 시에는 계약수 예시 데이터임을 강제합니다.
-    display_measure = investor_measure
-    display_measure_label = investor_measure_label
-    
-    df_investors = fetch_daum_futures_investor_trend(
-        lookback_days=25,
-        measure=investor_measure,
-    )
-    
+    # 단위는 계약수 하나뿐입니다(Daum이 제공하는 유일한 기준).
+    display_measure_label = "계약수"
+
+    df_investors = fetch_daum_futures_investor_trend(lookback_days=25)
+
     if df_investors is None or df_investors.empty:
         df_investors = get_krx_investor_derivatives_summary()
-    
-        # placeholder 함수의 값은 계약수 기준 고정 예시값입니다.
-        # 금액(억원) 선택 상태라도 계약수로 잘못 표기하지 않도록 강제합니다.
-        display_measure = "CONTRACT"
         display_measure_label = "계약수 (예시 데이터)"
 
     intraday_flow = fetch_daum_futures_intraday_acceleration(lookback_minutes=30)
@@ -571,7 +559,7 @@ def render_krx_cot_view():
     fig.update_yaxes(title_text="베이시스 (pt)", row=2, col=1, gridcolor="#21262D")
     fig.update_yaxes(title_text="거래량", row=3, col=1, gridcolor="#21262D")
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     if basis_series.isna().all():
         st.caption("💡 베이시스 데이터는 pykrx 원본에서 확인되지 않아 이번 조회 기간에는 표시되지 않았습니다.")
@@ -719,48 +707,38 @@ def render_krx_cot_view():
         if inv_is_placeholder:
             st.warning(
                 "⚠️ Daum 실제 투자주체별 선물 수급 데이터를 가져오지 못했습니다. "
-                "현재 표는 계약수 기준 placeholder(예시) 데이터입니다. "
-                "금액(억원) 모드를 선택했더라도 실제 금액 데이터가 아니므로 "
-                "계약수 기준으로 표시됩니다."
+                "현재 표는 고정된 placeholder(예시) 데이터이며 실제 시장 "
+                "수급이 아닙니다."
             )
         else:
-            if display_measure == "PRICE":
-                measure_caption = (
-                    "금액 기준: Daum 원 단위 응답을 억 원 단위로 변환해 표시합니다."
-                )
-            else:
-                measure_caption = (
-                    "계약수 기준: 투자주체별 KOSPI 200 선물 순매수 계약 수량입니다."
-                )
-        
             st.caption(
                 "📡 출처: Daum 금융 비공식 API "
                 "(finance.daum.net/api/investor/future/days). "
-                f"{measure_caption} "
+                "계약수 기준: 투자주체별 KOSPI 200 선물 순매수 계약 수량입니다. "
+                "이 API는 금액 기준을 제공하지 않습니다. "
                 "KRX 공식 API가 아니므로 페이지 구조 변경 시 수집이 실패할 수 있습니다."
             )
 
-        # data_measure, data_unit, data_date는 화면 표시용 메타데이터이므로 제외합니다.
+        # 화면 표시용 메타데이터 컬럼은 표에서 제외합니다.
+        # measure_fallback_reason은 금액 모드를 쓰던 예전 저장본에만 있는
+        # 컬럼인데, 남아 있으면 표에 그대로 새어 나오므로 함께 숨깁니다.
         hidden_columns = {
             "is_placeholder",
             "data_measure",
             "data_unit",
             "data_date",
+            "measure_fallback_reason",
         }
-        
+
         display_cols = [
             column
             for column in df_investors.columns
             if column not in hidden_columns
         ]
-        
-        if display_measure == "PRICE":
-            numeric_format = "%+.1f"
-            unit_suffix = "(억 원)"
-        else:
-            numeric_format = "%+d"
-            unit_suffix = "(계약)"
-        
+
+        numeric_format = "%+d"
+        unit_suffix = "(계약)"
+
         display_df = df_investors[display_cols].copy()
         
         display_df = display_df.rename(columns={
@@ -812,7 +790,7 @@ def render_krx_cot_view():
     ai_res = None
     with col_ai1:
         selected_engine = st.selectbox("AI 엔진 선택", options=engine_options, index=0)
-        if st.button("🤖 AI 해설 생성", use_container_width=True):
+        if st.button("🤖 AI 해설 생성", width="stretch"):
             with st.spinner(f"{selected_engine}로 분석 중..."):
                 prompt = f"""
 KOSPI 200 Derivatives Market Data

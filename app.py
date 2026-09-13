@@ -1,6 +1,9 @@
 # app.py
 import streamlit as st
 import base64
+import os
+import threading
+import time
 import urllib3
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -18,6 +21,11 @@ from views.radar_view import render_radar_view
 from views.ai_test_view import render_ai_test_view
 from views.ai_report_view import render_ai_report_view
 from views.toss_test_view import render_toss_test_view
+from views.data_status_view import (
+    render_data_freshness_sidebar,
+    render_data_status_view,
+)
+from services import store
 
 # SSL 경고 비활성화
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -104,7 +112,15 @@ st.markdown("""
 # 1. 간이 인증 (비밀번호 잠금) 시스템
 # ==========================================
 def check_password():
-    correct_password = st.secrets.get("auth", {}).get("password", APP_PASSWORD)
+    # [버그 수정] 기존 코드는 st.secrets.get("auth", {})를 직접 호출했습니다.
+    # st.secrets는 접근 시점에 secrets.toml을 파싱하므로, 파일이 없으면
+    # .get()조차 StreamlitSecretNotFoundError를 던집니다. 그 결과 secrets.toml
+    # 없이 새로 clone한 환경에서는 로그인 화면 자체가 예외로 죽어 앱을
+    # 전혀 쓸 수 없었습니다.
+    #
+    # config.APP_PASSWORD가 이미 [auth] password → APP_PASSWORD 환경변수 →
+    # 기본값 순서로 안전하게 해석하므로 그 결과만 사용합니다.
+    correct_password = APP_PASSWORD
 
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
@@ -138,17 +154,19 @@ st.sidebar.caption("글로벌 매크로 및 시장 수급 정밀 분석 시스�
 menu_selection = st.sidebar.radio(
     "이동할 메뉴를 선택하세요",
     [
-        "📊 거시경제 매크로 지표", 
-        "🏢 연준 순유동성 트래커", 
+        # 분석 메뉴 → 데이터 상태 → AI → 연결 진단 순서입니다.
+        "📊 거시경제 매크로 지표",
+        "🏢 연준 순유동성 트래커",
         "🔄 섹터 & 자산군 로테이션",
-        "🔌 토스증권 API 테스트",
-        "📑 기관 13F 포트폴리오 분석", 
+        "📑 기관 13F 포트폴리오 분석",
         "🎯 기관 13F Money 교집합",
         "🏛️ 글로벌 투기세력 (COT)",
         "🇰🇷 국내 파생 & 투기세력 (KRX)",
         "📡 외국인/기관 수급 레이더 (코스피)",
+        "🗄️ 데이터 저장소 상태",
         "🤖 AI 종합 데이터 분석 & 결론 리포트",
-        "🤖 AI API 연결 테스트"
+        "🤖 AI API 연결 테스트",
+        "🔌 토스증권 API 테스트",
     ],
     index=0,
     label_visibility="collapsed"
@@ -157,8 +175,22 @@ menu_selection = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.markdown("#### 🔄 데이터 갱신 설정")
 
+render_data_freshness_sidebar()
+
 if st.sidebar.button("데이터 수동 새로고침 🚀", width="stretch"):
+    # [버그 수정] 예전에는 st.cache_data.clear()만 했습니다. 그건 Streamlit의
+    # 메모리 캐시만 비울 뿐, 다음 조회는 아직 신선한 SQLite 저장본을 그대로
+    # 돌려줘서 화면의 숫자가 하나도 바뀌지 않았습니다.
+    # store.request_refresh()가 "이 시각 이전 저장본은 낡은 것으로 본다"는
+    # 기준을 세워 실제로 다시 수집하게 합니다.
+    store.request_refresh()
     st.cache_data.clear()
+    if store.get_read_mode() == store.READ_MODE_STORE_ONLY:
+        st.toast(
+            "store_only 모드입니다. 저장본만 다시 읽었습니다 "
+            "(수집은 collector.py가 담당합니다).",
+            icon="ℹ️",
+        )
     st.rerun()
 
 auto_refresh_enabled = st.sidebar.checkbox("실시간 자동 새로고침 활성화", value=False)
@@ -189,15 +221,27 @@ if st.sidebar.button(
     st.rerun()
 
 if st.session_state.get("shutdown_requested"):
+    # [버그 수정] 기존 코드는 st.stop() 뒤에 os._exit(0)를 두었습니다.
+    # st.stop()은 즉시 스크립트 실행을 중단시키므로 그 아래 줄은 영원히
+    # 실행되지 않습니다. 즉 "서버가 종료되었다"는 안내만 뜨고 실제
+    # 프로세스는 계속 살아 있었습니다.
+    #
+    # 이제 안내를 먼저 렌더한 뒤, 실제 종료를 별도 스레드에서 약간
+    # 지연 실행합니다. 브라우저가 이 화면을 받아볼 시간을 확보해야
+    # 하기 때문입니다. os._exit()은 Streamlit 런타임의 예외 처리를
+    # 우회해 즉시 프로세스를 끝내므로 의도대로 동작합니다.
     st.sidebar.error("서버를 종료합니다. 터미널 창을 확인하세요.")
     st.warning(
-        "⚠️ 앱 서버가 종료되었습니다. 다시 사용하려면 터미널에서 "
+        "⚠️ 앱 서버를 종료합니다. 다시 사용하려면 터미널에서 "
         "`streamlit run app.py`를 다시 실행하세요."
     )
-    st.stop()
 
-    import os
-    os._exit(0)
+    def _shutdown_after_response() -> None:
+        time.sleep(1.5)
+        os._exit(0)
+
+    threading.Thread(target=_shutdown_after_response, daemon=True).start()
+    st.stop()
 
 st.sidebar.caption("© 2026 Macro Web Dashboard v2.3")
 
@@ -226,8 +270,6 @@ elif menu_selection == "🏢 연준 순유동성 트래커":
     render_liquidity_view()
 elif menu_selection == "🔄 섹터 & 자산군 로테이션":
     render_sector_view()
-elif menu_selection == "🔌 토스증권 API 테스트":
-    render_toss_test_view()
 elif menu_selection == "📑 기관 13F 포트폴리오 분석":
     render_sec_view()
 elif menu_selection == "🎯 기관 13F Money 교집합":
@@ -238,7 +280,11 @@ elif menu_selection == "🇰🇷 국내 파생 & 투기세력 (KRX)":
     render_krx_cot_view()
 elif menu_selection == "📡 외국인/기관 수급 레이더 (코스피)":
     render_radar_view()
+elif menu_selection == "🗄️ 데이터 저장소 상태":
+    render_data_status_view()
 elif menu_selection == "🤖 AI 종합 데이터 분석 & 결론 리포트":
     render_ai_report_view()
 elif menu_selection == "🤖 AI API 연결 테스트":
     render_ai_test_view()
+elif menu_selection == "🔌 토스증권 API 테스트":
+    render_toss_test_view()

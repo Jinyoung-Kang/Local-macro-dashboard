@@ -6,10 +6,16 @@ S&P 500 외 6대 주요 자산(주식, 채권, 환율, 원자재) 3년 시계열
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from services import datasets, store
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
+
+# 공용 커넥션 풀 세션을 사용해 요청마다 TCP/TLS 핸드셰이크를
+# 반복하지 않습니다 (services/http_client.py).
+from services.http_client import get_session
 import streamlit as st
 
 logger = logging.getLogger(__name__)
@@ -53,7 +59,7 @@ def _cftc_get_with_retry(url: str, params: dict, max_attempts: int = 3):
     last_error = None
     for attempt in range(max_attempts):
         try:
-            response = requests.get(
+            response = get_session().get(
                 url,
                 params=params,
                 timeout=(5, 30),
@@ -73,8 +79,7 @@ def _cftc_get_with_retry(url: str, params: dict, max_attempts: int = 3):
     return None, str(last_error)
 
 
-@st.cache_data(ttl=3600*12, show_spinner=False)
-def fetch_cftc_cot_legacy(contract_code: str, limit: int = 300) -> pd.DataFrame:
+def collect_cftc_cot_legacy(contract_code: str, limit: int = 300) -> pd.DataFrame:
     url = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
     params = {
         "cftc_contract_market_code": contract_code,
@@ -125,7 +130,60 @@ def fetch_cftc_cot_legacy(contract_code: str, limit: int = 300) -> pd.DataFrame:
 # ==============================================================================
 # 2. 다중 자산 3년 시계열 병렬 수집 및 AI Context 요약 헬퍼
 # ==============================================================================
-def fetch_cot_multi_asset_history(years: int = 3, max_workers: int = 4) -> dict:
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def fetch_cftc_cot_legacy(contract_code: str, limit: int = 300) -> pd.DataFrame:
+    """
+    화면용 진입점 (views/cot_view.py가 자산별로 직접 호출합니다).
+
+    CFTC는 주 1회(금요일) 발표이므로 저장본으로 충분합니다. CFTC 공개 API는
+    응답이 느리고 간헐적으로 막히는데(CFTCTransientError), 저장해 두면
+    그 영향을 받지 않습니다.
+
+    [중요] 원래 예외(CFTCTransientError)를 화면이 잡아 안내 문구를 띄우므로,
+    저장본이 전혀 없을 때는 예외를 그대로 올려보내야 합니다.
+    """
+    snap_name = datasets.snap_cot_contract(contract_code, limit)
+    mode = store.get_read_mode()
+
+    if mode == store.READ_MODE_LIVE_ONLY:
+        return collect_cftc_cot_legacy(contract_code, limit)
+
+    snap = store.read_snapshot(snap_name)
+    has_stored = (
+        snap is not None
+        and isinstance(snap.payload, pd.DataFrame)
+        and not snap.payload.empty
+    )
+
+    if has_stored and snap.is_fresh(datasets.MAX_AGE_SLOW):
+        return snap.payload
+
+    if mode == store.READ_MODE_STORE_ONLY:
+        if has_stored:
+            return snap.payload
+        return pd.DataFrame()
+
+    try:
+        df = collect_cftc_cot_legacy(contract_code, limit)
+    except Exception:
+        if has_stored:
+            logger.info(
+                "%s: CFTC 수집 실패, 저장본으로 대체합니다 (수집 시각 %s)",
+                contract_code, snap.collected_at_kst_str(),
+            )
+            return snap.payload
+        # 저장본도 없으면 화면이 안내를 띄울 수 있게 예외를 그대로 전달합니다.
+        raise
+
+    if df is not None and not df.empty:
+        try:
+            store.put_frame(snap_name, df)
+        except Exception as e:
+            logger.warning("COT 저장 실패 (%s): %s", contract_code, e)
+    return df
+
+
+def collect_cot_multi_asset_history(years: int = 3, max_workers: int = 4) -> dict:
     """
     6개 COT 자산의 최근 N년 주간 데이터를 병렬 수집.
     반환: {자산명: {"data": DataFrame, "error": str}}
@@ -136,7 +194,7 @@ def fetch_cot_multi_asset_history(years: int = 3, max_workers: int = 4) -> dict:
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
-                fetch_cftc_cot_legacy,
+                collect_cftc_cot_legacy,
                 info["code"],
                 weeks
             ): asset_name
@@ -155,6 +213,29 @@ def fetch_cot_multi_asset_history(years: int = 3, max_workers: int = 4) -> dict:
                 results[asset_name] = {"data": pd.DataFrame(), "error": str(e)}
 
     return results
+
+
+# ==============================================================================
+# 저장본 우선 읽기 경로
+# ==============================================================================
+def fetch_cot_multi_asset_history(years: int = 3, max_workers: int = 4) -> dict:
+    """
+    화면용 진입점. COT는 CFTC가 **주 1회(금요일)** 발표하므로 저장본으로
+    충분하고, 자산마다 별도 요청이 필요해 수집이 느립니다.
+
+    반환: {자산명: {"data": DataFrame | None, "error": str | None}}
+    """
+    def _collect():
+        return collect_cot_multi_asset_history(years=years, max_workers=max_workers)
+
+    payload = store.cached_or_live(
+        datasets.SNAP_COT_HISTORY,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_SLOW,
+        as_object=True,
+        empty_value={},
+    )
+    return payload if isinstance(payload, dict) else {}
 
 
 def summarize_cot_asset(asset_name: str, df: pd.DataFrame) -> str:

@@ -4,13 +4,13 @@ services/dashboard_snapshot_service.py
 UI Markdown 태그 정제 및 데이터 단위 포맷팅, 안전 파싱 로직 포함.
 """
 import logging
-import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
 
 from services.macro_service import (
+    clean_tag_ui,
     get_collected_macro_data,
     get_macro_risk_indicators_for_ai,
     summarize_series_for_ai,
@@ -25,10 +25,17 @@ from services.cot_service import (
     summarize_cot_asset,
 )
 from services.krx_service import (
+    fetch_daum_futures_investor_trend,
     get_krx_futures_history,
     get_krx_investor_derivatives_summary,
 )
 from services.sec_service import load_all_institutions_data
+from services.radar_service import get_market_radar_scanner
+from services.market_scraper_service import get_scraped_macro_markets
+from services.advanced_macro_service import (
+    get_advanced_macro_indicators,
+    summarize_advanced_for_ai,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +49,14 @@ def safe_call(fn, *args, **kwargs):
 
 
 def clean_ui_tag(text: str) -> str:
-    """텍스트 내 포함된 UI 표시용 마크다운(gray 등)을 깔끔하게 제거합니다."""
-    if not isinstance(text, str):
-        return str(text)
-    text = re.sub(r":gray\[\[.*?\]\]", "", text)
-    text = re.sub(r":gray\[.*?\]", "", text)
-    text = re.sub(r"\[\[.*?\]\]", "", text)
-    return re.sub(r"\s{2,}", " ", text).strip()
+    """
+    텍스트 내 UI 표시용 마크다운 태그를 제거합니다.
+
+    같은 로직이 macro_service.clean_tag_ui와 여기 두 곳에 복제돼 있었고,
+    한쪽만 중첩 대괄호를 잘못 처리해 화면에 "]"가 남는 버그가 살아남았습니다.
+    단일 구현에 위임합니다.
+    """
+    return clean_tag_ui(text)
 
 
 def _get_num(row, *keys, default=0.0):
@@ -62,6 +70,26 @@ def _get_num(row, *keys, default=0.0):
         except (TypeError, ValueError):
             continue
     return default
+
+
+def _collect_krx_investor_trend() -> pd.DataFrame | None:
+    """
+    투자자별 선물 수급: Daum 실데이터 → 실패 시 placeholder.
+
+    반환 DataFrame에는 is_placeholder 컬럼이 반드시 포함돼, 화면·텍스트가
+    "실데이터인지 예시인지"를 구분할 수 있습니다.
+    """
+    df = safe_call(fetch_daum_futures_investor_trend, 25)
+
+    if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+        out = df.copy()
+        out["is_placeholder"] = False
+        return out
+
+    logger.warning(
+        "투자자별 선물 수급: Daum 실데이터 실패 → 고정 예시로 대체합니다."
+    )
+    return safe_call(get_krx_investor_derivatives_summary)
 
 
 def collect_dashboard_snapshot() -> dict:
@@ -90,14 +118,38 @@ def collect_dashboard_snapshot() -> dict:
             get_krx_futures_history,
             40,
         )
+        # [버그 수정] 예전에는 get_krx_investor_derivatives_summary()를
+        # 곧바로 불렀습니다. 그런데 그 함수는 **항상 고정 예시(placeholder)**
+        # 를 돌려주는 최종 폴백입니다(문서에도 그렇게 적혀 있습니다).
+        # 실데이터인 Daum 선물 수급이 정상 동작하는데도 스냅샷과 AI 리포트에는
+        # 매번 "+38,500 계약" 같은 가짜 숫자가 들어가고 있었습니다.
+        # 실데이터를 먼저 시도하고, 실패했을 때만 폴백을 씁니다.
         fut_krx_investor = executor.submit(
-            safe_call,
-            get_krx_investor_derivatives_summary,
+            _collect_krx_investor_trend,
         )
         fut_sec = executor.submit(
             safe_call,
             load_all_institutions_data,
         )
+        # [추가] 국내 수급 레이더는 별도 메뉴로 존재하는데 "전체 대시보드
+        # 원본 데이터"에는 빠져 있었습니다. AI 리포트가 국내 수급을 전혀
+        # 보지 못하는 상태였습니다.
+        fut_radar = executor.submit(
+            safe_call,
+            get_market_radar_scanner,
+            datetime.now(ZoneInfo("Asia/Seoul")).date(),
+            "KOSPI", "외국인", "순매수", 20, "TODAY",
+        )
+        fut_radar_inst = executor.submit(
+            safe_call,
+            get_market_radar_scanner,
+            datetime.now(ZoneInfo("Asia/Seoul")).date(),
+            "KOSPI", "기관", "순매수", 20, "TODAY",
+        )
+        # [추가] 미국채 실시간 참고 시세(TradingView)도 화면에는 있는데
+        # 스냅샷에는 없었습니다.
+        fut_scraper = executor.submit(safe_call, get_scraped_macro_markets)
+        fut_advanced = executor.submit(safe_call, get_advanced_macro_indicators)
 
         return {
             "collected_at": datetime.now(
@@ -111,13 +163,18 @@ def collect_dashboard_snapshot() -> dict:
             "krx": fut_krx.result(),
             "krx_investor": fut_krx_investor.result(),
             "sec": fut_sec.result(),
+            "radar_foreign": fut_radar.result(),
+            "radar_inst": fut_radar_inst.result(),
+            "scraper": fut_scraper.result(),
+            "advanced": fut_advanced.result(),
         }
 
 
 def _append_macro_section(lines: list[str], macro_res):
     lines.append("## 1. 거시경제 매크로 지표")
 
-    if not isinstance(macro_res, tuple) or len(macro_res) < 5:
+    # 저장 계층을 거치면 튜플이 리스트로 돌아올 수 있으므로 둘 다 받습니다.
+    if not isinstance(macro_res, (tuple, list)) or len(macro_res) < 5:
         lines.append("- 거시 지표 수집 실패")
         lines.append("")
         return
@@ -246,13 +303,32 @@ def _append_krx_section(lines: list[str], krx_res, krx_inv_res):
     else:
         lines.append("- KRX 선물 시계열 데이터 수집 대기 상태")
 
-    if krx_inv_res is not None and isinstance(krx_inv_res, pd.DataFrame) and not krx_inv_res.empty:
+    if (
+        krx_inv_res is not None
+        and isinstance(krx_inv_res, pd.DataFrame)
+        and not krx_inv_res.empty
+    ):
+        is_placeholder = bool(
+            krx_inv_res.get("is_placeholder", pd.Series([False])).any()
+        )
+
         lines.append("\n### 주요 투자자 20일 누적 순매수:")
-        lines.append("⚠️ 투자자별 20일 누적 수급은 현재 예시/추정 데이터이며, KRX 공식 확정 투자자별 선물 거래 데이터가 아닙니다.")
+        if is_placeholder:
+            lines.append(
+                "⚠️ 아래 수치는 **고정 예시(placeholder)** 입니다. "
+                "Daum 실데이터 수집에 실패했을 때만 나타나며, "
+                "실제 시장 데이터가 아니므로 판단 근거로 쓰지 마세요."
+            )
+        else:
+            lines.append(
+                "출처: Daum 금융 선물 투자주체별 매매동향 (계약수 기준). "
+                "KRX 공식 확정치가 아닌 포털 집계값입니다."
+            )
+
         for _, r in krx_inv_res.iterrows():
             subj = r.get("투자 주체", r.get("주체", "Unknown"))
-            amt = r.get("20일 누적", r.get("20일 누적 순매수 (계약)", 0))
-            lines.append(f"- {subj}: {amt:+,} 계약")
+            amt = _get_num(r, "20일 누적", "20일 누적 순매수 (계약)")
+            lines.append(f"- {subj}: {amt:+,.0f} 계약")
     lines.append("")
 
 
@@ -284,6 +360,86 @@ def _append_sec_section(lines: list[str], sec_res):
             top_hold = r.get("top_holding", "N/A")
             val_b = r.get("total_value_bil", r.get("value_bil", 0))
             lines.append(f"  * {inst_nm}: 총자산 ${val_b}B | 최대 비중 종목: {top_hold}")
+    lines.append("")
+
+
+def _append_radar_section(lines: list[str], foreign_df, inst_df):
+    lines.append("## 8. 국내 수급 레이더 (코스피 외국인·기관 순매수 상위)")
+
+    any_data = False
+    for label, df in (("외국인", foreign_df), ("기관", inst_df)):
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            lines.append(f"- {label} 순매수 상위: 데이터 수집 실패")
+            continue
+
+        any_data = True
+        source = ""
+        if "데이터_출처" in df.columns and not df["데이터_출처"].empty:
+            source = f" (출처: {df['데이터_출처'].iloc[0]})"
+        lines.append(f"\n### {label} 순매수 상위{source}")
+
+        for _, row in df.head(10).iterrows():
+            name = row.get("종목명", "N/A")
+            code = row.get("종목코드", "")
+            amount = _get_num(row, "순매수대금(억)")
+            change = _get_num(row, "등락률(%)")
+            lines.append(
+                f"- {name}({code}): 순매수 {amount:+,.1f}억원 | "
+                f"등락률 {change:+.2f}%"
+            )
+
+    if not any_data:
+        lines.append(
+            "- 참고: Naver/Daum은 과거 날짜 조회를 지원하지 않아 장 시작 전에는"
+            " 직전 거래일 데이터가 조회됩니다."
+        )
+    lines.append("")
+
+
+def _append_scraper_section(lines: list[str], scraper_res):
+    lines.append("## 9. 비공식 스크래핑 참고 시세 (TradingView/Yahoo)")
+    lines.append(
+        "주의: 공식 데이터가 아닌 공개 웹페이지 수집값입니다. "
+        "페이지 구조 변경 시 조용히 실패할 수 있습니다."
+    )
+
+    items = (scraper_res or {}).get("items") if isinstance(scraper_res, dict) else None
+    if not items:
+        lines.append("- 참고 시세 수집 실패")
+        lines.append("")
+        return
+
+    lines.append(f"- 수집 시각: {scraper_res.get('updated_at', '알 수 없음')}")
+    for item in items:
+        name = item.get("name", "N/A")
+        provider = item.get("provider", "?")
+        if item.get("status") != "ok" or item.get("price") is None:
+            lines.append(f"- {name} [{provider}]: 수집 실패")
+            continue
+
+        unit = item.get("unit", "")
+        price = item.get("price")
+        prev = item.get("previous_close")
+        pct = item.get("change_pct")
+
+        digits = 3 if unit == "%" else 2
+        text = f"- {name} [{provider}]: {price:,.{digits}f}{unit}"
+        if prev is not None and pct is not None:
+            text += f" | 전일 {prev:,.{digits}f} | {pct:+.2f}%"
+        else:
+            text += " | 전일 대비 미제공"
+        lines.append(text)
+
+    lines.append("")
+
+
+def _append_advanced_section(lines: list[str], advanced_res):
+    lines.append("## 10. 심화 매크로 지표 (금리 구조·신용·금융상황)")
+    lines.append(
+        "명목금리만으로는 구분되지 않는 실질금리/기대인플레, "
+        "10Y-3M 스프레드, 투자등급 신용, 금융상황지수입니다."
+    )
+    lines.append(summarize_advanced_for_ai(advanced_res))
     lines.append("")
 
 
@@ -321,5 +477,12 @@ def format_dashboard_snapshot_text(snapshot: dict) -> str:
         snapshot.get("krx_investor"),
     )
     _append_sec_section(lines, snapshot.get("sec"))
+    _append_radar_section(
+        lines,
+        snapshot.get("radar_foreign"),
+        snapshot.get("radar_inst"),
+    )
+    _append_scraper_section(lines, snapshot.get("scraper"))
+    _append_advanced_section(lines, snapshot.get("advanced"))
 
     return "\n".join(lines)

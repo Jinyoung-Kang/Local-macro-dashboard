@@ -17,7 +17,9 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests
+# 공용 커넥션 풀 세션을 사용해 요청마다 TCP/TLS 핸드셰이크를
+# 반복하지 않습니다 (services/http_client.py).
+from services.http_client import get_session
 import streamlit as st
 import yfinance as yf
 
@@ -68,7 +70,7 @@ def _fetch_from_tradingview() -> dict | None:
     예: "K2I1!의 현재 값은 561.15 KRW / POINT 입니다 — 지난 24시간 사이 −1.31% 내렸습니다."
     """
     try:
-        res = requests.get(TRADINGVIEW_URL, headers=_HEADERS, timeout=8)
+        res = get_session().get(TRADINGVIEW_URL, headers=_HEADERS, timeout=8)
         if res.status_code != 200:
             logger.warning(f"TradingView 응답 실패: HTTP {res.status_code}")
             return None
@@ -111,7 +113,7 @@ def _fetch_from_investing() -> dict | None:
     반드시 2순위 폴백으로만 사용합니다.
     """
     try:
-        res = requests.get(INVESTING_URL, headers=_HEADERS, timeout=8)
+        res = get_session().get(INVESTING_URL, headers=_HEADERS, timeout=8)
         if res.status_code != 200:
             logger.warning(f"Investing.com 응답 실패: HTTP {res.status_code}")
             return None

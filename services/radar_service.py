@@ -12,6 +12,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+
+# 공용 커넥션 풀 세션을 사용해 요청마다 TCP/TLS 핸드셰이크를
+# 반복하지 않습니다 (services/http_client.py).
+from services.http_client import get_session
 import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
@@ -19,6 +23,7 @@ import numpy as np
 
 from services.ls_service import call_ls_api
 from services.kis_service import call_kis_api
+from services import datasets, store
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -37,43 +42,9 @@ COMMON_HEADERS = {
     ),
 }
 
-from playwright.sync_api import sync_playwright
-
-
-def _fetch_rendered_html(
-    url: str,
-    wait_selector: str = "table",
-    timeout_ms: int = 10000,
-    wait_state: str = "attached",
-) -> str:
-    """
-    JS로 렌더링되는 페이지(Naver/Daum 신규 UI)를 헤드리스 브라우저로
-    실제 렌더링한 뒤 최종 HTML을 반환합니다.
-
-    주의: 일반 requests.get()으로는 React/Next.js가 그리는 표를
-    가져올 수 없어서 이 방식이 필요합니다.
-
-    wait_state="attached"를 기본값으로 사용합니다. Naver의 일부 표는
-    CSS로 숨겨져 있거나(display:none) 크기가 0이어서 "visible" 상태를
-    영원히 만족하지 못할 수 있지만, HTML 자체에는 데이터가 완성되어
-    있으므로 DOM에 존재하기만 하면 충분합니다.
-    """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent=COMMON_HEADERS["User-Agent"]
-        )
-        try:
-            page.goto(url, timeout=timeout_ms, wait_until="networkidle")
-            page.wait_for_selector(
-                wait_selector,
-                timeout=timeout_ms,
-                state=wait_state,
-            )
-            html = page.content()
-        finally:
-            browser.close()
-        return html
+# 렌더링 수집은 services/browser_pool.py의 공용 Chromium을 재사용합니다.
+# (기존에는 호출마다 Chromium을 새로 띄워 매번 콜드 스타트 비용을 냈습니다.)
+from services.browser_pool import fetch_rendered_html as _fetch_rendered_html
 
 # ==============================================================================
 # KIS FHPTJ04400000 투자자별 실제 필드 매핑
@@ -730,7 +701,7 @@ def fetch_daum_deal_ranking(
     }
 
     try:
-        response = requests.get(
+        response = get_session().get(
             url,
             headers=headers,
             params=params,
@@ -940,7 +911,7 @@ def debug_daum_investor_purchase_response(interval_type: str = "TODAY") -> dict:
     }
 
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        resp = get_session().get(url, headers=headers, params=params, timeout=8)
         return {
             "status_code": resp.status_code,
             "body": resp.json() if resp.status_code == 200 else resp.text[:500],
@@ -1141,8 +1112,7 @@ def _get_latest_completed_session_str(now_kst: datetime) -> str:
     return d.strftime("%Y%m%d")
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_market_radar_scanner(
+def collect_market_radar_scanner(
     target_date_obj,
     market: str = "KOSPI",
     investor: str = "외국인",
@@ -1150,6 +1120,12 @@ def get_market_radar_scanner(
     top_n: int = 30,
     interval_type: str = "TODAY",
 ) -> pd.DataFrame:
+    """
+    수급 랭킹을 실제로 수집합니다 (KIS → Daum → Naver → PyKrx 폴백 체인).
+
+    화면은 get_market_radar_scanner()를 쓰세요. 이 함수는 항상 네트워크를
+    쓰며, 최악의 경우 7영업일을 거슬러 올라가며 여러 소스를 시도합니다.
+    """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     today_str = now_kst.strftime("%Y%m%d")
     current_time = now_kst.time()
@@ -1275,6 +1251,133 @@ def get_market_radar_scanner(
 
 
 # ==============================================================================
+# 7-1. 저장본 우선 읽기 경로 + 날짜별 이력 누적
+# ==============================================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def get_market_radar_scanner(
+    target_date_obj,
+    market: str = "KOSPI",
+    investor: str = "외국인",
+    trade_type: str = "순매수",
+    top_n: int = 30,
+    interval_type: str = "TODAY",
+) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본 우선 + 날짜별 이력 누적.
+
+    이 화면이 저장 계층에서 가장 크게 이득을 봅니다.
+      - 수집 경로가 무거움: 최대 7영업일 × (Daum → Naver 렌더링 → PyKrx).
+        저장본이 있으면 이 전부를 건너뜁니다.
+      - **Naver/Daum은 과거 날짜 조회를 지원하지 않습니다.** 지금까지는 앱을
+        끄면 그날 수급이 사라졌지만, 이제 수집할 때마다 observations에
+        날짜별로 쌓이므로 이력을 직접 축적합니다.
+        (read_radar_history()로 조회)
+    """
+    snap_name = datasets.snap_radar_scanner(
+        market, investor, trade_type, interval_type,
+    )
+
+    def _collect():
+        df = collect_market_radar_scanner(
+            target_date_obj, market, investor, trade_type, top_n, interval_type,
+        )
+        if df is not None and not df.empty:
+            _accumulate_radar_history(
+                df, market, investor, trade_type, interval_type,
+            )
+        return df
+
+    df = store.cached_or_live(
+        snap_name,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_REALTIME,
+        as_frame=True,
+    )
+    return df if df is not None else pd.DataFrame()
+
+
+def _accumulate_radar_history(
+    df: pd.DataFrame,
+    market: str,
+    investor: str,
+    trade_type: str,
+    interval_type: str,
+) -> None:
+    """
+    수집된 랭킹을 "데이터 기준 거래일"로 observations에 누적합니다.
+
+    기준일은 수집 시각이 아니라 _get_latest_completed_session_str()이
+    계산한 거래일을 씁니다. Naver/Daum이 날짜 파라미터를 받지 않고
+    "가장 최근에 끝난 거래일"만 주기 때문에, 수집 시각으로 찍으면
+    토요일 새벽에 수집한 금요일 데이터가 토요일로 기록됩니다.
+    """
+    try:
+        session_str = _get_latest_completed_session_str(
+            datetime.now(ZoneInfo("Asia/Seoul"))
+        )
+        obs_date = (
+            f"{session_str[:4]}-{session_str[4:6]}-{session_str[6:8]}"
+        )
+
+        records = df.to_dict(orient="records")
+        for rec in records:
+            rec["시장"] = market
+            rec["투자주체"] = investor
+            rec["매매구분"] = trade_type
+            rec["기간구분"] = interval_type
+
+        # 같은 거래일에 조건별로 여러 건이 들어오므로, entity에 조건을
+        # 포함해야 서로 덮어쓰지 않습니다.
+        for rec in records:
+            rec["_entity"] = (
+                f"{market}|{investor}|{trade_type}|{interval_type}|"
+                f"{rec.get('종목코드', '?')}"
+            )
+
+        saved = store.put_observations(
+            datasets.OBS_RADAR, obs_date, records, entity_key="_entity",
+        )
+        logger.info(
+            "수급 레이더 이력 누적: date=%s, rows=%s (%s/%s/%s/%s)",
+            obs_date, saved, market, investor, trade_type, interval_type,
+        )
+    except Exception as e:
+        # 누적 실패가 화면을 막아서는 안 됩니다.
+        logger.warning("수급 레이더 이력 누적 실패: %s", e)
+
+
+def read_radar_history(
+    *,
+    market: str | None = None,
+    investor: str | None = None,
+    trade_type: str | None = None,
+    start_date: str | None = None,
+) -> pd.DataFrame:
+    """
+    누적된 수급 랭킹 이력을 조회합니다 (Naver/Daum이 제공하지 않는 과거 데이터).
+
+    start_date는 'YYYY-MM-DD' 형식입니다.
+    """
+    df = store.read_observations(datasets.OBS_RADAR, start_date=start_date)
+    if df.empty:
+        return df
+
+    if market and "시장" in df.columns:
+        df = df[df["시장"] == market]
+    if investor and "투자주체" in df.columns:
+        df = df[df["투자주체"] == investor]
+    if trade_type and "매매구분" in df.columns:
+        df = df[df["매매구분"] == trade_type]
+
+    return df.drop(columns=[c for c in ["_entity"] if c in df.columns])
+
+
+def list_radar_history_dates() -> list[str]:
+    """이력이 쌓인 거래일 목록."""
+    return store.list_observation_dates(datasets.OBS_RADAR)
+
+
+# ==============================================================================
 # 8. Daum 종목 페이지 실제 투자자 순매매 데이터 (pykrx 교차 검증용 독립 소스)
 # ==============================================================================
 def fetch_daum_investor_daily_history(stock_code: str, start_date_obj, end_date_obj) -> pd.DataFrame:
@@ -1294,7 +1397,7 @@ def fetch_daum_investor_daily_history(stock_code: str, start_date_obj, end_date_
     url = f"https://finance.daum.net/quotes/A{ticker_code}"
 
     try:
-        res = requests.get(url, headers=headers, timeout=8)
+        res = get_session().get(url, headers=headers, timeout=8)
         if res.status_code != 200:
             logger.warning(f"Daum 종목 페이지 실패 (종목={stock_code}): HTTP {res.status_code}")
             return pd.DataFrame()
@@ -1561,7 +1664,7 @@ def fetch_daum_stock_investor_flow(
     def fetch_page(page: int):
         """단일 페이지를 요청합니다. 실패 시 None을 반환합니다."""
         try:
-            response = requests.get(
+            response = get_session().get(
                 DAUM_STOCK_INVESTOR_URL,
                 headers=headers,
                 params={
@@ -2122,61 +2225,67 @@ def debug_daum_investor_periods() -> dict:
     실제로 선택(select_option)했을 때, investor_purchase API 요청이
     어떻게 바뀌는지 옵션별로 구분해서 캡처합니다.
     """
+    from playwright.sync_api import sync_playwright
+
     results_by_option = {}
 
+    # 진단 전용 경로이므로 공용 브라우저 풀을 오염시키지 않도록
+    # 일회성 브라우저를 쓰고, 예외가 나도 반드시 닫습니다.
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=COMMON_HEADERS["User-Agent"])
+        try:
+            page = browser.new_page(user_agent=COMMON_HEADERS["User-Agent"])
 
-        captured = []
+            captured = []
 
-        def on_request(req):
-            if "investor_purchase" in req.url:
-                captured.append(req.url)
+            def on_request(req):
+                if "investor_purchase" in req.url:
+                    captured.append(req.url)
 
-        page.on("request", on_request)
+            page.on("request", on_request)
 
-        page.goto(
-            "https://finance.daum.net/domestic/influential_investors",
-            wait_until="networkidle",
-            timeout=15000,
-        )
-        page.wait_for_timeout(1000)
+            page.goto(
+                "https://finance.daum.net/domestic/influential_investors",
+                wait_until="networkidle",
+                timeout=15000,
+            )
+            page.wait_for_timeout(1000)
 
-        # 페이지 안의 모든 select 요소와 그 안의 option 값을 먼저 조사
-        select_info = page.evaluate(
-            """
-            () => {
-                const selects = Array.from(document.querySelectorAll('select'));
-                return selects.map(sel => ({
-                    name: sel.name || sel.id || '(이름없음)',
-                    options: Array.from(sel.options).map(o => ({
-                        value: o.value,
-                        text: o.text,
-                    })),
-                }));
-            }
-            """
-        )
-        results_by_option["__select_구조__"] = select_info
+            # 페이지 안의 모든 select 요소와 그 안의 option 값을 먼저 조사
+            select_info = page.evaluate(
+                """
+                () => {
+                    const selects = Array.from(document.querySelectorAll('select'));
+                    return selects.map(sel => ({
+                        name: sel.name || sel.id || '(이름없음)',
+                        options: Array.from(sel.options).map(o => ({
+                            value: o.value,
+                            text: o.text,
+                        })),
+                    }));
+                }
+                """
+            )
+            results_by_option["__select_구조__"] = select_info
 
-        captured.clear()
-        results_by_option["초기 로드(당일 추정)"] = list(dict.fromkeys(captured))
-
-        # 기간 관련 값으로 추정되는 option value 시도
-        candidate_values = ["TODAY", "5", "20", "DAYS_5", "DAYS_20"]
-
-        for value in candidate_values:
             captured.clear()
-            try:
-                page.select_option("select", value=value, timeout=3000)
-                page.wait_for_timeout(1500)
-                results_by_option[f"value={value}"] = list(
-                    dict.fromkeys(captured)
-                )
-            except Exception as e:
-                results_by_option[f"value={value}"] = [f"선택 실패: {e}"]
+            results_by_option["초기 로드(당일 추정)"] = list(dict.fromkeys(captured))
 
-        browser.close()
+            # 기간 관련 값으로 추정되는 option value 시도
+            candidate_values = ["TODAY", "5", "20", "DAYS_5", "DAYS_20"]
+
+            for value in candidate_values:
+                captured.clear()
+                try:
+                    page.select_option("select", value=value, timeout=3000)
+                    page.wait_for_timeout(1500)
+                    results_by_option[f"value={value}"] = list(
+                        dict.fromkeys(captured)
+                    )
+                except Exception as e:
+                    results_by_option[f"value={value}"] = [f"선택 실패: {e}"]
+
+        finally:
+            browser.close()
 
     return results_by_option

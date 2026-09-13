@@ -40,7 +40,7 @@ def render_sec_view():
             )
         with col_ai_btn:
             st.write("")
-            run_13f_ai = st.button("🚀 13F 스마트머니 테마 분석 실행", type="primary", use_container_width=True)
+            run_13f_ai = st.button("🚀 13F 스마트머니 테마 분석 실행", type="primary", width="stretch")
 
         if run_13f_ai:
             with st.spinner("전체 기관의 최신 13F 데이터를 취합하여 교집합을 추출 중입니다... (잠시만 기다려주세요)"):
@@ -211,7 +211,7 @@ def render_sec_view():
                 margin=dict(l=10, r=10, t=40, b=10),
                 coloraxis_colorbar=dict(title="비중 (%)")
             )
-            st.plotly_chart(fig_tree, use_container_width=True)
+            st.plotly_chart(fig_tree, width="stretch")
 
     # TAB 2: 기간별 비중 추이
     with tab_v2:
@@ -273,7 +273,7 @@ def render_sec_view():
             hovermode="x unified", margin=dict(l=20, r=220, t=50, b=40),
             legend=dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.02, font=dict(size=10.5))
         )
-        st.plotly_chart(fig_trend, use_container_width=True)
+        st.plotly_chart(fig_trend, width="stretch")
 
     # TAB 3: 직전 분기 대비 매수/매도 변동 내역
     with tab_v3:
@@ -302,7 +302,7 @@ def render_sec_view():
                     hovertemplate="<b>%{y}</b><br>비중 증감: %{x:+.2f}%p<extra></extra>"
                 ))
                 fig_qoq.update_layout(height=max(380, len(qoq_bar_df) * 34 + 90), title="직전 분기 대비 비중 변동 상위 종목 (%p)", xaxis_title="비중 증감폭 (%p)", yaxis_title="", margin=dict(l=20, r=40, t=40, b=20))
-                st.plotly_chart(fig_qoq, use_container_width=True)
+                st.plotly_chart(fig_qoq, width="stretch")
 
             qoq_display = merged_qoq[merged_qoq['action'] != "⚪ 유지 (Unchanged)"].sort_values(by='weight_diff', key=abs, ascending=False).head(30)
             qoq_table = qoq_display[['name', 'action', 'weight_curr', 'weight_diff', 'value_curr', 'shares_diff']].copy()
@@ -311,7 +311,7 @@ def render_sec_view():
             qoq_table['비중 증감(%p)'] = qoq_table['비중 증감(%p)'].map('{:+.2f}%p'.format)
             qoq_table['현재 평가액($)'] = qoq_table['현재 평가액($)'].map('${:,.0f}'.format)
             qoq_table['주식수 증감'] = qoq_table['주식수 증감'].map('{:+,.0f}'.format)
-            st.dataframe(qoq_table, use_container_width=True, hide_index=True)
+            st.dataframe(qoq_table, width="stretch", hide_index=True)
         else:
             st.info("비교 가능한 직전 분기 공시 데이터가 없습니다.")
 
@@ -361,7 +361,7 @@ def render_sec_view():
                 xaxis_title="포트폴리오 비중 (%)", yaxis_title="",
                 margin=dict(l=20, r=40, t=40, b=20)
             )
-            st.plotly_chart(fig_bar, use_container_width=True)
+            st.plotly_chart(fig_bar, width="stretch")
 
     st.divider()
 
@@ -372,4 +372,4 @@ def render_sec_view():
     df_display['비중 (%)'] = df_display['비중 (%)'].map('{:.2f}%'.format)
     df_display['평가액 ($)'] = df_display['평가액 ($)'].map('${:,.0f}'.format)
     df_display['보유 주식수'] = df_display['보유 주식수'].map('{:,.0f}'.format)
-    st.dataframe(df_display, use_container_width=True, hide_index=True)
+    st.dataframe(df_display, width="stretch", hide_index=True)
