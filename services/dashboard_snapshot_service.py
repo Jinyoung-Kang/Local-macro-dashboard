@@ -79,7 +79,7 @@ def _collect_krx_investor_trend() -> pd.DataFrame | None:
     반환 DataFrame에는 is_placeholder 컬럼이 반드시 포함돼, 화면·텍스트가
     "실데이터인지 예시인지"를 구분할 수 있습니다.
     """
-    df = safe_call(fetch_daum_futures_investor_trend, 25, "CONTRACT")
+    df = safe_call(fetch_daum_futures_investor_trend, 25)
 
     if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
         out = df.copy()

@@ -306,28 +306,20 @@ def _task_krx_futures() -> str:
 
 
 def _task_daum_futures_trend() -> str:
-    """KRX 화면이 페이지 로드 시 바로 쓰는 Daum 선물 수급 조합을 미리 받습니다."""
+    """KRX 화면이 페이지 로드 시 바로 쓰는 Daum 선물 수급을 미리 받습니다."""
     from services import datasets, store
     from services.krx_service import collect_daum_futures_investor_trend
 
-    # views/krx_cot_view.py의 기본 선택값 조합
-    combos = [(25, "CONTRACT"), (25, "PRICE")]
+    # views/krx_cot_view.py가 쓰는 기간. 금액(억원) 기준은 Daum이 제공하지
+    # 않아 제거됐으므로, 예전의 CONTRACT/PRICE 2회 요청이 1회로 줄었습니다.
+    lookback = 25
 
-    ok = 0
-    for lookback, measure in combos:
-        df = collect_daum_futures_investor_trend(lookback, measure)
-        if df is None or df.empty:
-            logger.info("    Daum 선물 빈 결과(저장본 유지): d%s/%s", lookback, measure)
-            continue
-        store.put_frame(
-            datasets.snap_daum_futures_trend(lookback, measure), df,
-        )
-        ok += 1
+    df = collect_daum_futures_investor_trend(lookback)
+    if df is None or df.empty:
+        raise EmptyResult("빈 결과 — 기존 저장본 유지")
 
-    if not ok:
-        raise EmptyResult(f"0/{len(combos)} 조합 — 기존 저장본 유지")
-
-    return f"{ok}/{len(combos)} 조합"
+    store.put_frame(datasets.snap_daum_futures_trend(lookback), df)
+    return f"{len(df)}행"
 
 
 def _task_volatility_history() -> str:

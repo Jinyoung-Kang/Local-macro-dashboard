@@ -7,6 +7,7 @@ tests/test_store.py
 import os
 import sys
 
+import pathlib
 import pandas as pd
 import pytest
 
@@ -437,7 +438,7 @@ def test_dataset_names_are_unique():
         datasets.snap_radar_scanner("KOSPI", "외국인", "순매수", "TODAY"),
         datasets.snap_sec_13f("0001067983", 8),
         datasets.snap_cot_contract("13874A", 166),
-        datasets.snap_daum_futures_trend(25, "CONTRACT"),
+        datasets.snap_daum_futures_trend(25),
     ]
     assert len(generated) == len(set(generated))
     assert not set(fixed) & set(generated)
@@ -1310,7 +1311,7 @@ def test_krx_investor_prefers_real_daum_data(monkeypatch):
         "5일 누적": 200, "20일 누적": 300,
     }])
     monkeypatch.setattr(
-        dss, "fetch_daum_futures_investor_trend", lambda d, m: real,
+        dss, "fetch_daum_futures_investor_trend", lambda d: real,
     )
 
     called = []
@@ -1330,7 +1331,7 @@ def test_krx_investor_falls_back_and_marks_placeholder(monkeypatch):
 
     monkeypatch.setattr(
         dss, "fetch_daum_futures_investor_trend",
-        lambda d, m: pd.DataFrame(),
+        lambda d: pd.DataFrame(),
     )
     out = dss._collect_krx_investor_trend()
 
@@ -1407,32 +1408,36 @@ def test_snapshot_tag_cleaner_delegates_to_single_implementation():
 # ==============================================================================
 # 25. KRX 금액(억원) 기준 — 계약수를 1e8로 나눠 0이 되면 안 된다
 # ==============================================================================
-def test_won_amount_detection_separates_contracts_from_won():
+# 25. KRX 금액(억원) 기준 제거 — Daum이 제공하지 않는 모드였다
+# ==============================================================================
+def test_daum_futures_trend_has_no_measure_parameter():
     """
-    KOSPI200 선물 순매수는 원 단위면 1e8~1e12, 계약수면 1e2~1e5 규모라
-    크기로 확실히 구분됩니다.
-
-    판별 근거가 없는 경우(컬럼 없음 / 전부 0)는 ""를 돌려줘야 합니다.
-    "API가 요청을 무시했다"고 단정하면 거짓 경고가 되기 때문입니다.
+    [회귀] "수급 표시 기준: 금액(억원)"은 type=PRICE 파라미터가 먹힌다는
+    가정 위에 있었습니다. 실제로는 계약수가 그대로 돌아왔고, 그 값을
+    1억으로 나눠 화면의 금액이 전부 0.0이 됐습니다(사용자 신고).
+    모드 자체를 제거했으므로 measure 인자가 되살아나면 안 됩니다.
     """
-    from services.krx_service import _detect_measure_unit
+    import inspect
+    from services import datasets
+    from services.krx_service import (
+        collect_daum_futures_investor_trend,
+        fetch_daum_futures_investor_trend,
+    )
 
-    cols = ["frgn", "inst"]
-    won = pd.DataFrame({"frgn": [3.4e11, -2.1e11], "inst": [1.2e10, -8e9]})
-    contracts = pd.DataFrame({"frgn": [3450, -2100], "inst": [1200, -800]})
-    zeros = pd.DataFrame({"frgn": [0.0, 0.0], "inst": [0.0, 0.0]})
+    for fn in (collect_daum_futures_investor_trend,
+               fetch_daum_futures_investor_trend):
+        params = inspect.signature(fn).parameters
+        assert "measure" not in params, f"{fn.__name__}에 measure가 남아 있습니다"
 
-    assert _detect_measure_unit(won, cols) == "PRICE"
-    assert _detect_measure_unit(contracts, cols) == "CONTRACT"
-    assert _detect_measure_unit(pd.DataFrame(), cols) == ""
-    assert _detect_measure_unit(zeros, cols) == ""
+    assert "measure" not in inspect.signature(
+        datasets.snap_daum_futures_trend
+    ).parameters
 
 
-def test_price_measure_falls_back_when_api_ignores_type(monkeypatch):
+def test_daum_futures_trend_returns_contract_counts(monkeypatch):
     """
-    [회귀] Daum이 type=PRICE를 무시하고 계약수를 반환하면, 계약수를
-    1억으로 나눠 화면의 "금액(억원)" 값이 전부 0.0이 됐습니다.
-    이제 계약수 기준으로 되돌리고 그 사유를 데이터에 실어 보냅니다.
+    계약수는 1억으로 나누지 않고 그대로(정수) 나와야 합니다.
+    예전 금액 모드에서 3450 계약 → 0.0이 되던 것이 버그의 실체였습니다.
     """
     import services.krx_service as krx
 
@@ -1441,7 +1446,6 @@ def test_price_measure_falls_back_when_api_ignores_type(monkeypatch):
 
         @staticmethod
         def json():
-            # 계약수 규모의 값 (원 단위가 아님)
             return {"data": [
                 {"date": "2026-09-11", **{
                     field: 3450 for _, field in krx.DAUM_FUTURES_CATEGORY_MAP
@@ -1452,39 +1456,192 @@ def test_price_measure_falls_back_when_api_ignores_type(monkeypatch):
         "S", (), {"get": staticmethod(lambda *a, **k: _Resp())},
     )())
 
-    df = krx.collect_daum_futures_investor_trend(25, "PRICE")
+    df = krx.collect_daum_futures_investor_trend(25)
 
     assert not df.empty
-    assert df["data_measure"].iloc[0] == "CONTRACT", "계약수로 되돌려야 합니다"
+    assert df["data_measure"].iloc[0] == "CONTRACT"
     assert df["data_unit"].iloc[0] == "계약"
-    assert df["measure_fallback_reason"].iloc[0], "사유가 비어 있습니다"
-    # 0.0으로 뭉개지지 않아야 합니다.
-    assert df["당일 순매수"].abs().max() > 0
+    assert "measure_fallback_reason" not in df.columns
+    assert df["당일 순매수"].iloc[0] == 3450, "계약수가 0으로 뭉개졌습니다"
 
 
-def test_price_measure_kept_when_api_returns_won(monkeypatch):
-    """실제 원 단위 금액이 오면 정상적으로 억 원으로 변환돼야 합니다."""
-    import services.krx_service as krx
+def test_krx_view_has_no_amount_radio():
+    """화면에서도 금액(억원) 선택지가 사라져야 합니다."""
+    source = pathlib.Path("views/krx_cot_view.py").read_text(encoding="utf-8")
 
-    class _Resp:
-        status_code = 200
+    body = "\n".join(
+        line for line in source.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert '"금액(억원)"' not in body
+    assert "수급 표시 기준" not in body
 
-        @staticmethod
-        def json():
-            return {"data": [
-                {"date": "2026-09-11", **{
-                    field: 3.45e11 for _, field in krx.DAUM_FUTURES_CATEGORY_MAP
-                }},
-            ]}
 
-    monkeypatch.setattr(krx, "get_session", lambda: type(
-        "S", (), {"get": staticmethod(lambda *a, **k: _Resp())},
-    )())
+# ==============================================================================
+# 26. 분봉이 정체됐을 때 전일 종가를 일봉에서 보완한다
+# ==============================================================================
+def _daily_frame(values, start="2026-09-07"):
+    idx = pd.date_range(start=start, periods=len(values), freq="D")
+    return pd.DataFrame({"Close": values}, index=idx)
 
-    df = krx.collect_daum_futures_investor_trend(25, "PRICE")
 
-    assert df["data_measure"].iloc[0] == "PRICE"
-    assert df["data_unit"].iloc[0] == "억 원"
-    assert not df["measure_fallback_reason"].iloc[0]
-    # 3.45e11 원 = 3450 억 원
-    assert df["당일 순매수"].iloc[0] == pytest.approx(3450.0, rel=1e-3)
+def test_previous_close_from_daily_skips_current_trading_day():
+    """
+    현재가가 속한 거래일은 건너뛰고 '그 앞' 거래일 종가를 골라야 합니다.
+    """
+    import services.macro_service as ms
+
+    daily = _daily_frame([8.60, 8.65, 8.71])   # 09-07, 09-08, 09-09
+    ms.fetch_ticker_data.clear()
+
+    orig = ms.fetch_ticker_data
+    try:
+        ms.fetch_ticker_data = lambda symbol, period="1mo": daily
+        # 현재가 시각이 09-09이면 09-08 종가가 전일 종가입니다.
+        assert ms.get_previous_close_from_daily(
+            "JPYKRW=X", pd.Timestamp("2026-09-09 06:28"),
+        ) == pytest.approx(8.65)
+        # 기준 시각을 안 주면 끝에서 두 번째 값
+        assert ms.get_previous_close_from_daily("JPYKRW=X") == pytest.approx(8.65)
+    finally:
+        ms.fetch_ticker_data = orig
+
+
+def test_previous_close_from_daily_returns_none_when_too_short():
+    import services.macro_service as ms
+
+    orig = ms.fetch_ticker_data
+    try:
+        ms.fetch_ticker_data = lambda symbol, period="1mo": _daily_frame([8.71])
+        assert ms.get_previous_close_from_daily("JPYKRW=X") is None
+
+        ms.fetch_ticker_data = lambda symbol, period="1mo": pd.DataFrame()
+        assert ms.get_previous_close_from_daily("JPYKRW=X") is None
+    finally:
+        ms.fetch_ticker_data = orig
+
+
+def test_jpy_krw_prev_close_recovered_from_daily_bars(monkeypatch):
+    """
+    [회귀] 엔/원 100엔당 카드가 '전일 종가: N/A'로 표시되던 문제.
+
+    주말·비유동 시간대에는 1분봉 피드가 마지막 봉을 그대로 반복해서
+    마지막 두 봉의 종가가 같아집니다. 그러면 전일 대비를 계산할 수 없는데,
+    예전에는 이미 알고 있는 전일 종가까지 버려 N/A가 됐습니다.
+    이제 일봉에서 직전 거래일 종가를 가져와 채웁니다.
+    """
+    import services.macro_service as ms
+
+    # 마지막 두 봉의 종가가 완전히 같은 정체된 분봉
+    stale = pd.DataFrame(
+        {"Close": [8.71, 8.71]},
+        index=pd.to_datetime(["2026-09-12 06:27", "2026-09-12 06:28"]),
+    )
+    stale.attrs["is_intraday"] = True
+
+    daily = _daily_frame([8.60, 8.65, 8.71], start="2026-09-10")
+
+    def _fake_fetch(symbol, period="1mo"):
+        return stale if period == "5d" else daily
+
+    monkeypatch.setattr(ms, "fetch_ticker_data", _fake_fetch)
+    monkeypatch.setattr(
+        ms, "MACRO_CATEGORIES",
+        {"통화": {"엔/원 100엔당 (JPY/KRW) :gray[[실시간]]": "JPYKRW=X"}},
+    )
+    monkeypatch.setattr(ms, "_apply_bond_scanner_override", lambda *a, **k: a)
+
+    collected = ms.collect_macro_data()[0]
+    item = collected["통화"][0]
+
+    assert item["status"] == "ok"
+    # 8.71 < 50 이므로 100엔당으로 환산됩니다.
+    assert item["price_str"] == "871.00"
+    # 전일 종가가 N/A가 아니라 일봉의 직전 거래일(8.65 → 865.00)이어야 합니다.
+    assert item["prev_str"] == "865.00", item["prev_str"]
+    assert item["prev_source"] == "일봉 직전 거래일 종가"
+    # 배율이 현재가에만 적용돼 100배 틀어지면 안 됩니다.
+    assert item["delta"] == pytest.approx(6.0, abs=0.01)
+    assert item["delta_str"].startswith("+6.00")
+
+
+def test_single_bar_recovers_prev_close_from_daily(monkeypatch):
+    """
+    분봉이 딱 한 개만 오는 날에도 같은 원인으로 '전일 데이터 없음'이 됩니다.
+    일봉에서 직전 거래일 종가를 찾으면 정상 카드로 승격돼야 합니다.
+    """
+    import services.macro_service as ms
+
+    one_bar = pd.DataFrame(
+        {"Close": [8.71]},
+        index=pd.to_datetime(["2026-09-12 06:28"]),
+    )
+    one_bar.attrs["is_intraday"] = True
+    daily = _daily_frame([8.60, 8.65, 8.71], start="2026-09-10")
+
+    monkeypatch.setattr(
+        ms, "fetch_ticker_data",
+        lambda symbol, period="1mo": one_bar if period == "5d" else daily,
+    )
+    monkeypatch.setattr(
+        ms, "MACRO_CATEGORIES",
+        {"통화": {"엔/원 100엔당 (JPY/KRW) :gray[[실시간]]": "JPYKRW=X"}},
+    )
+    monkeypatch.setattr(ms, "_apply_bond_scanner_override", lambda *a, **k: a)
+
+    item = ms.collect_macro_data()[0]["통화"][0]
+    assert item["status"] == "ok"
+    assert item["price_str"] == "871.00"
+    assert item["prev_str"] == "865.00"
+    assert item["prev_source"] == "일봉 직전 거래일 종가"
+
+
+def test_single_bar_stays_na_without_daily_fallback(monkeypatch):
+    """일봉에서도 못 찾으면 0.00%로 위장하지 않고 N/A로 남아야 합니다."""
+    import services.macro_service as ms
+
+    one_bar = pd.DataFrame(
+        {"Close": [8.71]}, index=pd.to_datetime(["2026-09-12 06:28"]),
+    )
+    one_bar.attrs["is_intraday"] = True
+
+    monkeypatch.setattr(
+        ms, "fetch_ticker_data",
+        lambda symbol, period="1mo": one_bar if period == "5d" else pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        ms, "MACRO_CATEGORIES",
+        {"통화": {"엔/원 100엔당 (JPY/KRW) :gray[[실시간]]": "JPYKRW=X"}},
+    )
+    monkeypatch.setattr(ms, "_apply_bond_scanner_override", lambda *a, **k: a)
+
+    item = ms.collect_macro_data()[0]["통화"][0]
+    assert item["status"] == "single"
+    assert item["prev_str"] == "N/A"
+    assert item["delta"] is None
+
+
+def test_stale_intraday_stays_na_without_daily_fallback(monkeypatch):
+    """정체된 분봉 + 일봉 폴백 실패 → 여전히 N/A (0.00% 위장 금지)."""
+    import services.macro_service as ms
+
+    stale = pd.DataFrame(
+        {"Close": [8.71, 8.71]},
+        index=pd.to_datetime(["2026-09-12 06:27", "2026-09-12 06:28"]),
+    )
+    stale.attrs["is_intraday"] = True
+
+    monkeypatch.setattr(
+        ms, "fetch_ticker_data",
+        lambda symbol, period="1mo": stale if period == "5d" else pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        ms, "MACRO_CATEGORIES",
+        {"통화": {"엔/원 100엔당 (JPY/KRW) :gray[[실시간]]": "JPYKRW=X"}},
+    )
+    monkeypatch.setattr(ms, "_apply_bond_scanner_override", lambda *a, **k: a)
+
+    item = ms.collect_macro_data()[0]["통화"][0]
+    assert item["delta"] is None
+    assert item["prev_str"] == "N/A"
+    assert "prev_source" not in item

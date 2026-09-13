@@ -470,48 +470,18 @@ DAUM_FUTURES_CATEGORY_MAP = [
 ]
 
 
-def _detect_measure_unit(df_raw: pd.DataFrame, columns: list[str]) -> str:
-    """
-    파싱된 값이 '원 단위 금액'인지 '계약수'인지 크기로 판별합니다.
-
-    KOSPI200 선물 투자자별 순매수는
-      - 원 단위 금액: 최소 수억 원 (1e8) ~ 수천억 원 (1e12)
-      - 계약수      : 수백 ~ 수만 (1e2 ~ 1e5)
-    이므로 1e7을 경계로 두면 안전하게 구분됩니다.
-
-    반환값:
-      "PRICE"    — 원 단위 금액이 확실함
-      "CONTRACT" — 계약수가 확실함
-      ""         — 판별 불가(컬럼 없음 / 전부 0 / 비수치).
-                   이때는 "API가 요청을 무시했다"고 단정할 근거가 없으므로
-                   호출자가 요청 기준을 그대로 유지해야 합니다.
-    """
-    present = [c for c in columns if c in df_raw.columns]
-    if not present:
-        return ""
-
-    try:
-        peak = float(df_raw[present].abs().to_numpy().max())
-    except (ValueError, TypeError):
-        return ""
-
-    if not peak or peak != peak:          # 0 또는 NaN → 근거 없음
-        return ""
-
-    return "PRICE" if peak >= 1e7 else "CONTRACT"
-
-
 def collect_daum_futures_investor_trend(
     lookback_days: int = 25,
-    measure: str = "CONTRACT",
 ) -> pd.DataFrame:
     """
     Daum 금융 '투자주체별 매매동향(선물)' 내부 JSON API에서
-    KOSPI 200 선물의 투자자별 일자별 순매수 데이터를 가져옵니다.
+    KOSPI 200 선물의 투자자별 일자별 순매수 **계약수**를 가져옵니다.
 
-    measure:
-    - CONTRACT: 계약수 기준 (기본값)
-    - PRICE: 금액 기준. Daum 원 단위 응답을 억 원 단위로 변환합니다.
+    [제거된 기능] 예전에는 measure="PRICE"로 금액(억원) 기준을 요청할 수
+    있었습니다. 그러나 이 엔드포인트는 금액을 제공하지 않습니다. type=PRICE를
+    붙여도 응답은 계약수 그대로였고(응답 필드도 *Settlement 계약수 필드가
+    전부입니다), 그 값을 1억으로 나누는 바람에 화면의 모든 금액이 0.0으로
+    표시됐습니다. 확인할 수 없는 모드를 유지하는 대신 계약수만 다룹니다.
 
     반환 컬럼:
     - 투자 주체
@@ -520,19 +490,9 @@ def collect_daum_futures_investor_trend(
     - 20일 누적
     - 포지션 성향
     - is_placeholder
-    - data_measure
-    - data_unit
+    - data_measure ("CONTRACT" 고정)
+    - data_unit    ("계약" 고정)
     """
-    valid_measures = {"CONTRACT", "PRICE"}
-    measure = str(measure).upper().strip()
-
-    if measure not in valid_measures:
-        logger.warning(
-            "Daum 선물 수급 지원하지 않는 measure=%s. CONTRACT로 변경합니다.",
-            measure,
-        )
-        measure = "CONTRACT"
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -552,11 +512,6 @@ def collect_daum_futures_investor_trend(
         "pagination": "true",
     }
 
-    # Daum API는 계약수 모드일 때 type 파라미터가 없고,
-    # 금액 모드일 때만 type=PRICE를 사용합니다.
-    if measure == "PRICE":
-        params["type"] = "PRICE"
-
     try:
         response = get_session().get(
             DAUM_FUTURES_INVESTOR_URL,
@@ -567,9 +522,7 @@ def collect_daum_futures_investor_trend(
 
         if response.status_code != 200:
             logger.warning(
-                "Daum 선물 투자주체별 매매동향 API HTTP 실패: "
-                "measure=%s, status=%s",
-                measure,
+                "Daum 선물 투자주체별 매매동향 API HTTP 실패: status=%s",
                 response.status_code,
             )
             return pd.DataFrame()
@@ -579,8 +532,8 @@ def collect_daum_futures_investor_trend(
 
         if not isinstance(rows, list) or not rows:
             logger.warning(
-                "Daum 선물 투자주체별 매매동향 API 빈 응답: measure=%s",
-                measure,
+                "Daum 선물 투자주체별 매매동향 API 빈 응답 (lookback=%s)",
+                lookback_days,
             )
             return pd.DataFrame()
 
@@ -603,8 +556,8 @@ def collect_daum_futures_investor_trend(
 
         if not parsed_rows:
             logger.warning(
-                "Daum 선물 수급 API 파싱 결과가 비어 있습니다: measure=%s",
-                measure,
+                "Daum 선물 수급 API 파싱 결과가 비어 있습니다 (lookback=%s)",
+                lookback_days,
             )
             return pd.DataFrame()
 
@@ -630,44 +583,12 @@ def collect_daum_futures_investor_trend(
             numeric_only=True
         )
 
-        # ----------------------------------------------------------------
-        # [버그 수정] type=PRICE를 보내도 Daum이 이를 무시하고 계약수를
-        # 그대로 돌려주는 경우가 있습니다. 그때 계약수(수천 단위)를
-        # 1억으로 나누면 전부 0.0이 되어, 화면의 "금액(억원)" 기준이
-        # 그냥 0만 뜨는 상태가 됩니다("작동하지 않는다"의 실체).
-        #
-        # 원 단위 금액이라면 KOSPI200 선물 순매수는 최소 수억~수천억 원
-        # (1e8~1e12) 규모이고, 계약수라면 1e2~1e5 규모입니다. 두 범위는
-        # 확실히 구분되므로 크기로 판별합니다.
-        # ----------------------------------------------------------------
-        measure_fallback_reason = None
-        if measure == "PRICE" and _detect_measure_unit(
-            df_raw, numeric_columns,
-        ) == "CONTRACT":
-            measure_fallback_reason = (
-                "Daum API가 금액(type=PRICE) 요청을 무시하고 계약수를 "
-                "반환했습니다. 0으로 표시하지 않도록 계약수 기준으로 "
-                "되돌립니다."
-            )
-            logger.warning(
-                "Daum 선물 수급: %s", measure_fallback_reason,
-            )
-            measure = "CONTRACT"
-
-        divisor = 100_000_000 if measure == "PRICE" else 1
-        unit = "억 원" if measure == "PRICE" else "계약"
-        measure_label = "금액" if measure == "PRICE" else "계약수"
-
         records = []
 
         for label, field in DAUM_FUTURES_CATEGORY_MAP:
-            raw_today = float(today_row.get(field, 0.0) or 0.0)
-            raw_5d = float(cum_5d.get(field, 0.0) or 0.0)
-            raw_20d = float(cum_20d.get(field, 0.0) or 0.0)
-
-            net_today = raw_today / divisor
-            net_5d = raw_5d / divisor
-            net_20d = raw_20d / divisor
+            net_today = float(today_row.get(field, 0.0) or 0.0)
+            net_5d = float(cum_5d.get(field, 0.0) or 0.0)
+            net_20d = float(cum_20d.get(field, 0.0) or 0.0)
 
             # 포지션 성향은 최근 20거래일 누적값을 기준으로 판단합니다.
             if net_20d > 0:
@@ -677,14 +598,9 @@ def collect_daum_futures_investor_trend(
             else:
                 stance = "⚪ 중립"
 
-            if measure == "PRICE":
-                net_today = round(net_today, 1)
-                net_5d = round(net_5d, 1)
-                net_20d = round(net_20d, 1)
-            else:
-                net_today = int(net_today)
-                net_5d = int(net_5d)
-                net_20d = int(net_20d)
+            net_today = int(net_today)
+            net_5d = int(net_5d)
+            net_20d = int(net_20d)
 
             records.append({
                 "투자 주체": label,
@@ -698,18 +614,15 @@ def collect_daum_futures_investor_trend(
 
         # 뷰에서 토글별 표기·포맷을 결정하는 데 사용합니다.
         df_result["is_placeholder"] = False
-        df_result["data_measure"] = measure
-        df_result["data_unit"] = unit
-        # 요청한 기준과 실제 데이터 기준이 다르면 화면이 알려 줘야 합니다.
-        df_result["measure_fallback_reason"] = measure_fallback_reason or ""
+        df_result["data_measure"] = "CONTRACT"
+        df_result["data_unit"] = "계약"
         df_result["data_date"] = str(
             today_row.get("date", "")
         )[:10]
 
         logger.info(
             "Daum 선물 투자주체별 매매동향 수집 성공: "
-            "measure=%s, rows=%s, 기준일=%s",
-            measure_label,
+            "계약수 기준, rows=%s, 기준일=%s",
             len(df_result),
             today_row.get("date"),
         )
@@ -718,9 +631,8 @@ def collect_daum_futures_investor_trend(
 
     except Exception as e:
         logger.warning(
-            "Daum 선물 투자주체별 매매동향 수집 실패: "
-            "measure=%s, error=%s",
-            measure,
+            "Daum 선물 투자주체별 매매동향 수집 실패: lookback=%s, error=%s",
+            lookback_days,
             e,
         )
         return pd.DataFrame()
@@ -732,22 +644,28 @@ def collect_daum_futures_investor_trend(
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_daum_futures_investor_trend(
     lookback_days: int = 25,
-    measure: str = "CONTRACT",
 ) -> pd.DataFrame:
     """
     화면용 진입점. 저장본 우선.
 
-    Daum 내부 JSON API는 조회 조건(기간·기준)별로 응답이 달라 스냅샷 키에
-    조건을 포함합니다. 일별 확정치라 수집기 주기(1시간)로 충분합니다.
+    Daum 내부 JSON API는 조회 기간별로 응답이 달라 스냅샷 키에 기간을
+    포함합니다. 일별 확정치라 수집기 주기(1시간)로 충분합니다.
+
+    required_columns를 지정해, 금액 모드를 쓰던 예전 스키마의 저장본이
+    남아 있어도 그대로 화면에 오지 않고 다시 수집하게 합니다.
     """
     def _collect():
-        return collect_daum_futures_investor_trend(lookback_days, measure)
+        return collect_daum_futures_investor_trend(lookback_days)
 
     df = store.cached_or_live(
-        datasets.snap_daum_futures_trend(lookback_days, measure),
+        datasets.snap_daum_futures_trend(lookback_days),
         _collect,
         max_age_seconds=datasets.MAX_AGE_DAILY,
         as_frame=True,
+        required_columns=(
+            "투자 주체", "당일 순매수", "5일 누적", "20일 누적",
+            "포지션 성향", "is_placeholder", "data_measure",
+        ),
     )
     return df if df is not None else pd.DataFrame()
 

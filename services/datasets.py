@@ -24,8 +24,11 @@ SNAP_COT_HISTORY = "cot.multi_asset"              # CFTC COT (DataFrame 중첩)
 
 
 # Daum 선물 투자주체별 매매동향 (조회 조건별)
-def snap_daum_futures_trend(lookback_days: int, measure: str) -> str:
-    return f"krx.daum_futures_trend.d{lookback_days}.{measure}"
+def snap_daum_futures_trend(lookback_days: int) -> str:
+    # 예전에는 .CONTRACT / .PRICE 접미사로 기준을 구분했습니다. 금액 기준이
+    # 제거돼 접미사가 무의미해졌지만, 예전 키의 저장본과 섞이지 않도록
+    # .CONTRACT를 그대로 둡니다(이 키가 계약수 기준임을 명시하는 역할).
+    return f"krx.daum_futures_trend.d{lookback_days}.CONTRACT"
 
 
 # 변동성 지수(^VIX / ^MOVE)는 가장 긴 기간으로 한 번 저장하고,

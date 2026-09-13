@@ -535,6 +535,69 @@ def get_bond_previous_close_from_fred(scraper_key: str) -> float | None:
 
 
 # ==============================================================================
+# 2-3. 분봉이 전일 대비를 못 줄 때의 일봉 폴백
+# ==============================================================================
+# 카드 수치는 period="5d"의 **1분봉**에서 나옵니다. 주말·휴장·비유동 시간대
+# 에는 분봉 피드가 마지막 봉을 그대로 반복해서 내려주는 경우가 있고, 그러면
+# 마지막 두 봉의 종가가 완전히 같아집니다. 이때 "변화 없음(0.00%)"으로
+# 표시하면 거짓이므로 delta를 N/A로 두는데, 그 과정에서 **전일 종가까지
+# 같이 N/A**가 돼 버렸습니다(엔/원 100엔당 카드에서 사용자가 신고한 증상).
+#
+# 분봉의 직전 봉이 쓸모없을 뿐, 일봉에는 직전 거래일 종가가 그대로 있습니다.
+# 미국채에서 FRED 확정치로 전일값을 보완한 것과 같은 방식입니다.
+def get_previous_close_from_daily(
+    symbol: str,
+    current_ts=None,
+) -> float | None:
+    """
+    일봉에서 '현재가가 속한 거래일보다 앞선' 마지막 종가를 반환합니다.
+
+    current_ts를 주면 그 날짜보다 이전 거래일의 종가만 고릅니다. 주지 않으면
+    일봉의 끝에서 두 번째 값을 씁니다.
+
+    반환값은 yfinance 원본 스케일입니다. 표시 배율(엔/원 ×100 등)은
+    호출자가 현재가와 동일하게 적용해야 합니다.
+    """
+    if not symbol:
+        return None
+
+    try:
+        df = fetch_ticker_data(symbol, period="1mo")
+    except Exception as e:
+        logger.warning("일봉 전일 종가 조회 실패 (%s): %s", symbol, e)
+        return None
+
+    if df is None or not isinstance(df, pd.DataFrame) or "Close" not in df:
+        return None
+
+    closes = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    closes = closes[closes > 0]
+    if closes.empty:
+        return None
+
+    if current_ts is not None:
+        try:
+            index = pd.DatetimeIndex(closes.index)
+            if index.tz is not None:
+                index = index.tz_localize(None)
+
+            cur = pd.Timestamp(current_ts)
+            if cur.tzinfo is not None:
+                cur = cur.tz_localize(None)
+
+            earlier = closes[index.normalize() < cur.normalize()]
+            if not earlier.empty:
+                return float(earlier.iloc[-1])
+        except Exception as e:
+            logger.debug("일봉 거래일 비교 실패 (%s): %s", symbol, e)
+
+    if len(closes) >= 2:
+        return float(closes.iloc[-2])
+
+    return None
+
+
+# ==============================================================================
 # 3. 실시간 매크로 전 지표 수집 및 텍스트 브리핑 생성
 # ==============================================================================
 def collect_macro_data():
@@ -570,16 +633,33 @@ def collect_macro_data():
         for name, ticker in items.items():
             _, df = raw.get(cat_name, {}).get(name, (ticker, None))
             if df is not None and isinstance(df, pd.DataFrame) and len(df) >= 2:
-                curr = float(df['Close'].iloc[-1])
-                prev = float(df['Close'].iloc[-2])
-                if "JPY/KRW" in name and curr < 50:
-                    curr, prev = curr * 100, prev * 100
+                raw_curr = float(df['Close'].iloc[-1])
+                raw_prev = float(df['Close'].iloc[-2])
+
+                # 야후의 JPYKRW=X는 '1엔당 원'이라 화면 표기 단위(100엔당)와
+                # 다릅니다. 배율은 원본 현재가로 한 번만 판정하고 현재가·
+                # 전일값에 똑같이 적용합니다. (전일값을 스케일 적용 후의
+                # 현재가로 판정하면 배율이 빠져 100배 틀어집니다.)
+                scale = 100.0 if ("JPY/KRW" in name and raw_curr < 50) else 1.0
+                curr = raw_curr * scale
+                prev = raw_prev * scale
+
+                prev_source = None
 
                 # [수정] 최근 2개 봉의 종가가 완전히 동일하면(휴장·야간시간대에
-                # 마지막 봉이 그대로 복제되는 경우 포함), 등락률을
-                # "변화 없음(0.00%)"으로 위장하지 않고 신뢰할 수 없는 값으로
-                # 간주해 N/A 처리합니다. 실제 무변동인지, 데이터 정체인지
-                # 구분할 수 없기 때문입니다.
+                # 마지막 봉이 그대로 복제되는 경우 포함) 분봉으로는 전일 대비를
+                # 알 수 없습니다. 예전에는 여기서 끝내 버려 전일 종가까지
+                # N/A로 사라졌는데, 일봉에는 직전 거래일 종가가 남아 있으므로
+                # 그걸로 보완합니다. 그래도 못 구하면 "변화 없음(0.00%)"으로
+                # 위장하지 않고 N/A로 둡니다.
+                if curr == prev:
+                    daily_prev = get_previous_close_from_daily(
+                        ticker, df.index[-1],
+                    )
+                    if daily_prev is not None and daily_prev * scale != curr:
+                        prev = daily_prev * scale
+                        prev_source = "일봉 직전 거래일 종가"
+
                 if curr == prev:
                     delta = None
                     pct = None
@@ -616,7 +696,11 @@ def collect_macro_data():
                     if delta is not None and pct is not None
                     else "N/A"
                 )
-                collected[cat_name].append({
+                # delta가 None이라는 것은 곧 "직전 봉이 현재 봉과 같아서
+                # 전일 종가로 쓸 수 없다"는 뜻입니다. 그 값을 "전일 종가"라고
+                # 이름 붙여 보여 주면 오히려 거짓말이 되므로 N/A로 둡니다.
+                # 진짜 전일 종가는 위의 일봉 폴백에서 채워집니다.
+                item_out = {
                     "name": name,
                     "price": curr,
                     "delta": delta,
@@ -626,14 +710,19 @@ def collect_macro_data():
                     "prev_str": f"{prev:,.2f}" if delta is not None else "N/A",
                     "status": "ok",
                     "last_ts": last_ts_str,
-                })
+                }
+                if prev_source:
+                    item_out["prev_source"] = prev_source
+                collected[cat_name].append(item_out)
                 if ticker == "^TNX":
                     rate_10y_curr, rate_10y_prev = curr, (prev if delta is not None else None)
                 elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
                     rate_2y_curr, rate_2y_prev = curr, (prev if delta is not None else None)
 
             elif df is not None and isinstance(df, pd.DataFrame) and len(df) == 1:
-                curr = float(df['Close'].iloc[-1])
+                raw_curr = float(df['Close'].iloc[-1])
+                scale = 100.0 if ("JPY/KRW" in name and raw_curr < 50) else 1.0
+                curr = raw_curr * scale
 
                 last_timestamp = df.index[-1]
                 is_intraday = bool(df.attrs.get("is_intraday", False))
@@ -655,24 +744,55 @@ def collect_macro_data():
                 except Exception:
                     last_ts_str = "N/A"
 
-                # [수정] 데이터가 1개뿐이면 직전값을 알 수 없으므로, curr를
+                # 봉이 하나뿐이면 분봉만으로는 직전값을 알 수 없습니다.
+                # 위의 정체된 분봉과 원인이 같으므로(얇은 피드) 같은 방식으로
+                # 일봉에서 직전 거래일 종가를 찾아봅니다. 못 찾으면 curr를
                 # prev처럼 위장해 "변화 없음(0.00%)"으로 표시하지 않고
                 # delta/pct를 명시적으로 None(N/A)으로 남깁니다.
-                collected[cat_name].append({
-                    "name": name,
-                    "price": curr,
-                    "delta": None,
-                    "pct": None,
-                    "price_str": f"{curr:,.2f}",
-                    "delta_str": "N/A",
-                    "prev_str": "N/A",
-                    "status": "single",
-                    "last_ts": last_ts_str,
-                })
+                daily_prev = get_previous_close_from_daily(
+                    ticker, last_timestamp,
+                )
+                prev_single = (
+                    daily_prev * scale if daily_prev is not None else None
+                )
+
+                if prev_single is not None and prev_single != curr:
+                    delta = curr - prev_single
+                    pct = (delta / prev_single) * 100 if prev_single != 0 else 0.0
+                    collected[cat_name].append({
+                        "name": name,
+                        "price": curr,
+                        "delta": delta,
+                        "pct": pct,
+                        "price_str": f"{curr:,.2f}",
+                        "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
+                        "prev_str": f"{prev_single:,.2f}",
+                        "prev_source": "일봉 직전 거래일 종가",
+                        "status": "ok",
+                        "last_ts": last_ts_str,
+                    })
+                else:
+                    delta = None
+                    collected[cat_name].append({
+                        "name": name,
+                        "price": curr,
+                        "delta": None,
+                        "pct": None,
+                        "price_str": f"{curr:,.2f}",
+                        "delta_str": "N/A",
+                        "prev_str": "N/A",
+                        "status": "single",
+                        "last_ts": last_ts_str,
+                    })
+
                 if ticker == "^TNX":
-                    rate_10y_curr, rate_10y_prev = curr, None
+                    rate_10y_curr, rate_10y_prev = curr, (
+                        prev_single if delta is not None else None
+                    )
                 elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
-                    rate_2y_curr, rate_2y_prev = curr, None
+                    rate_2y_curr, rate_2y_prev = curr, (
+                        prev_single if delta is not None else None
+                    )
             else:
                 collected[cat_name].append({"name": name, "status": "fail"})
 

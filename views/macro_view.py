@@ -559,10 +559,16 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                     if delta_value is None:
                         col.caption(":gray[전일 대비 미제공]")
                     prev_label = f"전일 종가: `{item['prev_str']}`"
-                    if item.get("prev_source") == "FRED 공식 확정치":
+                    prev_source = item.get("prev_source")
+                    if prev_source == "FRED 공식 확정치":
                         # 현재가(TradingView 실시간)와 전일값(FRED 확정치)의
                         # 출처가 다르다는 점을 반드시 밝힙니다.
                         prev_label += " :gray[(FRED 확정치)]"
+                    elif prev_source == "일봉 직전 거래일 종가":
+                        # 분봉이 마지막 봉을 반복해 전일 대비를 못 줄 때,
+                        # 같은 심볼의 일봉에서 직전 거래일 종가를 가져온
+                        # 경우입니다. 현재가(분봉)와 기준이 다릅니다.
+                        prev_label += " :gray[(일봉 종가)]"
                     extra_caption_parts = [prev_label]
                     if item.get("contract_month"):
                         extra_caption_parts.append(f"월물: `{item['contract_month']}`")

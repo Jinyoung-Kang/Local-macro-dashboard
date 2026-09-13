@@ -1136,11 +1136,10 @@ def missing_datasets(db_path: Path | None = None) -> list[dict]:
             f"변동성 {symbol}",
         ))
 
-    for lookback, measure in ((25, "CONTRACT"), (25, "PRICE")):
-        expected.append((
-            ds.snap_daum_futures_trend(lookback, measure),
-            f"Daum 선물 수급 ({measure})",
-        ))
+    expected.append((
+        ds.snap_daum_futures_trend(25),
+        "Daum 선물 수급 (계약수)",
+    ))
 
     try:
         from services.cot_service import COT_ASSETS

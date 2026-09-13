@@ -153,18 +153,19 @@ st.sidebar.caption("글로벌 매크로 및 시장 수급 정밀 분석 시스�
 menu_selection = st.sidebar.radio(
     "이동할 메뉴를 선택하세요",
     [
-        "📊 거시경제 매크로 지표", 
-        "🏢 연준 순유동성 트래커", 
+        # 분석 메뉴 → 데이터 상태 → AI → 연결 진단 순서입니다.
+        "📊 거시경제 매크로 지표",
+        "🏢 연준 순유동성 트래커",
         "🔄 섹터 & 자산군 로테이션",
-        "🔌 토스증권 API 테스트",
-        "📑 기관 13F 포트폴리오 분석", 
+        "📑 기관 13F 포트폴리오 분석",
         "🎯 기관 13F Money 교집합",
         "🏛️ 글로벌 투기세력 (COT)",
         "🇰🇷 국내 파생 & 투기세력 (KRX)",
         "📡 외국인/기관 수급 레이더 (코스피)",
+        "🗄️ 데이터 저장소 상태",
         "🤖 AI 종합 데이터 분석 & 결론 리포트",
         "🤖 AI API 연결 테스트",
-        "🗄️ 데이터 저장소 상태"
+        "🔌 토스증권 API 테스트",
     ],
     index=0,
     label_visibility="collapsed"
@@ -257,8 +258,6 @@ elif menu_selection == "🏢 연준 순유동성 트래커":
     render_liquidity_view()
 elif menu_selection == "🔄 섹터 & 자산군 로테이션":
     render_sector_view()
-elif menu_selection == "🔌 토스증권 API 테스트":
-    render_toss_test_view()
 elif menu_selection == "📑 기관 13F 포트폴리오 분석":
     render_sec_view()
 elif menu_selection == "🎯 기관 13F Money 교집합":
@@ -269,9 +268,11 @@ elif menu_selection == "🇰🇷 국내 파생 & 투기세력 (KRX)":
     render_krx_cot_view()
 elif menu_selection == "📡 외국인/기관 수급 레이더 (코스피)":
     render_radar_view()
+elif menu_selection == "🗄️ 데이터 저장소 상태":
+    render_data_status_view()
 elif menu_selection == "🤖 AI 종합 데이터 분석 & 결론 리포트":
     render_ai_report_view()
 elif menu_selection == "🤖 AI API 연결 테스트":
     render_ai_test_view()
-elif menu_selection == "🗄️ 데이터 저장소 상태":
-    render_data_status_view()
+elif menu_selection == "🔌 토스증권 API 테스트":
+    render_toss_test_view()
