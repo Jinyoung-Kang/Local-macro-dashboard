@@ -81,10 +81,15 @@ def render_radar_view():
                 else:
                     st.warning(f"KIS API\n\n{kis_msg}")
             with test_col2:
+                # [버그 수정] 예전에는 실패 사유와 무관하게 "LS 계좌 미연결
+                # 또는 미사용"을 붙였습니다. 실제로는 토큰까지 정상 발급되고
+                # TR만 빈 응답이었는데, 사용자는 키가 등록 안 된 줄 알고
+                # 계속 키를 의심하게 됐습니다. 진단 함수가 만든 메시지를
+                # 그대로 보여 줍니다.
                 if ls_ok:
                     st.success(f"LS API\n\n{ls_msg}")
                 else:
-                    st.warning(f"LS API\n\nLS 계좌 미연결 또는 미사용\n\n{ls_msg}")
+                    st.warning(f"LS API\n\n{ls_msg}")
             with test_col3:
                 if pykrx_ok:
                     st.success(f"PyKrx/KRX\n\n{pykrx_msg}")

@@ -72,6 +72,10 @@ api_key = "KRX_OPEN_API_AUTH_KEY"   # http://data.krx.co.kr
 app_key    = "KIS_APP_KEY"          # https://apiportal.koreainvestment.com
 app_secret = "KIS_APP_SECRET"
 
+[ls]                                # 선택. https://openapi.ls-sec.co.kr
+app_key    = "LS_APP_KEY"           # LS증권 홈 > 매매시스템 > API > 사용등록/해지
+app_secret = "LS_APP_SECRET"        # ⚠️ "Open API"로 발급 (모의투자 키는 서버가 다릅니다)
+
 [ai]
 nvidia_api_key   = "..."            # https://build.nvidia.com
 cerebras_api_key = "..."
@@ -88,6 +92,7 @@ cloudflare_api_token  = "..."
 | `fred.api_key` | FRED 웹 CSV로 폴백 (대부분 정상 동작) |
 | `krx.api_key` | KRX 선물이 KODEX 200 기반 **추정치**로 폴백 (`is_estimated=True` 표시) |
 | `kis.app_key` / `kis.app_secret` | 장중 수급 가집계와 **교차 검증** 비활성화 |
+| `ls.app_key` / `ls.app_secret` | 수급 레이더 폴백 체인에서 LS 단계만 건너뜀 (KIS/Daum/Naver로 충분히 동작) |
 | `ai.*` | AI 리포트 메뉴만 비활성화 |
 
 ---
@@ -246,6 +251,17 @@ python collector.py --verify
   다시 읽기만 합니다(수집은 `collector.py`의 몫). 이때는 그 사실을 알리는
   안내가 뜹니다.
 
+### 수급 레이더 폴백 체인
+
+```
+KIS(장중 가집계) → Daum(API) → Naver(렌더링) → LS(OPEN API) → PyKrx → 누적 이력
+```
+
+앞쪽이 성공하면 뒤는 호출되지 않습니다. LS는 KIS/Daum/Naver 뒤에 있으므로,
+평소에는 쓰이지 않고 앞의 셋이 모두 실패했을 때만 동원됩니다.
+
+> **LS 키가 없어도 됩니다.** 없으면 그 단계만 건너뜁니다.
+
 ### 외부 소스가 모두 실패하면 — 누적 이력으로 대체
 
 Naver·Daum은 **과거 날짜 조회를 지원하지 않아**, 과거 수급 조회는 pykrx
@@ -383,11 +399,12 @@ python -m pytest tests/ -v
 - `tests/test_verification.py` — 교차 검증 판정 규칙, 장중/마감 시간 게이트,
   "확인 못 함"을 "일치"로 위장하지 않는지, 등락률 결측이 국면 판정을
   강세로 뒤집지 않는지, 외부 소스 전멸 시 누적 이력 대체,
-  연결 진단이 화면과 같은 데이터 경로를 보는지
+  연결 진단이 화면과 같은 데이터 경로를 보는지, LS 인증 단계 구분과
+  실패 토큰 비캐싱
 - `tests/test_browser_pool.py` — 헤드리스 브라우저가 스레드 교체를 견디는지
   (로컬 HTTP 서버만 사용, Chromium 없으면 자동 skip)
 
-모두 외부 네트워크를 쓰지 않으므로 언제든 돌 수 있습니다 (현재 153건).
+모두 외부 네트워크를 쓰지 않으므로 언제든 돌 수 있습니다 (현재 160건).
 
 ---
 
@@ -480,6 +497,9 @@ git push -u origin <브랜치명>
 | `--verify`가 "확인 못 함"만 나옴 | 시간 조건 때문입니다. 시세 대조는 장 마감 후, 수급 대조는 정규장 중에만 가능합니다 |
 | `--verify`에서 불일치 발견 | 비공식 소스(Daum·Naver·TradingView)의 페이지 구조 변경을 먼저 의심하세요 |
 | 수급 레이더에서 `PyKrx/KRX` 빨간 카드 | KRX가 pykrx에 JSON 대신 차단 페이지를 주고 있습니다(`Expecting value: line 1 column 1`). **업그레이드로는 해결되지 않습니다**(1.2.8이 최신). 당일 조회는 KIS/Daum/Naver로 정상이며, 과거 조회는 누적 이력으로 대체됩니다 |
+| LS API가 `해당자료가 없습니다` | **인증은 성공한 상태입니다**(토큰 발급 OK). 시세 TR은 정규장에만 데이터를 줍니다. 평일 09:00~15:30에 다시 확인하세요 |
+| LS API가 `OAuth 토큰 발급 실패` | 이때가 진짜 키 문제입니다. LS 홈에서 **"Open API"**로 사용등록했는지 확인하세요(모의투자 Open API 키는 서버가 달라 실전 URL에서 거절됩니다) |
+| 키를 고쳤는데도 계속 실패 | 해결됐습니다. 실패한 토큰을 더 이상 캐시하지 않으므로 재시작 없이 재시도됩니다 |
 | 연결 상태 테스트 결과와 실제 수집이 다름 | 진단은 화면이 쓰는 경로를 그대로 호출합니다(Daum=`investor_purchase` API, Naver=렌더링). 그래도 어긋나면 진단 함수가 다른 경로를 보고 있다는 뜻이니 알려주세요 |
 | 수급 레이더가 `외부 데이터 소스가 모두 실패` 경고 | 수집기가 저장해 둔 이력을 보여주는 중입니다. 출처에 적힌 **날짜**를 확인하세요 — 지금 시점의 수급이 아닙니다 |
 | `cannot switch to a different thread` | 헤드리스 브라우저 스레드 문제로, 해결됐습니다. 그래도 보이면 `git pull` 후 앱을 재시작하세요 |

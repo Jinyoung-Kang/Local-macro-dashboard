@@ -55,11 +55,39 @@ KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
+def _cached_kis_token(app_key: str, app_secret: str) -> str:
+    """키 조합별 토큰 캐시. 인자는 캐시 키로만 쓰입니다."""
+    return _request_kis_token()
+
+
 def get_kis_access_token() -> str:
-    """KIS OAuth 2.0 Access Token 발급 및 캐싱"""
+    """
+    KIS OAuth 2.0 Access Token (성공한 토큰만 캐싱).
+
+    [버그 수정] 예전에는 발급 실패 시 돌려준 빈 문자열까지 6시간 캐시됐고,
+    그 사이에 secrets.toml의 키를 고쳐도 앱을 재시작하기 전까지 계속
+    실패했습니다. 무엇을 고쳐도 안 되는 것처럼 보이는 상태였습니다.
+    """
     app_key = get_secret("kis.app_key", get_secret("KIS_APP_KEY", get_secret("kis_app_key", "")))
     app_secret = get_secret("kis.app_secret", get_secret("KIS_APP_SECRET", get_secret("kis_app_secret", "")))
-    
+
+    if not app_key or not app_secret:
+        return ""
+
+    token = _cached_kis_token(app_key, app_secret)
+    if not token:
+        try:
+            _cached_kis_token.clear()
+        except Exception:                                    # noqa: BLE001
+            pass
+    return token
+
+
+def _request_kis_token() -> str:
+    """토큰을 실제로 발급받습니다 (캐시 없음)."""
+    app_key = get_secret("kis.app_key", get_secret("KIS_APP_KEY", get_secret("kis_app_key", "")))
+    app_secret = get_secret("kis.app_secret", get_secret("KIS_APP_SECRET", get_secret("kis_app_secret", "")))
+
     if not app_key or not app_secret:
         return ""
 

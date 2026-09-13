@@ -659,3 +659,144 @@ def test_naver_diagnostic_still_matches_its_real_path():
     daum_test = source.split("def test_daum_scraping")[1].split("\ndef ")[0]
     assert "_fetch_rendered_html" not in daum_test
     assert "fetch_daum_deal_ranking" in daum_test
+
+
+# ==============================================================================
+# 11. LS증권 OPEN API
+# ==============================================================================
+def test_ls_diagnostic_reports_auth_success_when_only_data_is_empty(monkeypatch):
+    """
+    [회귀] 사용자가 본 실제 화면:
+
+        LS API
+        LS 계좌 미연결 또는 미사용
+        LS 서버 응답: 해당자료가 없습니다.
+
+    "해당자료가 없습니다"는 LS 서버가 TR에 **정상 응답한 내용**입니다.
+    토큰까지 발급됐다는 뜻인데도 화면은 "미연결"이라고 말해, 사용자가
+    앱키를 계속 의심하게 만들었습니다.
+    """
+    import datetime as dt
+    import services.radar_service as rs
+    import services.ls_service as ls
+
+    monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "dummy")
+    monkeypatch.setattr(ls, "request_ls_token", lambda: ("valid-token", ""))
+    monkeypatch.setattr(
+        rs, "call_ls_api",
+        lambda **kw: {"rsp_msg": "해당자료가 없습니다."},
+    )
+
+    # 주말(2026-09-13 일요일) → 시세 TR이 비는 것은 정상
+    class _FixedNow(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return dt.datetime(2026, 9, 13, 22, 0, tzinfo=tz)
+
+    monkeypatch.setattr(rs, "datetime", _FixedNow)
+
+    ok, msg = rs.test_ls_connection()
+
+    assert ok is True, msg
+    assert "인증 성공" in msg
+    assert "미연결" not in msg
+    assert "정규장" in msg          # 언제 다시 확인할지 알려 줘야 합니다
+
+
+def test_ls_diagnostic_fails_clearly_when_token_is_rejected(monkeypatch):
+    """토큰 발급이 거절되면 그때야말로 키 문제입니다. 사유를 보여 줍니다."""
+    import services.radar_service as rs
+    import services.ls_service as ls
+
+    monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "dummy")
+    monkeypatch.setattr(
+        ls, "request_ls_token",
+        lambda: ("", "HTTP 401 — invalid appkey"),
+    )
+
+    ok, msg = rs.test_ls_connection()
+    assert ok is False
+    assert "토큰 발급 실패" in msg
+    assert "invalid appkey" in msg
+
+
+def test_ls_diagnostic_says_when_keys_are_absent(monkeypatch):
+    import services.radar_service as rs
+    import services.ls_service as ls
+
+    monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "")
+    ok, msg = rs.test_ls_connection()
+    assert ok is False
+    assert "app_key" in msg
+
+
+def test_ls_token_failure_is_not_cached(monkeypatch):
+    """
+    [회귀] 실패한 빈 토큰이 5시간 캐시돼, 사용자가 secrets.toml의 키를
+    고쳐도 앱을 재시작하기 전까지 계속 실패했습니다.
+    """
+    import services.ls_service as ls
+
+    cleared = []
+
+    class _FailingCache:
+        def __call__(self, app_key, app_secret):
+            return ""                      # 토큰 발급 실패
+
+        @staticmethod
+        def clear():
+            cleared.append(1)
+
+    monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "dummy")
+    monkeypatch.setattr(ls, "_cached_ls_token", _FailingCache())
+
+    assert ls.get_ls_access_token() == ""
+    assert cleared == [1], "실패한 토큰이 캐시에 남았습니다"
+
+
+def test_ls_token_success_stays_cached(monkeypatch):
+    """성공한 토큰은 캐시를 비우지 않아야 합니다 (매번 재발급 방지)."""
+    import services.ls_service as ls
+
+    cleared = []
+
+    class _GoodCache:
+        def __call__(self, app_key, app_secret):
+            return "valid-token"
+
+        @staticmethod
+        def clear():
+            cleared.append(1)
+
+    monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "dummy")
+    monkeypatch.setattr(ls, "_cached_ls_token", _GoodCache())
+
+    assert ls.get_ls_access_token() == "valid-token"
+    assert cleared == [], "성공했는데 캐시를 비웠습니다"
+
+
+def test_ls_fetcher_is_actually_wired_into_the_chain():
+    """
+    [회귀] fetch_ls_deal_ranking은 정의만 되어 있고 **한 번도 호출되지
+    않았습니다.** LS 키를 정확히 넣어도 화면 데이터가 달라지지 않았던
+    이유입니다. 폴백 체인에 실제로 들어가 있는지 소스에서 확인합니다.
+    """
+    import pathlib
+
+    source = pathlib.Path("services/radar_service.py").read_text(encoding="utf-8")
+    chain = source.split("def collect_market_radar_scanner")[1]
+    assert "fetch_ls_deal_ranking(" in chain, (
+        "LS 수집 함수가 폴백 체인에서 호출되지 않습니다"
+    )
+
+
+def test_ls_fetcher_preserves_leading_zero_stock_codes():
+    """
+    [회귀] KIS 경로는 zfill(6)을 쓰는데 LS 경로만 빠져 있었습니다.
+    069500이 69500으로 깨지면 이후 조회가 전부 실패합니다.
+    """
+    import pathlib
+
+    source = pathlib.Path("services/radar_service.py").read_text(encoding="utf-8")
+    ls_fn = source.split("def fetch_ls_deal_ranking")[1].split("\ndef ")[0]
+    assert ls_fn.count('zfill(6)') >= 2, "LS 경로에 종목코드 zfill이 없습니다"

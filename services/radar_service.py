@@ -9,6 +9,7 @@ import logging
 from importlib import metadata
 import re
 from datetime import datetime, time, timedelta
+from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -177,40 +178,102 @@ def test_kis_connection():
 
 
 def test_ls_connection():
-    body_params_1452 = {
-        "t1452InBlock": {
-            "gubun": "1",
-            "jnilgubun": "1",
-            "paygubun": "2",
-            "ordergubun": "1",
-            "cnt": 30,
-        }
-    }
+    """
+    LS증권 OPEN API 연결 점검 — **단계를 나눠** 보고합니다.
 
-    try:
-        res = call_ls_api(tr_cd="t1452", tr_url="/stock/market-sum", body_params=body_params_1452)
-        if res and "t1452OutBlock1" in res and len(res["t1452OutBlock1"]) > 0:
-            count = len(res["t1452OutBlock1"])
-            return True, f"정상 통신 성공 (t1452 상위 종목 수: {count}개)"
-    except Exception:
-        pass
+    [버그 수정] 예전에는 어떤 이유로 실패하든 화면이
+    "LS 계좌 미연결 또는 미사용"이라고 적었습니다. 그런데 사용자가 실제로
+    받은 응답은 `해당자료가 없습니다`였습니다. 이건 LS 서버가 TR에 **정상
+    응답한 내용**입니다. 즉 앱키/시크릿은 유효했고 토큰도 발급됐는데,
+    화면은 "키가 등록 안 됐다"는 뜻으로 읽히는 문구를 보여 줬습니다.
 
-    body_params_1664 = {
-        "t1664InBlock": {
-            "gubun1": "1", "gubun2": "1", "gubun3": "1", "cnt": 30
-        }
-    }
+    무엇이 실제로 막혔는지 알 수 있도록 이렇게 나눕니다.
+        1. 키가 secrets.toml에 있는가
+        2. OAuth 토큰이 발급되는가  ← 앱키/시크릿 유효성의 진짜 판정
+        3. TR이 데이터를 주는가      ← 장 시간·상품 권한의 문제
 
-    try:
-        res = call_ls_api(tr_cd="t1664", tr_url="/stock/investor", body_params=body_params_1664)
-        if res and "t1664OutBlock1" in res and len(res["t1664OutBlock1"]) > 0:
-            count = len(res["t1664OutBlock1"])
-            return True, f"정상 통신 성공 (t1664 상위 종목 수: {count}개)"
-        elif res:
-            return False, f"LS 서버 응답: {res.get('rsp_msg', str(res))}"
-        return False, "LS 서버 응답 없음"
-    except Exception as e:
-        return False, f"예외 발생: {str(e)}"
+    2단계까지 통과하면 **연결은 성공**입니다. 3단계에서 데이터가 비는 것은
+    주말·장 마감 시간대에는 정상입니다.
+    """
+    from services.ls_service import get_secret as ls_secret, request_ls_token
+
+    # --- 1단계: 키 존재 ---
+    app_key = ls_secret("ls.app_key", ls_secret("LS_APP_KEY", ""))
+    app_secret = ls_secret("ls.app_secret", ls_secret("LS_APP_SECRET", ""))
+    if not app_key or not app_secret:
+        return False, (
+            "secrets.toml에 `[ls] app_key` / `app_secret`이 없습니다. "
+            "LS를 쓰지 않는다면 무시해도 됩니다."
+        )
+
+    # --- 2단계: 토큰 발급 (키 유효성의 진짜 판정) ---
+    token, token_error = request_ls_token()
+    if not token:
+        return False, (
+            f"OAuth 토큰 발급 실패 — 앱키/시크릿이 유효하지 않거나 "
+            f"OPEN API 사용등록이 안 된 상태입니다.\n\n{token_error}"
+        )
+
+    # --- 3단계: TR 조회 ---
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    is_regular_session = (
+        now_kst.weekday() < 5
+        and dtime(9, 0) <= now_kst.time() < dtime(15, 30)
+    )
+
+    attempts = [
+        ("t1452", "/stock/market-sum", {
+            "t1452InBlock": {
+                "gubun": "1", "jnilgubun": "1", "paygubun": "2",
+                "ordergubun": "1", "cnt": 30,
+            }
+        }),
+        ("t1664", "/stock/investor", {
+            "t1664InBlock": {
+                "gubun1": "1", "gubun2": "1", "gubun3": "1", "cnt": 30,
+            }
+        }),
+    ]
+
+    messages = []
+    for tr_cd, tr_url, body in attempts:
+        try:
+            res = call_ls_api(tr_cd=tr_cd, tr_url=tr_url, body_params=body)
+        except Exception as e:                               # noqa: BLE001
+            messages.append(f"{tr_cd}: 예외 {type(e).__name__}")
+            continue
+
+        if not res:
+            messages.append(f"{tr_cd}: 응답 없음")
+            continue
+
+        block = res.get(f"{tr_cd}OutBlock1")
+        if isinstance(block, list) and block:
+            return True, (
+                f"정상 통신 성공 (토큰 발급 OK · {tr_cd} 조회 종목 수: "
+                f"{len(block)}개)"
+            )
+
+        messages.append(f"{tr_cd}: {res.get('rsp_msg', '데이터 없음')}")
+
+    # 토큰이 나왔다는 것은 인증이 된다는 뜻입니다. 이것을 "미연결"이라고
+    # 말하면 사용자가 키를 계속 의심하게 됩니다.
+    detail = " / ".join(messages) if messages else "데이터 없음"
+    when = "정규장" if is_regular_session else "장 시간이 아님"
+
+    if is_regular_session:
+        return False, (
+            f"인증은 성공했습니다(토큰 발급 OK). 다만 TR이 데이터를 주지 "
+            f"않습니다 — {detail}\n\n"
+            f"지금은 정규장인데도 비어 있으므로, 해당 TR의 사용 권한이나 "
+            f"입력값을 확인해야 합니다."
+        )
+
+    return True, (
+        f"인증 성공 (토큰 발급 OK). 조회 데이터는 비어 있습니다 — {detail}\n\n"
+        f"현재 {when}이라 시세 TR이 빈 값을 주는 것은 정상입니다. "
+        f"정규장(평일 09:00~15:30)에 다시 확인하세요."
+    )
 
 
 def test_pykrx_connection():
@@ -555,8 +618,11 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
             if data_list:
                 records = []
                 for idx, row in enumerate(data_list[:top_n], start=1):
-                    code = row.get("shcode", "")
-                    name = row.get("hname", "")
+                    # [버그 수정] 앞자리 0이 있는 종목코드(069500 등)를 그대로
+                    # 두면 이후 단계에서 정수로 해석돼 69500으로 깨집니다.
+                    # KIS 경로는 zfill(6)을 쓰는데 LS 경로만 빠져 있었습니다.
+                    code = str(row.get("shcode", "")).strip().zfill(6)
+                    name = str(row.get("hname", "")).strip()
                     price = float(row.get("price", 0))
                     change_pct = float(row.get("diff", 0))
 
@@ -580,7 +646,10 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
                             "등락률(%)": change_pct,
                             "순매수대금(억)": net_amt_eok,
                             "시가총액_가중": max(price * 1000, 500),
-                            "데이터_출처": f"LS 증권사 API ({target_date})"
+                            "수집시각": datetime.now(
+                                ZoneInfo("Asia/Seoul")
+                            ).strftime("%Y-%m-%d %H:%M:%S KST"),
+                            "데이터_출처": f"LS 증권사 API ({target_date})",
                         })
                 if records:
                     return pd.DataFrame(records)
@@ -605,8 +674,8 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
             if data_list:
                 records = []
                 for idx, row in enumerate(data_list[:top_n], start=1):
-                    code = row.get("shcode", "")
-                    name = row.get("hname", "")
+                    code = str(row.get("shcode", "")).strip().zfill(6)
+                    name = str(row.get("hname", "")).strip()
                     price = float(row.get("price", 0))
                     change_pct = float(row.get("diff", 0))
 
@@ -633,7 +702,10 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
                             "등락률(%)": change_pct,
                             "순매수대금(억)": net_amt_eok,
                             "시가총액_가중": max(price * 1000, 500),
-                            "데이터_출처": f"LS 증권사 API ({target_date})"
+                            "수집시각": datetime.now(
+                                ZoneInfo("Asia/Seoul")
+                            ).strftime("%Y-%m-%d %H:%M:%S KST"),
+                            "데이터_출처": f"LS 증권사 API ({target_date})",
                         })
                 if records:
                     return pd.DataFrame(records)
@@ -1184,7 +1256,8 @@ def collect_market_radar_scanner(
     interval_type: str = "TODAY",
 ) -> pd.DataFrame:
     """
-    수급 랭킹을 실제로 수집합니다 (KIS → Daum → Naver → PyKrx 폴백 체인).
+    수급 랭킹을 실제로 수집합니다
+    (KIS → Daum → Naver → LS → PyKrx → 누적 이력 폴백 체인).
 
     화면은 get_market_radar_scanner()를 쓰세요. 이 함수는 항상 네트워크를
     쓰며, 최악의 경우 7영업일을 거슬러 올라가며 여러 소스를 시도합니다.
@@ -1273,6 +1346,28 @@ def collect_market_radar_scanner(
                 "PyKrx만 사용",
                 search_date_str,
             )
+
+        # LS증권 OPEN API.
+        #
+        # 이 함수는 오랫동안 정의만 되어 있고 **어디에서도 호출되지
+        # 않았습니다.** 그래서 LS 키를 아무리 정확히 넣어도 화면 데이터는
+        # 하나도 달라지지 않았습니다. 연결 진단만 LS를 찌르고 있었으니,
+        # 사용자 입장에서는 "연결도 안 되고 쓰이지도 않는" 상태였습니다.
+        #
+        # 이미 잘 동작하는 KIS/Daum/Naver 뒤에 둡니다. 그 셋 중 하나라도
+        # 성공하면 LS는 호출되지 않으므로 기존 동작을 해치지 않고,
+        # 셋이 모두 실패했을 때만 한 번 더 기회를 줍니다.
+        if can_use_intraday_sources:
+            df = fetch_ls_deal_ranking(
+                search_date_str, market, investor, trade_type, top_n,
+            )
+            if df is not None and not df.empty:
+                logger.info(
+                    "수급 레이더 성공: source=LS, date=%s, market=%s, "
+                    "investor=%s, trade_type=%s, rows=%s",
+                    search_date_str, market, investor, trade_type, len(df),
+                )
+                return df
 
         if PYKRX_AVAILABLE:
           df = fetch_pykrx_deal_ranking(
