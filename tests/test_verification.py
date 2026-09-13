@@ -300,3 +300,198 @@ def test_run_verification_flags_a_real_divergence(monkeypatch):
     report = vs.run_verification(now=after)
     assert len(report.mismatches) == 1
     assert report.mismatches[0].name == "KOSPI200 선물 종가"
+
+
+# ==============================================================================
+# 8. 선물 등락률 — 없는 값을 0.00%로 메우면 국면 판정이 뒤집힌다
+# ==============================================================================
+def test_phase_is_not_biased_upward_when_change_is_unknown():
+    """
+    [회귀] 사용자 화면에서 발견된 실제 사고.
+
+    KRX 응답에 FLUC_RT가 없으면 safe_float이 0.0을 돌려줬고, 그 0.0이
+    `p_up = 등락률 >= 0`을 **항상 True**로 만들었습니다. 그래서 선물이
+    1,112.00 → 1,088.30 (-2.13%)으로 하락한 날에도 화면은
+    '신규 롱'(강세 신호)을 표시했습니다. 실제로는 '신규 숏'(약세)입니다.
+    """
+    import numpy as np
+    import pandas as pd
+
+    def diagnose(chg, oi_delta):
+        if pd.isna(chg) or pd.isna(oi_delta):
+            return "판정 불가 (등락률 미제공)"
+        p_up, oi_up = chg >= 0, oi_delta >= 0
+        if p_up and oi_up:
+            return "신규 롱 (Long Accumulation)"
+        if p_up and not oi_up:
+            return "숏 커버링 (Short Covering)"
+        if not p_up and oi_up:
+            return "신규 숏 (Short Accumulation)"
+        return "롱 청산 (Long Liquidation)"
+
+    real_pct = (1088.30 - 1112.00) / 1112.00 * 100
+    assert real_pct == pytest.approx(-2.132, abs=0.01)
+
+    # 예전 동작(0.0으로 메움) → 강세로 뒤집힘
+    assert diagnose(0.0, 859) == "신규 롱 (Long Accumulation)"
+    # 올바른 동작
+    assert diagnose(real_pct, 859) == "신규 숏 (Short Accumulation)"
+    # 모를 때는 어느 쪽으로도 기울지 않습니다
+    assert diagnose(np.nan, 859) == "판정 불가 (등락률 미제공)"
+
+
+def test_krx_history_derives_change_from_closes(monkeypatch):
+    """
+    KRX가 FLUC_RT를 주지 않아도 등락률이 종가에서 계산돼야 합니다.
+    종가 시계열은 KIS와 소수점까지 일치하는 것이 교차 검증으로 확인됐습니다.
+    """
+    import pandas as pd
+    import services.krx_service as krx
+
+    # FLUC_RT가 아예 없는 KRX 응답을 흉내 냅니다.
+    # collect_krx_futures_history는 레코드가 5건 미만이면 추정치 폴백으로
+    # 빠지므로, 실제 계산 경로를 타도록 영업일 6일치를 줍니다.
+    days = {
+        "20260904": 1100.00,
+        "20260907": 1105.00,
+        "20260908": 1110.00,
+        "20260909": 1108.00,
+        "20260910": 1112.00,
+        "20260911": 1088.30,
+    }
+    oi_by_day = {
+        "20260904": 125000, "20260907": 125800, "20260908": 126400,
+        "20260909": 127000, "20260910": 127733, "20260911": 128592,
+    }
+
+    def fake_daily(date_str):
+        if date_str not in days:
+            return pd.DataFrame()
+        return pd.DataFrame([{
+            "ISU_NM": "코스피200 F 202612",
+            "TDD_CLSPRC": f"{days[date_str]:.2f}",
+            "ACC_TRDVOL": "150000",
+            "ACC_OPNINT_QTY": str(oi_by_day[date_str]),
+        }])
+
+    monkeypatch.setattr(krx, "fetch_krx_derivatives_daily", fake_daily)
+    monkeypatch.setattr(krx, "fetch_kospi200_index_close", lambda d: None)
+    monkeypatch.setattr(krx, "_generate_fallback_derivatives_data",
+                        lambda days_: pd.DataFrame())
+
+    df = krx.collect_krx_futures_history(days=20)
+
+    assert not df.empty, "추정치 폴백으로 빠졌습니다 (실제 계산 경로가 아님)"
+    assert not df["is_estimated"].any(), "KRX 실데이터여야 합니다"
+
+    last = df.iloc[-1]
+    # FLUC_RT가 없어도 종가에서 -2.13%가 계산돼야 합니다.
+    assert last["Change_Pct"] == pytest.approx(-2.132, abs=0.01)
+    # 하락 + OI 증가 → 신규 숏. 예전에는 '신규 롱'으로 뒤집혔습니다.
+    assert "신규 숏" in last["Market_Phase"], last["Market_Phase"]
+    # KRX가 주지 않은 값을 0.0으로 지어내지 않았는지
+    assert pd.isna(last["Change_Pct_Reported"])
+    # 첫 행은 직전 종가가 없으므로 등락률을 모릅니다 (0.0으로 메우면 안 됨)
+    assert pd.isna(df.iloc[0]["Change_Pct"])
+    assert "판정 불가" in df.iloc[0]["Market_Phase"]
+
+
+def test_change_rate_check_catches_the_zero_percent_bug(monkeypatch):
+    """
+    화면이 +0.00%를 보여주던 그 상황을 --verify가 잡아내야 합니다.
+    KRX 보고값 0.00% vs 종가 계산값 -2.13% → 불일치.
+    """
+    import pandas as pd
+    import services.krx_service as krx
+
+    broken = pd.DataFrame({
+        "Date": pd.to_datetime(["2026-09-10", "2026-09-11"]),
+        "Futures_Close": [1112.00, 1088.30],
+        "Change_Pct": [float("nan"), -2.132],
+        "Change_Pct_Reported": [0.0, 0.0],
+        "is_estimated": [False, False],
+    })
+    monkeypatch.setattr(krx, "get_krx_futures_history", lambda days=20: broken)
+
+    out = vs.check_change_rate_consistency()
+    assert out.verdict == vs.VERDICT_MISMATCH
+    assert "파싱" in out.note
+
+
+def test_change_rate_check_passes_when_sources_agree(monkeypatch):
+    import pandas as pd
+    import services.krx_service as krx
+
+    good = pd.DataFrame({
+        "Date": pd.to_datetime(["2026-09-10", "2026-09-11"]),
+        "Futures_Close": [1112.00, 1088.30],
+        "Change_Pct": [float("nan"), -2.132],
+        "Change_Pct_Reported": [float("nan"), -2.13],
+        "is_estimated": [False, False],
+    })
+    monkeypatch.setattr(krx, "get_krx_futures_history", lambda days=20: good)
+
+    assert vs.check_change_rate_consistency().verdict == vs.VERDICT_MATCH
+
+
+def test_change_rate_check_reports_missing_krx_field_as_skipped(monkeypatch):
+    """
+    KRX가 필드를 안 주는 것은 '불일치'가 아니라 '확인 못 함'입니다.
+    다만 화면이 종가 계산값을 쓴다는 사실을 반드시 밝혀야 합니다.
+    """
+    import pandas as pd
+    import services.krx_service as krx
+
+    no_field = pd.DataFrame({
+        "Date": pd.to_datetime(["2026-09-10", "2026-09-11"]),
+        "Futures_Close": [1112.00, 1088.30],
+        "Change_Pct": [float("nan"), -2.132],
+        "Change_Pct_Reported": [float("nan"), float("nan")],
+        "is_estimated": [False, False],
+    })
+    monkeypatch.setattr(krx, "get_krx_futures_history", lambda days=20: no_field)
+
+    out = vs.check_change_rate_consistency()
+    assert out.verdict == vs.VERDICT_SKIPPED
+    assert "종가에서" in out.note
+
+
+def test_change_rate_check_skips_estimated_mode(monkeypatch):
+    import pandas as pd
+    import services.krx_service as krx
+
+    est = pd.DataFrame({
+        "Date": pd.to_datetime(["2026-09-11"]),
+        "Futures_Close": [365.0],
+        "Change_Pct": [0.2],
+        "Change_Pct_Reported": [float("nan")],
+        "is_estimated": [True],
+    })
+    monkeypatch.setattr(krx, "get_krx_futures_history", lambda days=20: est)
+
+    assert vs.check_change_rate_consistency().verdict == vs.VERDICT_SKIPPED
+
+
+def test_phase_card_label_distinguishes_long_from_short():
+    """
+    [회귀] 카드가 `m_phase.split(" ")[0]`로 첫 단어만 잘라 써서
+    '신규 롱'과 '신규 숏'이 둘 다 '신규'로 보였습니다. 이 화면에서 가장
+    중요한 정보가 강세/약세 방향인데 그게 사라진 셈입니다.
+    """
+    import re
+
+    def short(phase):
+        return re.sub(r"\s*\(.*?\)\s*$", "", phase).strip() or phase
+
+    labels = {
+        "신규 롱 (Long Accumulation)": "신규 롱",
+        "신규 숏 (Short Accumulation)": "신규 숏",
+        "숏 커버링 (Short Covering)": "숏 커버링",
+        "롱 청산 (Long Liquidation)": "롱 청산",
+        "판정 불가 (등락률 미제공)": "판정 불가",
+    }
+    for full, expected in labels.items():
+        assert short(full) == expected
+
+    # 네 국면이 전부 서로 다르게 보여야 합니다 (예전에는 2개가 겹쳤습니다).
+    assert len(set(labels.values())) == len(labels)

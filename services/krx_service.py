@@ -176,10 +176,23 @@ def collect_krx_futures_history(days: int = 40) -> pd.DataFrame:
         if close_val <= 0:
             return None
 
-        return {            
+        # [버그 수정] 예전에는 FLUC_RT가 없거나 파싱에 실패하면 safe_float이
+        # **0.0**을 돌려줬습니다. 그 0.0이 그대로 등락률로 쓰여 화면이 매일
+        # "+0.00%"를 보여줬고, 더 나쁜 것은 4대 국면 판정의 `p_up = 등락률 >= 0`
+        # 이 항상 True가 돼 **하락한 날에도 '신규 롱'(강세)으로 뒤집혀** 표시된
+        # 점입니다. 없으면 없다고(NaN) 두고, 아래에서 종가로 직접 계산합니다.
+        reported_pct = None
+        for field in ("FLUC_RT", "FLUC_RATE", "CMPPREVDD_RT"):
+            if field in row.index and str(row.get(field)).strip() not in ("", "nan"):
+                reported_pct = safe_float(row.get(field))
+                break
+
+        return {
             "Date": pd.to_datetime(d_str, format="%Y%m%d"),
             "Futures_Close": close_val,
-            "Change_Pct": safe_float(row.get("FLUC_RT", 0)),
+            "Change_Pct_Reported": (
+                np.nan if reported_pct is None else reported_pct
+            ),
             "Volume": safe_float(row.get("ACC_TRDVOL", row.get("TRDVOL", 0))),
             "Open_Interest": safe_float(row.get("ACC_OPNINT_QTY", row.get("OPNINT_QTY", 0))),
             "Contract_Name": str(row.get(name_col, "KOSPI 200 선물")),
@@ -242,7 +255,7 @@ def collect_krx_futures_history(days: int = 40) -> pd.DataFrame:
         records.append({
             "Date": rec["Date"],
             "Futures_Close": rec["Futures_Close"],
-            "Change_Pct": rec["Change_Pct"],
+            "Change_Pct_Reported": rec["Change_Pct_Reported"],
             "Volume": rec["Volume"],
             "Open_Interest": rec["Open_Interest"],
             "Theory_Price": theo_val,
@@ -267,10 +280,59 @@ def collect_krx_futures_history(days: int = 40) -> pd.DataFrame:
     # 미결제약정 증감
     df_hist["OI_Change"] = df_hist["Open_Interest"].diff().fillna(0)
 
+    # ----------------------------------------------------------------------
+    # 등락률: 연속된 확정 종가에서 직접 계산합니다.
+    #
+    # KRX 응답의 FLUC_RT를 그대로 믿지 않는 이유가 있습니다. 그 필드가 오지
+    # 않을 때 예전 코드는 0.0으로 메웠고, 화면은 매일 "+0.00%"를 보여줬습니다.
+    # 실제로 2026-09-10 → 09-11에 선물은 1,112.00 → 1,088.30으로 -2.13%
+    # 움직였는데 화면은 +0.00%였습니다.
+    #
+    # 종가 시계열은 KIS Open API와 소수점까지 일치하는 것이 교차 검증으로
+    # 확인됐으므로, 종가에서 계산한 등락률이 가장 신뢰할 수 있습니다.
+    # KRX가 준 값은 Change_Pct_Reported로 남겨 두어 대조에 씁니다.
+    # ----------------------------------------------------------------------
+    df_hist["Change_Pct"] = (
+        df_hist["Futures_Close"].pct_change() * 100.0
+    ).round(4)
+
+    if "Change_Pct_Reported" not in df_hist.columns:
+        df_hist["Change_Pct_Reported"] = np.nan
+
+    # 첫 행은 직전 종가가 없으므로 KRX가 준 값이 있으면 그것을 씁니다.
+    first_idx = df_hist.index[0]
+    if pd.isna(df_hist.at[first_idx, "Change_Pct"]):
+        df_hist.at[first_idx, "Change_Pct"] = df_hist.at[
+            first_idx, "Change_Pct_Reported"
+        ]
+
+    # KRX 보고값과 계산값이 크게 다르면 로그로 남깁니다(둘 중 하나가 이상함).
+    both = df_hist.dropna(subset=["Change_Pct", "Change_Pct_Reported"])
+    if not both.empty:
+        gap = (both["Change_Pct"] - both["Change_Pct_Reported"]).abs()
+        if (gap > 0.5).any():
+            logger.warning(
+                "KRX 등락률(FLUC_RT)과 종가 기반 계산값이 %d일에서 0.5%%p 넘게 "
+                "다릅니다. 화면은 종가 기반 계산값을 씁니다.",
+                int((gap > 0.5).sum()),
+            )
+
+    # ----------------------------------------------------------------------
     # 4대 국면 판별
+    #
+    # [버그 수정] 예전에는 `p_up = 등락률 >= 0`이었습니다. 등락률이 결측일 때
+    # 0.0으로 메워지면 이 식이 **항상 True**가 되어, 하락한 날에도 '신규 롱'
+    # (강세 신호)으로 뒤집혀 표시됐습니다. 모르면 모른다고 해야 합니다.
+    # ----------------------------------------------------------------------
     def diagnose_phase(row):
-        p_up = row["Change_Pct"] >= 0
-        oi_up = row["OI_Change"] >= 0
+        chg = row["Change_Pct"]
+        oi_delta = row["OI_Change"]
+
+        if pd.isna(chg) or pd.isna(oi_delta):
+            return "판정 불가 (등락률 미제공)"
+
+        p_up = chg >= 0
+        oi_up = oi_delta >= 0
         if p_up and oi_up:
             return "신규 롱 (Long Accumulation)"
         elif p_up and not oi_up:
@@ -332,7 +394,12 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
             scale_factor = 0.01 if last_close > 1000 else 1.0
 
             df["Futures_Close"] = (df["Close"] * scale_factor).round(2)
-            df["Change_Pct"] = df["Futures_Close"].pct_change().fillna(0.0).round(2) * 100.0
+            # 첫 행은 직전 종가가 없어 등락률을 알 수 없습니다. 0.0으로 메우면
+            # 국면 판정이 '상승'으로 기울므로 NaN으로 둡니다.
+            df["Change_Pct"] = (
+                df["Futures_Close"].pct_change() * 100.0
+            ).round(4)
+            df["Change_Pct_Reported"] = np.nan
 
             vol = df["Volume"] if "Volume" in df.columns else 150000
             df["Volume"] = pd.to_numeric(vol, errors='coerce').fillna(150000).replace(0, 150000).astype(int)
@@ -346,6 +413,8 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
             df["Contract_Name"] = "KOSPI 200 최근월물 (프록시 추정 모드)"
 
             def diagnose_phase(row):
+                if pd.isna(row["Change_Pct"]) or pd.isna(row["OI_Change"]):
+                    return "판정 불가 (등락률 미제공)"
                 p_up = row["Change_Pct"] >= 0
                 oi_up = row["OI_Change"] >= 0
                 if p_up and oi_up:
@@ -371,7 +440,8 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
             df["is_estimated"] = True
 
             return df[[
-                "Date", "Futures_Close", "Change_Pct", "Volume", "Open_Interest",
+                "Date", "Futures_Close", "Change_Pct", "Change_Pct_Reported",
+                "Volume", "Open_Interest",
                 "OI_Change", "Theory_Price", "Market_Basis", "Contract_Name",
                 "Market_Phase", "COT_OI_Index", "is_estimated"
             ]]
@@ -383,14 +453,15 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
     return pd.DataFrame({
         "Date": dates,
         "Futures_Close": [365.0 + (i * 0.2) for i in range(days)],
-        "Change_Pct": [0.20] * days,
+        "Change_Pct": [np.nan] * days,
+        "Change_Pct_Reported": [np.nan] * days,
         "Volume": [150000] * days,
         "Open_Interest": [280000 + (i * 150) for i in range(days)],
         "OI_Change": [150] * days,
         "Theory_Price": [365.5 + (i * 0.2) for i in range(days)],
         "Market_Basis": [0.75] * days,
         "Contract_Name": "KOSPI 200 최근월물 (프록시 추정 모드)",
-        "Market_Phase": ["신규 롱 (Long Accumulation)"] * days,
+        "Market_Phase": ["판정 불가 (등락률 미제공)"] * days,
         "COT_OI_Index": [55.0] * days,
         "is_estimated": [True] * days,
     })
@@ -443,6 +514,10 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
         required_columns=(
             "Date", "Futures_Close", "Market_Basis",
             "Open_Interest", "Volume", "is_estimated",
+            # 등락률을 종가에서 직접 계산하도록 바뀌기 전의 저장본에는
+            # 이 컬럼이 없습니다. 그 저장본은 등락률이 전부 0.00%라
+            # 국면 판정이 뒤집혀 있으므로 버리고 다시 수집해야 합니다.
+            "Change_Pct_Reported",
         ),
     )
     return df if df is not None else pd.DataFrame()

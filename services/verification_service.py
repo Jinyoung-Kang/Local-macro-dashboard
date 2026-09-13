@@ -461,6 +461,90 @@ def check_investor_ranking(
     )
 
 
+def check_change_rate_consistency() -> CheckResult:
+    """
+    선물 등락률: KRX가 준 값(FLUC_RT) vs 종가에서 계산한 값.
+
+    [왜 필요한가] 실제로 이 프로젝트에서 터졌던 사고입니다. KRX 응답에
+    FLUC_RT가 없으면 파서가 0.0으로 메웠고, 화면은 매일 "+0.00%"를 보여
+    줬습니다. 더 나쁜 것은 4대 국면 판정이 `등락률 >= 0`을 쓰기 때문에
+    **하락한 날에도 '신규 롱'(강세)으로 뒤집혀** 표시된 점입니다.
+    (2026-09-11: 실제 -2.13%인데 화면은 +0.00%, 국면은 신규 롱)
+
+    두 값이 갈라지면 파싱이 깨졌다는 뜻이므로 여기서 잡습니다.
+    """
+    name = "선물 등락률 (KRX 보고값 vs 종가 계산값)"
+
+    from services.krx_service import get_krx_futures_history
+
+    try:
+        df = get_krx_futures_history(days=20)
+    except Exception as e:                           # noqa: BLE001
+        return CheckResult(name=name, verdict=VERDICT_ERROR, note=str(e)[:160])
+
+    if df is None or df.empty:
+        return CheckResult(
+            name=name, verdict=VERDICT_ERROR, note="선물 시계열이 비어 있습니다",
+        )
+
+    if "is_estimated" in df.columns and bool(df["is_estimated"].iloc[-1]):
+        return CheckResult(
+            name=name, verdict=VERDICT_SKIPPED,
+            note="추정치 모드입니다 (KRX 확정치가 아니므로 대조 대상이 아닙니다)",
+        )
+
+    last = df.iloc[-1]
+    derived = last.get("Change_Pct")
+    reported = last.get("Change_Pct_Reported")
+
+    import pandas as pd
+
+    readings = [
+        SourceReading(
+            "종가 계산값", not pd.isna(derived),
+            None if pd.isna(derived) else float(derived),
+            "연속 확정 종가에서 계산",
+        ),
+        SourceReading(
+            "KRX 보고값(FLUC_RT)", not pd.isna(reported),
+            None if pd.isna(reported) else float(reported),
+            "KRX 응답 필드",
+        ),
+    ]
+
+    if pd.isna(derived):
+        return CheckResult(
+            name=name, verdict=VERDICT_ERROR, readings=readings,
+            note="종가에서 등락률을 계산하지 못했습니다.",
+        )
+
+    if pd.isna(reported):
+        return CheckResult(
+            name=name, verdict=VERDICT_SKIPPED, readings=readings,
+            note=(
+                "KRX 응답에 등락률 필드(FLUC_RT)가 없습니다. 화면은 종가에서 "
+                "계산한 값을 씁니다. 예전에는 이 경우 0.00%로 메워서 국면 "
+                "판정이 상승 쪽으로 뒤집혔습니다."
+            ),
+        )
+
+    # 등락률은 비율값이라 상대 오차가 아니라 **절대 %p 차이**로 봅니다.
+    gap = abs(float(derived) - float(reported))
+    if gap <= 0.05:
+        return CheckResult(
+            name=name, verdict=VERDICT_MATCH, readings=readings,
+            note=f"차이 {gap:.3f}%p",
+        )
+
+    return CheckResult(
+        name=name, verdict=VERDICT_MISMATCH, readings=readings,
+        note=(
+            f"차이 {gap:.3f}%p. 둘 중 하나의 파싱이 깨졌습니다. "
+            "화면은 종가 계산값을 쓰므로 KRX 필드 매핑을 확인하세요."
+        ),
+    )
+
+
 # ==============================================================================
 # 6. 전체 검증 실행
 # ==============================================================================
@@ -500,6 +584,7 @@ def run_verification(now: datetime | None = None) -> VerificationReport:
             ],
             tolerance_pct=TOLERANCE_OI_PCT,
         ))
+        results.append(check_change_rate_consistency())
         results.append(compare_readings(
             "KOSPI200 현물 지수",
             [
@@ -513,6 +598,7 @@ def run_verification(now: datetime | None = None) -> VerificationReport:
         for label in (
             "KOSPI200 선물 종가",
             "KOSPI200 선물 미결제약정",
+            "선물 등락률 (KRX 보고값 vs 종가 계산값)",
             "KOSPI200 현물 지수",
         ):
             results.append(CheckResult(

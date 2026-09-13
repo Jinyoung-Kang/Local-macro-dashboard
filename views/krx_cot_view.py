@@ -8,6 +8,8 @@ KOSPI 200 선물, 미결제약정(OI), 베이시스, 투자자별 포지션 분�
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 
+import re
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -219,7 +221,12 @@ def render_krx_cot_view():
             return fallback
 
     fut_close = safe_val(latest.get("Futures_Close"), safe_val(prev.get("Futures_Close"), 365.20))
-    chg_pct = safe_val(latest.get("Change_Pct"), 0.0)
+    # [버그 수정] 예전에는 등락률이 없을 때 0.0으로 메웠습니다. 그러면 화면에
+    # 초록색 "↑ +0.00%"가 떠서 "변화 없음"으로 읽히는데, 실제로는 "모른다"는
+    # 뜻이었습니다. 모르면 델타를 아예 표시하지 않습니다.
+    raw_chg = latest.get("Change_Pct")
+    chg_is_missing = raw_chg is None or pd.isna(raw_chg)
+    chg_pct = 0.0 if chg_is_missing else float(raw_chg)
 
     raw_basis = latest.get("Market_Basis")
     m_basis = float(raw_basis) if raw_basis is not None and not pd.isna(raw_basis) else np.nan
@@ -239,8 +246,10 @@ def render_krx_cot_view():
         st.metric(
             label=f"KOSPI 200 선물{estimate_suffix}",
             value=f"{fut_close:,.2f} pt",
-            delta=f"{chg_pct:+.2f}%",
+            delta=None if chg_is_missing else f"{chg_pct:+.2f}%",
         )
+        if chg_is_missing:
+            st.caption(":gray[전일 대비 미제공]")
         st.caption(f"기준일: {data_date_str}")
     with m2:
         st.metric(
@@ -268,7 +277,12 @@ def render_krx_cot_view():
             )
             st.caption("선물 - 현물")
     with m4:
-        phase_short = m_phase.split(" ")[0] if len(m_phase.split(" ")) > 1 else m_phase
+        # [버그 수정] 예전에는 `m_phase.split(" ")[0]`로 첫 단어만 잘라 썼습니다.
+        # 그러면 "신규 롱 (Long Accumulation)"과 "신규 숏 (Short Accumulation)"이
+        # **둘 다 '신규'로 뭉개져** 강세/약세를 구분할 수 없었습니다. 이 카드에서
+        # 가장 중요한 정보가 바로 그 방향인데도 말입니다.
+        # 영문 괄호만 떼어 내면 짧으면서도 구분됩니다.
+        phase_short = re.sub(r"\s*\(.*?\)\s*$", "", m_phase).strip() or m_phase
         st.metric(
             label="시장 국면 (Phase)",
             value=phase_short,
@@ -686,7 +700,7 @@ def render_krx_cot_view():
                         background-color:#161B22; border-radius:4px;">
                 <div style="font-weight:600; color:#58A6FF; font-size:0.88rem;">현재 국면 판정</div>
                 <div style="font-size:0.92rem; color:#F0F6FC; margin-top:2px;">
-                    <strong>{m_phase}</strong> (가격 {chg_pct:+.2f}%, OI {oi_delta:+,.0f})
+                    <strong>{m_phase}</strong> (가격 {"미제공" if chg_is_missing else f"{chg_pct:+.2f}%"}, OI {oi_delta:+,.0f})
                 </div>
             </div>
             """,
@@ -798,7 +812,7 @@ KOSPI 200 Derivatives Market Data
 - Analysis Time: {now_str}
 - Data Quality: {"ESTIMATED/PROXY (not official KRX data)" if hist_is_estimated else "OFFICIAL KRX DATA"}
 - Target: {latest.get('Contract_Name', 'KOSPI 200')}
-- Futures Close: {fut_close:,.2f} pt ({chg_pct:+.2f}%)
+- Futures Close: {fut_close:,.2f} pt ({"change rate unavailable" if chg_is_missing else f"{chg_pct:+.2f}%"})
 - Market Basis: {"N/A" if basis_is_missing else f"{m_basis:.2f} pt"}
 - Open Interest (OI): {oi_val:,} contracts (Daily Change: {oi_delta:+,} contracts)
 - Market Phase: {m_phase}

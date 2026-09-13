@@ -6,6 +6,7 @@ services/radar_service.py
 
 """
 import logging
+from importlib import metadata
 import re
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -213,23 +214,62 @@ def test_ls_connection():
 
 
 def test_pykrx_connection():
+    """
+    PyKrx 연결 점검.
+
+    [개선] 예전에는 실패했을 때 "최근 7일 내 유효한 KOSPI 종목 리스트를
+    가져오지 못했습니다"만 말해서, 무엇을 해야 할지 알 수 없었습니다.
+    PyKrx는 KRX 웹 엔드포인트를 **비공식으로** 긁는 라이브러리라
+    KRX가 응답 형식을 바꾸면 예외 없이 빈 리스트만 돌려주기 시작합니다.
+    그 경우와 진짜 통신 오류를 구분해서 알려 줍니다.
+
+    PyKrx는 수급 레이더의 **마지막 폴백**이며, 여기서 실패해도 KIS/Daum/
+    Naver가 살아 있으면 당일 조회는 정상입니다. 다만 Naver·Daum은 과거
+    날짜 조회를 지원하지 않아, **기준일을 과거로 바꾸면 PyKrx만 남습니다.**
+    """
     if not PYKRX_AVAILABLE:
         return False, "pykrx 패키지가 설치되지 않았습니다 (requirements.txt 확인 필요)."
 
     try:
-        now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
-        check_date = now_kst
+        version = metadata.version("pykrx")
+    except Exception:
+        version = "알 수 없음"
 
-        for _ in range(7):
-            date_str = check_date.strftime("%Y%m%d")
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    check_date = now_kst
+    empty_days = []
+    last_error = None
+
+    for _ in range(7):
+        date_str = check_date.strftime("%Y%m%d")
+        try:
             tickers = stock.get_market_ticker_list(date_str, market="KOSPI")
-            if tickers and len(tickers) > 0:
-                return True, f"정상 통신 성공 (기준일 {date_str}, KOSPI 종목 수: {len(tickers)}개)"
-            check_date -= timedelta(days=1)
+        except Exception as e:                       # noqa: BLE001
+            last_error = f"{type(e).__name__}: {str(e)[:120]}"
+            tickers = None
+        else:
+            if tickers:
+                return True, (
+                    f"정상 통신 성공 (기준일 {date_str}, "
+                    f"KOSPI 종목 수: {len(tickers)}개, pykrx {version})"
+                )
+            empty_days.append(date_str)
+        check_date -= timedelta(days=1)
 
-        return False, "최근 7일 내 유효한 KOSPI 종목 리스트를 가져오지 못했습니다."
-    except Exception as e:
-        return False, f"예외 발생: {str(e)}"
+    if last_error:
+        return False, (
+            f"KRX 서버 통신에 실패했습니다 (pykrx {version}). "
+            f"마지막 오류: {last_error} — 네트워크·방화벽을 먼저 확인하세요."
+        )
+
+    return False, (
+        f"KRX가 응답은 했지만 종목 리스트가 최근 7일 내내 비어 있습니다 "
+        f"(pykrx {version}). PyKrx는 KRX 웹을 비공식으로 긁는 라이브러리라 "
+        f"KRX가 응답 형식을 바꾸면 이렇게 조용히 빈 값만 돌려줍니다. "
+        f"`pip install --upgrade pykrx` 로 먼저 갱신해 보세요. "
+        f"당일 조회는 KIS/Daum/Naver로 정상 동작하며, 과거 날짜 조회만 "
+        f"영향을 받습니다."
+    )
 
 
 def test_naver_scraping():
