@@ -307,6 +307,11 @@ def render_data_status_view() -> None:
 
     st.divider()
 
+    # ---------------------------------------------------------- 교차 검증
+    _render_verification_section()
+
+    st.divider()
+
     # --------------------------------------------------------------- 사용법
     with st.expander("⚙️ 수집기 실행 방법", expanded=False):
         st.markdown(
@@ -339,6 +344,107 @@ def render_data_status_view() -> None:
             "| `store_only` | 저장본만 사용. 화면이 외부를 절대 기다리지 않음 |\n"
             "| `live_only` | 저장 계층 무시 (분리 이전 동작) |\n"
         )
+
+
+
+# ==============================================================================
+# 교차 검증 패널
+# ==============================================================================
+def _render_verification_section() -> None:
+    """
+    KRX·KIS 두 공식 출처로 화면의 숫자를 대조합니다.
+
+    이 프로젝트는 공식 API와 비공식 스크래핑을 섞어 쓰는데, 비공식 소스는
+    페이지 구조가 바뀌면 예외 없이 **조용히 틀린 값**을 주기 시작합니다.
+    여기서 두 출처가 갈라지는 순간을 잡습니다.
+
+    버튼을 눌러야만 실행합니다. 검증은 네트워크를 쓰므로 화면을 열 때마다
+    자동으로 돌면 저장 계층을 둔 의미가 없어집니다.
+    """
+    from config import get_krx_key
+    from services import verification_service as vs
+    from services.kis_service import get_secret as kis_secret
+
+    st.subheader("🔍 데이터 교차 검증 (KRX · KIS)")
+    st.caption(
+        "같은 수치를 서로 다른 출처가 같게 말하는지 대조합니다. "
+        "비공식 스크래핑(Daum·Naver·TradingView)은 페이지 구조가 바뀌면 "
+        "오류 없이 틀린 값을 주기 시작하므로, 공식 API를 기준선으로 둡니다."
+    )
+
+    krx_key = bool(get_krx_key())
+    kis_key = bool(kis_secret("kis.app_key", kis_secret("KIS_APP_KEY", "")))
+    kis_sec = bool(kis_secret("kis.app_secret", kis_secret("KIS_APP_SECRET", "")))
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("KRX api_key", "있음" if krx_key else "없음")
+    k2.metric("KIS app_key", "있음" if kis_key else "없음")
+    k3.metric("KIS app_secret", "있음" if kis_sec else "없음")
+
+    if not krx_key and not (kis_key and kis_sec):
+        st.warning(
+            "KRX·KIS 키가 없어 교차 검증을 할 수 없습니다. "
+            "`.streamlit/secrets.toml`에 `[krx] api_key` 와 "
+            "`[kis] app_key` / `app_secret` 을 설정하세요.",
+            icon="🔑",
+        )
+        return
+
+    settled, settle_reason = vs.is_settled_now()
+    intraday, intraday_reason = vs.is_intraday_now()
+    st.caption(
+        f"시세 대조(확정치): {'가능' if settled else '불가'} — {settle_reason}  \n"
+        f"수급 대조(장중 가집계): {'가능' if intraday else '불가'} — {intraday_reason}"
+    )
+
+    if st.button("지금 교차 검증 실행", width="stretch"):
+        with st.spinner("두 출처에서 같은 수치를 받아 대조하는 중..."):
+            st.session_state["verification_report"] = vs.run_verification()
+
+    report = st.session_state.get("verification_report")
+    if report is None:
+        st.info(
+            "아직 실행하지 않았습니다. 위 버튼을 누르거나 터미널에서 "
+            "`python collector.py --verify` 를 실행하세요.",
+            icon="ℹ️",
+        )
+        return
+
+    st.caption(
+        f"검증 시각: `{report.checked_at:%Y-%m-%d %H:%M:%S KST}` · {report.headline()}"
+    )
+
+    if report.mismatches:
+        st.error(
+            f"**불일치 {len(report.mismatches)}건.** 출처가 서로 다른 값을 "
+            "말하고 있습니다. 아래 항목을 확인하세요.",
+            icon="❗",
+        )
+
+    for result in report.results:
+        with st.container(border=True):
+            st.markdown(f"**{result.icon} {result.name}** — {result.label}")
+
+            if result.readings:
+                rows = [
+                    {
+                        "출처": r.source,
+                        "값": r.display(),
+                        "비고": r.detail,
+                    }
+                    for r in result.readings
+                ]
+                st.dataframe(
+                    pd.DataFrame(rows), width="stretch", hide_index=True,
+                )
+
+            if result.diff_pct is not None:
+                st.caption(
+                    f"출처 간 최대 차이 `{result.diff_pct:+.3f}%` "
+                    f"(허용 오차 {result.tolerance_pct}%)"
+                )
+            if result.note:
+                st.caption(result.note)
 
 
 # ==============================================================================

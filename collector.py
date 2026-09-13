@@ -699,6 +699,46 @@ def run_loop(
         logger.info("상주 모드를 종료합니다.")
 
 
+def run_verification_cli() -> int:
+    """
+    `python collector.py --verify`
+
+    KRX·KIS 키를 써서 "같은 수치를 서로 다른 출처가 같게 말하는지"를 대조하고
+    결과를 출력합니다. 수집도, 저장도 하지 않습니다.
+
+    종료 코드
+      0 : 불일치 없음 (확인 못 한 항목은 있을 수 있습니다)
+      1 : 불일치 발견 — 조사 필요
+      2 : 키가 없어 검증 자체를 할 수 없음
+    """
+    from config import get_krx_key
+    from services import verification_service as vs
+    from services.kis_service import get_secret as kis_secret
+
+    krx_key = get_krx_key()
+    kis_key = kis_secret("kis.app_key", kis_secret("KIS_APP_KEY", ""))
+    kis_secret_val = kis_secret("kis.app_secret", kis_secret("KIS_APP_SECRET", ""))
+
+    print()
+    print("키 확인:")
+    print(f"  KRX api_key    : {'✅ 있음' if krx_key else '❌ 없음'}")
+    print(f"  KIS app_key    : {'✅ 있음' if kis_key else '❌ 없음'}")
+    print(f"  KIS app_secret : {'✅ 있음' if kis_secret_val else '❌ 없음'}")
+
+    if not krx_key and not (kis_key and kis_secret_val):
+        print()
+        print("  두 키가 모두 없어 교차 검증을 할 수 없습니다.")
+        print("  .streamlit/secrets.toml에 [krx] api_key 와 [kis] app_key /")
+        print("  app_secret 을 설정한 뒤 다시 실행하세요.")
+        print()
+        return 2
+
+    report = vs.run_verification()
+    print(vs.format_report(report))
+
+    return 1 if report.mismatches else 0
+
+
 def print_status(verbose: bool = False) -> None:
     """저장 상태를 출력합니다. '무엇이 왜 실패했는지'가 핵심입니다."""
     from services import store
@@ -915,6 +955,10 @@ def main() -> int:
         "--purge-days", type=int, default=None,
         help="지정 일수보다 오래된 누적 이력 삭제",
     )
+    parser.add_argument(
+        "--verify", action="store_true",
+        help="KRX·KIS 키로 데이터 교차 검증 (수집하지 않고 대조만)",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -927,6 +971,9 @@ def main() -> int:
     if args.install_launchd:
         print_launchd_plist(args.fast_interval)
         return 0
+
+    if args.verify:
+        return run_verification_cli()
 
     if args.status:
         print_status(verbose=args.verbose)

@@ -68,6 +68,10 @@ api_key = "FRED_API_KEY"            # https://fred.stlouisfed.org/docs/api/api_k
 [krx]
 api_key = "KRX_OPEN_API_AUTH_KEY"   # http://data.krx.co.kr
 
+[kis]
+app_key    = "KIS_APP_KEY"          # https://apiportal.koreainvestment.com
+app_secret = "KIS_APP_SECRET"
+
 [ai]
 nvidia_api_key   = "..."            # https://build.nvidia.com
 cerebras_api_key = "..."
@@ -83,6 +87,7 @@ cloudflare_api_token  = "..."
 |---|---|
 | `fred.api_key` | FRED 웹 CSV로 폴백 (대부분 정상 동작) |
 | `krx.api_key` | KRX 선물이 KODEX 200 기반 **추정치**로 폴백 (`is_estimated=True` 표시) |
+| `kis.app_key` / `kis.app_secret` | 장중 수급 가집계와 **교차 검증** 비활성화 |
 | `ai.*` | AI 리포트 메뉴만 비활성화 |
 
 ---
@@ -153,7 +158,7 @@ python collector.py --purge-days 400  # 오래된 누적 이력 정리
 python collector.py --install-launchd   # plist 예시 출력 → 안내대로 저장/등록
 ```
 
-### 문제가 생겼을 때 — 진단 3단계
+### 문제가 생겼을 때 — 진단 4단계
 
 ```bash
 # 1) 무엇이 왜 실패했는지
@@ -164,7 +169,10 @@ python collector.py --status -v       # 스냅샷 상세 + 전체 누락 목록
 python collector.py --history krx_futures
 python collector.py --history all
 
-# 3) 그 작업만 다시 실행
+# 3) 두 공식 출처(KRX·KIS)가 같은 값을 말하는지 대조
+python collector.py --verify
+
+# 4) 그 작업만 다시 실행
 python collector.py --task krx_futures
 ```
 
@@ -178,6 +186,43 @@ python collector.py --task krx_futures
 
 수집기는 **중복 실행을 막습니다** (`data/collector.lock`). 죽은 프로세스의
 락은 자동 회수되며, 필요하면 `--force`로 무시할 수 있습니다.
+
+### 데이터 교차 검증 (KRX · KIS)
+
+이 프로젝트는 공식 API와 비공식 스크래핑을 섞어 씁니다. 비공식 소스는 대상
+페이지 구조가 바뀌면 **예외 없이 조용히 틀린 값**을 주기 시작하고, 화면만
+봐서는 알아챌 방법이 없습니다. KRX·KIS 두 공식 출처를 기준선으로 두고 같은
+수치를 대조합니다.
+
+```bash
+python collector.py --verify
+```
+
+| 대조 항목 | 출처 A | 출처 B | 출처 C | 언제 |
+|---|---|---|---|---|
+| KOSPI200 선물 종가 | KRX (화면이 쓰는 값) | KIS | — | 장 마감 후 |
+| KOSPI200 미결제약정 | KRX (화면이 쓰는 값) | KIS | — | 장 마감 후 |
+| KOSPI200 현물 지수 | KRX Open API | KIS | yfinance `^KS200` | 장 마감 후 |
+| 외국인 순매수 1위 종목 | KIS 장중 가집계 | Daum (화면이 쓰는 값) | — | 정규장 중 |
+
+**시간 조건이 항목마다 반대인 이유** — KRX는 *일별 확정 종가*를, KIS는
+*현재가*를 줍니다. 장중에 이 둘을 비교하면 항상 다르게 나오므로 시세 대조는
+장 마감 후에만 합니다. 반대로 KIS 수급 가집계 TR은 장중 전용이라 마감 후에는
+빈 데이터를 돌려줍니다. 그래서 수급 대조는 정규장 중에만 가능합니다.
+
+**"확인 못 함"과 "일치"는 절대 섞지 않습니다.** 키가 없거나 한쪽 수집이
+실패해 비교 자체를 못 한 경우를 "일치"로 표시하면 검증이 거짓말이 됩니다.
+판정은 `일치 / 불일치 / 수집 실패 / 확인 못 함` 네 가지로 구분됩니다.
+
+화면에서도 같은 검증을 돌릴 수 있습니다:
+**🗄️ 데이터 저장소 상태 → 🔍 데이터 교차 검증**.
+
+종료 코드: `0` 불일치 없음 · `1` 불일치 발견 · `2` 키가 없어 검증 불가.
+
+> **⚠️ 추정치는 검증 대상에서 제외됩니다.**
+> KRX 수집이 실패해 KODEX 200 기반 추정치(`is_estimated=True`)로 화면이
+> 그려지고 있으면, 그 값을 KRX 확정치인 양 비교하지 않고 그 사실을 그대로
+> 보고합니다.
 
 ### 읽기 모드 (`DASHBOARD_READ_MODE`)
 
@@ -311,8 +356,10 @@ python -m pytest tests/ -v
 - `tests/test_regressions.py` — 과거에 실제로 앱을 망가뜨렸던 버그들을 고정
 - `tests/test_store.py` — 저장 계층, 직렬화 왕복, 읽기 모드, 스키마 검증,
   수집기 진단, 지표명 정제, 전일 종가 일봉 폴백, 수동 새로고침
+- `tests/test_verification.py` — 교차 검증 판정 규칙, 장중/마감 시간 게이트,
+  "확인 못 함"을 "일치"로 위장하지 않는지
 
-둘 다 네트워크를 쓰지 않으므로 언제든 돌 수 있습니다 (현재 112건).
+셋 다 네트워크를 쓰지 않으므로 언제든 돌 수 있습니다 (현재 136건).
 
 ---
 
@@ -335,14 +382,16 @@ services/
   liquidity_service.py  연준 순유동성
   sector_service.py     섹터·자산군 로테이션
   krx_service.py        KRX 파생 · 한국판 COT
+  kis_service.py        한국투자증권 Open API (토큰 · 지수 · 선물 시세)
+  verification_service.py  KRX·KIS 교차 검증 (판정: 일치/불일치/실패/확인못함)
   radar_service.py      국내 수급 레이더 (다단 폴백)
   sec_service.py        SEC 13F
   cot_service.py        CFTC COT
   ai_service.py         AI 엔진 라우팅 (NVIDIA / Cloudflare / Cerebras)
   dashboard_snapshot_service.py  전체 원본 데이터 텍스트 생성
 views/                  메뉴별 화면
-  data_status_view.py   저장소 상태 · 신선도 · 누적 이력
-tests/                  회귀 테스트 + 저장 계층 테스트
+  data_status_view.py   저장소 상태 · 신선도 · 누적 이력 · 교차 검증 패널
+tests/                  회귀 테스트 + 저장 계층 + 교차 검증 테스트
 ```
 
 **코드 작성 규칙**
@@ -399,3 +448,6 @@ git push -u origin <브랜치명>
 | KRX 선물이 "추정치" | `krx.api_key` 미설정. KODEX 200 기반 폴백입니다 |
 | 수급 레이더 종목 조회 실패 | `--only fast`로 재수집하세요 (과거 버전이 저장한 종목코드 손상 가능성) |
 | `playwright` 관련 오류 | `playwright install chromium` 을 실행했는지 확인 |
+| `--verify`가 "KIS OAuth2 토큰 발급 실패" | `[kis] app_key`/`app_secret` 오타, 또는 실전/모의 서버 불일치 |
+| `--verify`가 "확인 못 함"만 나옴 | 시간 조건 때문입니다. 시세 대조는 장 마감 후, 수급 대조는 정규장 중에만 가능합니다 |
+| `--verify`에서 불일치 발견 | 비공식 소스(Daum·Naver·TradingView)의 페이지 구조 변경을 먼저 의심하세요 |
