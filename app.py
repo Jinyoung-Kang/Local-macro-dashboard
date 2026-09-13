@@ -25,6 +25,7 @@ from views.data_status_view import (
     render_data_freshness_sidebar,
     render_data_status_view,
 )
+from services import store
 
 # SSL 경고 비활성화
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -177,8 +178,19 @@ st.sidebar.markdown("#### 🔄 데이터 갱신 설정")
 render_data_freshness_sidebar()
 
 if st.sidebar.button("데이터 수동 새로고침 🚀", width="stretch"):
-    # 저장 계층 캐시까지 비워 다음 조회에서 다시 수집하도록 합니다.
+    # [버그 수정] 예전에는 st.cache_data.clear()만 했습니다. 그건 Streamlit의
+    # 메모리 캐시만 비울 뿐, 다음 조회는 아직 신선한 SQLite 저장본을 그대로
+    # 돌려줘서 화면의 숫자가 하나도 바뀌지 않았습니다.
+    # store.request_refresh()가 "이 시각 이전 저장본은 낡은 것으로 본다"는
+    # 기준을 세워 실제로 다시 수집하게 합니다.
+    store.request_refresh()
     st.cache_data.clear()
+    if store.get_read_mode() == store.READ_MODE_STORE_ONLY:
+        st.toast(
+            "store_only 모드입니다. 저장본만 다시 읽었습니다 "
+            "(수집은 collector.py가 담당합니다).",
+            icon="ℹ️",
+        )
     st.rerun()
 
 auto_refresh_enabled = st.sidebar.checkbox("실시간 자동 새로고침 활성화", value=False)

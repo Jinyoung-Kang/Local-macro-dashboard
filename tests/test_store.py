@@ -1645,3 +1645,133 @@ def test_stale_intraday_stays_na_without_daily_fallback(monkeypatch):
     assert item["delta"] is None
     assert item["prev_str"] == "N/A"
     assert "prev_source" not in item
+
+
+# ==============================================================================
+# 27. 수동 새로고침 버튼 — 저장본이 신선해도 실제로 다시 수집해야 한다
+# ==============================================================================
+@pytest.fixture
+def clean_refresh():
+    """새로고침 토큰은 모듈 전역이므로 테스트 간 초기화합니다."""
+    from services import store
+    store._refresh_token = 0.0
+    store._refresh_attempted.clear()
+    yield
+    store._refresh_token = 0.0
+    store._refresh_attempted.clear()
+
+
+def test_refresh_forces_recollection_of_fresh_snapshot(db, clean_refresh):
+    """
+    [회귀] 새로고침 버튼을 눌러도 화면이 그대로였던 문제.
+
+    st.cache_data.clear()는 Streamlit 메모리 캐시만 비웁니다. 그 다음 조회는
+    cached_or_live로 들어와 아직 신선한 SQLite 저장본을 그대로 돌려줬기 때문에
+    숫자가 하나도 바뀌지 않았습니다.
+    """
+    from services import store
+
+    calls = []
+
+    def live():
+        calls.append(1)
+        return {"v": len(calls)}
+
+    assert store.cached_or_live("t.a", live, max_age_seconds=3600) == {"v": 1}
+    # 신선하므로 다시 읽어도 수집하지 않습니다 (정상 동작).
+    assert store.cached_or_live("t.a", live, max_age_seconds=3600) == {"v": 1}
+    assert len(calls) == 1
+
+    store.request_refresh()
+
+    assert store.cached_or_live("t.a", live, max_age_seconds=3600) == {"v": 2}
+    assert len(calls) == 2, "새로고침이 재수집을 일으키지 않았습니다"
+
+    # 재수집된 저장본은 다시 신선합니다. 매번 수집하면 안 됩니다.
+    assert store.cached_or_live("t.a", live, max_age_seconds=3600) == {"v": 2}
+    assert len(calls) == 2
+
+
+def test_refresh_retries_failing_source_only_once(db, clean_refresh):
+    """
+    수집이 실패하면 저장본의 수집 시각이 그대로 남습니다. 그대로 두면
+    rerun마다 실패하는 외부 호출을 반복해 화면이 계속 느려집니다.
+    새로고침 1회당 1번만 시도해야 합니다.
+    """
+    from services import store
+
+    store.put_snapshot("t.b", {"v": "old"})
+
+    attempts = []
+
+    def broken():
+        attempts.append(1)
+        raise RuntimeError("외부 소스 장애")
+
+    store.request_refresh()
+    for _ in range(4):
+        out = store.cached_or_live("t.b", broken, max_age_seconds=3600)
+
+    assert len(attempts) == 1, f"실패 소스를 {len(attempts)}번 호출했습니다"
+    # 실패해도 화면이 비지 않도록 기존 저장본을 계속 보여 줍니다.
+    assert out == {"v": "old"}
+
+
+def test_store_only_never_calls_live_even_when_stale(db, clean_refresh, monkeypatch):
+    """
+    [회귀] store_only는 "화면이 절대 외부를 기다리지 않는다"가 약속입니다.
+    예전에는 저장본이 오래됐을 때 그냥 통과해 live_fn을 불렀습니다.
+    """
+    from services import store
+
+    store.put_snapshot("t.c", {"v": "stored"})
+    monkeypatch.setenv("DASHBOARD_READ_MODE", store.READ_MODE_STORE_ONLY)
+
+    calls = []
+
+    def live():
+        calls.append(1)
+        return {"v": "live"}
+
+    # max_age_seconds=0 → 저장본은 확실히 '오래된' 상태입니다.
+    assert store.cached_or_live("t.c", live, max_age_seconds=0) == {"v": "stored"}
+    assert calls == [], "store_only인데 외부를 호출했습니다"
+
+    # 새로고침을 요청해도 store_only에서는 외부를 부르지 않습니다.
+    store.request_refresh()
+    assert store.cached_or_live("t.c", live, max_age_seconds=0) == {"v": "stored"}
+    assert calls == []
+
+    # 저장본이 아예 없으면 빈 값입니다 (수집하지 않습니다).
+    assert store.cached_or_live(
+        "t.missing", live, max_age_seconds=0, empty_value="EMPTY",
+    ) == "EMPTY"
+    assert calls == []
+
+
+def test_every_refresh_button_requests_store_refresh():
+    """
+    새로고침 버튼이 st.cache_data.clear()만 하던 원래 버그가 되살아나지
+    않도록, 버튼이 있는 모든 화면이 store.request_refresh()를 부르는지
+    소스에서 확인합니다.
+    """
+    files = [
+        "app.py",
+        "views/krx_cot_view.py",
+        "views/cot_view.py",
+        "views/radar_view.py",
+    ]
+    for name in files:
+        source = pathlib.Path(name).read_text(encoding="utf-8")
+        # 주석에 적힌 설명 문구는 세지 않습니다. 실제 호출만 봅니다.
+        code = "\n".join(
+            line for line in source.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "새로고침" in code, name
+        assert "store.request_refresh()" in code, (
+            f"{name}의 새로고침 버튼이 저장 계층 갱신을 요청하지 않습니다"
+        )
+        assert code.count("st.cache_data.clear()") <= code.count(
+            "store.request_refresh()"
+        ), f"{name}에 request_refresh 없이 캐시만 비우는 자리가 남아 있습니다"

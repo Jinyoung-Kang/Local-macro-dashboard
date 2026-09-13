@@ -38,6 +38,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1211,6 +1212,55 @@ def _schema_matches(
     return True
 
 
+# ==============================================================================
+# 수동 새로고침 (화면의 "새로고침" 버튼)
+# ==============================================================================
+# [버그 수정] 화면의 새로고침 버튼은 st.cache_data.clear()만 했습니다. 그건
+# Streamlit의 메모리 캐시만 비울 뿐이고, 그 다음 조회는 다시 cached_or_live로
+# 들어와 **아직 신선한 SQLite 저장본**을 그대로 돌려줬습니다. 결과적으로
+# 버튼을 눌러도 화면의 숫자가 하나도 바뀌지 않았습니다(사용자 신고).
+#
+# 저장본을 지우는 방식은 쓰지 않습니다. 수집이 실패하면 보여 줄 값이 아예
+# 없어지기 때문입니다. 대신 "이 시각 이전에 수집된 저장본은 낡은 것으로
+# 본다"는 기준 시각을 하나 들고, 그보다 오래된 저장본만 다시 수집합니다.
+_refresh_token: float = 0.0
+
+# 한 번의 새로고침에서 이미 수집을 시도한 스냅샷. 수집이 실패하면 저장본의
+# 수집 시각이 그대로 남아, 이후 모든 rerun마다 실패하는 외부 호출을 반복하게
+# 됩니다(화면이 계속 느려짐). 새로고침 1회당 1번만 시도합니다.
+_refresh_attempted: dict[str, float] = {}
+
+
+def request_refresh() -> None:
+    """
+    다음 조회에서 저장본의 신선도를 무시하고 다시 수집하게 합니다.
+
+    화면의 새로고침 버튼이 st.cache_data.clear()와 함께 호출합니다.
+    store_only 모드에서는 외부를 호출하지 않는다는 약속이 우선이므로
+    아무 효과가 없습니다(저장본 재조회만 일어납니다).
+    """
+    global _refresh_token
+    _refresh_token = time.time()
+    _refresh_attempted.clear()
+
+
+def refresh_requested_at() -> float:
+    """마지막 수동 새로고침 요청 시각(epoch). 요청이 없었으면 0.0."""
+    return _refresh_token
+
+
+def _superseded_by_refresh(name: str, snap: "Snapshot | None") -> bool:
+    """이 저장본이 수동 새로고침 요청보다 오래됐는지."""
+    if not _refresh_token:
+        return False
+    if _refresh_attempted.get(name) == _refresh_token:
+        # 이번 새로고침에서 이미 시도했습니다. 다시 조르지 않습니다.
+        return False
+    if snap is None or snap.collected_at is None:
+        return True
+    return snap.collected_at.timestamp() < _refresh_token
+
+
 def cached_or_live(
     name: str,
     live_fn: Callable[[], Any],
@@ -1226,8 +1276,13 @@ def cached_or_live(
 
     읽기 모드(DASHBOARD_READ_MODE)에 따라 동작이 달라집니다.
       - auto       : 신선하면 저장본, 아니면 수집 + 저장 (기본)
-      - store_only : 저장본만. 없으면 empty_value. 화면이 절대 외부를 기다리지 않음
+      - store_only : 저장본만. 오래됐어도 그대로 주고, 없으면 empty_value.
+                     화면이 절대 외부를 기다리지 않습니다.
       - live_only  : 저장 계층 무시
+
+    request_refresh()가 호출된 뒤에는(화면의 새로고침 버튼) 그보다 먼저
+    수집된 저장본을 신선하지 않은 것으로 보고 다시 수집합니다. store_only
+    모드에서는 외부를 부르지 않는다는 약속이 우선입니다.
 
     수집이 실패하면 "신선하지 않더라도" 남아 있는 저장본을 내려줍니다.
     외부 소스 장애 시 화면이 비는 것보다 오래된 값이라도 보여주는 편이
@@ -1251,12 +1306,22 @@ def cached_or_live(
         and _schema_matches(snap.payload, required_columns, name)
     )
 
-    if mode == READ_MODE_STORE_ONLY and not snap_ok:
-        # store_only에서 스키마가 깨진 저장본은 쓸 수 없으므로 빈 값을 줍니다.
-        return empty_value
+    if mode == READ_MODE_STORE_ONLY:
+        # [버그 수정] 예전에는 저장본이 '오래됐을 때' 여기를 그냥 통과해
+        # live_fn()을 불렀습니다. store_only의 약속은 "화면이 절대 외부를
+        # 기다리지 않는다"이므로, 오래됐더라도 있는 저장본을 그대로 주고
+        # 없으면 빈 값을 줍니다. 갱신은 수집기의 몫입니다.
+        return snap.payload if snap_ok else empty_value
 
-    if snap_ok and snap.is_fresh(max_age_seconds):
+    forced = _superseded_by_refresh(name, snap)
+
+    if snap_ok and snap.is_fresh(max_age_seconds) and not forced:
         return snap.payload
+
+    if _refresh_token:
+        # 수집 성공/실패와 무관하게 "이번 새로고침에서 시도했음"을 남깁니다.
+        # 실패한 소스를 매 rerun마다 다시 호출하면 화면이 계속 느려집니다.
+        _refresh_attempted[name] = _refresh_token
 
     try:
         value = live_fn()
