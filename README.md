@@ -20,6 +20,9 @@ pip install -r requirements.txt
 # ⚠️ 필수: 렌더링 스크래핑용 Chromium 다운로드 (최초 1회)
 # 건너뛰면 "수급 레이더"의 Naver 렌더링 수집이 실패합니다.
 playwright install chromium
+
+# 수정 후 pull(다운로드)
+git pull origin claude/eager-euler-2hpyfe
 ```
 
 ---
