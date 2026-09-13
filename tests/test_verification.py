@@ -495,3 +495,77 @@ def test_phase_card_label_distinguishes_long_from_short():
 
     # 네 국면이 전부 서로 다르게 보여야 합니다 (예전에는 2개가 겹쳤습니다).
     assert len(set(labels.values())) == len(labels)
+
+
+# ==============================================================================
+# 9. 외부 소스가 전부 죽었을 때 누적 이력으로 대체한다
+# ==============================================================================
+def test_radar_falls_back_to_accumulated_history(monkeypatch, tmp_path):
+    """
+    PyKrx가 KRX 차단으로 죽으면 과거 날짜 조회는 소스가 하나도 남지 않습니다.
+    수집기가 쌓아 둔 우리 자신의 이력이 있으면 빈 화면 대신 그것을 씁니다.
+    """
+    import datetime as dt
+    import pandas as pd
+    import services.radar_service as rs
+
+    rows = pd.DataFrame([
+        {"종목코드": "069500", "종목명": "KODEX 200", "순매수대금(억)": 619.5,
+         "obs_date": "2026-09-11"},
+        {"종목코드": "005930", "종목명": "삼성전자", "순매수대금(억)": 412.0,
+         "obs_date": "2026-09-11"},
+    ])
+
+    monkeypatch.setattr(rs, "list_radar_history_dates",
+                        lambda: ["2026-09-10", "2026-09-11"])
+    monkeypatch.setattr(rs, "read_radar_history", lambda **kw: rows)
+
+    out = rs._read_ranking_from_history(
+        dt.date(2026, 9, 11), "KOSPI", "외국인", "순매수", 30,
+    )
+
+    assert out is not None and not out.empty
+    assert out.iloc[0]["종목명"] == "KODEX 200"
+    # 종목코드 앞자리 0이 살아 있어야 합니다 (예전에 int로 뭉개진 적 있음)
+    assert out.iloc[0]["종목코드"] == "069500"
+    # 어느 날짜의 저장본을 썼는지 반드시 밝혀야 합니다
+    assert "누적 이력" in out.iloc[0]["데이터_출처"]
+    assert "2026-09-11" in out.iloc[0]["데이터_출처"]
+
+
+def test_radar_history_uses_nearest_earlier_date(monkeypatch):
+    """요청한 날짜에 이력이 없으면 그보다 앞선 가장 가까운 거래일을 씁니다."""
+    import datetime as dt
+    import pandas as pd
+    import services.radar_service as rs
+
+    asked = {}
+
+    def _read(**kw):
+        asked.update(kw)
+        return pd.DataFrame([{
+            "종목코드": "005930", "종목명": "삼성전자",
+            "순매수대금(억)": 100.0, "obs_date": "2026-09-10",
+        }])
+
+    monkeypatch.setattr(rs, "list_radar_history_dates",
+                        lambda: ["2026-09-09", "2026-09-10", "2026-09-14"])
+    monkeypatch.setattr(rs, "read_radar_history", _read)
+
+    out = rs._read_ranking_from_history(
+        dt.date(2026, 9, 11), "KOSPI", "외국인", "순매수", 30,
+    )
+    # 09-14는 미래이므로 쓰면 안 됩니다.
+    assert asked["start_date"] == "2026-09-10"
+    assert out is not None and "2026-09-10" in out.iloc[0]["데이터_출처"]
+
+
+def test_radar_history_returns_none_when_nothing_stored(monkeypatch):
+    """이력이 없으면 억지로 무언가를 만들어내지 않습니다."""
+    import datetime as dt
+    import services.radar_service as rs
+
+    monkeypatch.setattr(rs, "list_radar_history_dates", lambda: [])
+    assert rs._read_ranking_from_history(
+        dt.date(2026, 9, 11), "KOSPI", "외국인", "순매수", 30,
+    ) is None

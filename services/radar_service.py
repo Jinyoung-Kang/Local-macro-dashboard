@@ -263,12 +263,17 @@ def test_pykrx_connection():
         )
 
     return False, (
-        f"KRX가 응답은 했지만 종목 리스트가 최근 7일 내내 비어 있습니다 "
-        f"(pykrx {version}). PyKrx는 KRX 웹을 비공식으로 긁는 라이브러리라 "
-        f"KRX가 응답 형식을 바꾸면 이렇게 조용히 빈 값만 돌려줍니다. "
-        f"`pip install --upgrade pykrx` 로 먼저 갱신해 보세요. "
-        f"당일 조회는 KIS/Daum/Naver로 정상 동작하며, 과거 날짜 조회만 "
-        f"영향을 받습니다."
+        f"KRX가 JSON이 아닌 응답(차단 페이지 등)을 돌려주고 있습니다 "
+        f"(pykrx {version}). 로그에 'Expecting value: line 1 column 1'이 "
+        f"보이면 같은 증상입니다. PyKrx는 KRX 웹을 비공식으로 긁는 "
+        f"라이브러리라 KRX가 응답 형식·차단 정책을 바꾸면 이렇게 조용히 "
+        f"빈 값만 돌려줍니다. **버전 업그레이드로는 해결되지 않습니다** "
+        f"(1.2.8이 최신). 라이브러리가 KRX 변경을 따라잡을 때까지 기다려야 "
+        f"합니다.\n\n"
+        f"영향 범위: 당일 조회는 KIS/Daum/Naver로 정상 동작합니다. "
+        f"과거 날짜 조회만 영향을 받으며, 수집기가 쌓아 온 누적 이력이 "
+        f"있으면 그것으로 대체됩니다 "
+        f"(🗄️ 데이터 저장소 상태 → 누적 수급 이력)."
     )
 
 
@@ -1281,13 +1286,84 @@ def collect_market_radar_scanner(
 
         current_date_obj -= timedelta(days=1)
 
+    # ------------------------------------------------------------------
+    # 마지막 수단: 수집기가 쌓아 온 우리 자신의 누적 이력.
+    #
+    # Naver·Daum은 과거 날짜 조회를 지원하지 않아 과거 조회는 PyKrx 하나에
+    # 기대고 있었는데, PyKrx는 KRX 웹을 비공식으로 긁는 라이브러리라 KRX가
+    # 응답 형식을 바꾸면 통째로 죽습니다(실제로 그런 상태입니다).
+    #
+    # 다행히 수집기가 돌 때마다 그날의 랭킹을 observations에 적재해 왔습니다.
+    # 외부에서 다시 받을 수 없는 데이터를 우리가 이미 갖고 있으므로,
+    # 빈 화면을 보여주는 대신 그것을 씁니다.
+    # ------------------------------------------------------------------
+    history = _read_ranking_from_history(
+        target_date_obj, market, investor, trade_type, top_n,
+    )
+    if history is not None and not history.empty:
+        logger.info(
+            "수급 레이더: 외부 소스가 모두 실패해 누적 이력으로 대체합니다 "
+            "(date=%s, rows=%s)",
+            target_date_obj, len(history),
+        )
+        return history
+
     logger.error(
         "수급 스캐너 완전 실패: 시작일=%s, 시장=%s, 투자주체=%s, 방향=%s, 기간=%s "
-        "(PYKRX_AVAILABLE=%s)",
+        "(PYKRX_AVAILABLE=%s, 누적 이력에도 없음)",
         target_date_obj, market, investor, trade_type, interval_type,
         PYKRX_AVAILABLE,
     )
     return pd.DataFrame()
+
+
+def _read_ranking_from_history(
+    target_date_obj,
+    market: str,
+    investor: str,
+    trade_type: str,
+    top_n: int,
+):
+    """
+    누적 이력(observations)에서 해당 조건의 랭킹을 꺼냅니다.
+
+    요청한 날짜에 이력이 없으면 **그보다 앞선 가장 가까운 거래일**을 씁니다.
+    어느 날짜를 썼는지는 '데이터_출처'에 남겨 화면이 밝힐 수 있게 합니다.
+    """
+    try:
+        target_str = target_date_obj.strftime("%Y-%m-%d")
+        available = [d for d in list_radar_history_dates() if d <= target_str]
+        if not available:
+            return None
+
+        picked = max(available)
+        df = read_radar_history(
+            market=market,
+            investor=investor,
+            trade_type=trade_type,
+            start_date=picked,
+        )
+        if df is None or df.empty:
+            return None
+
+        if "obs_date" in df.columns:
+            df = df[df["obs_date"] == picked]
+        if df.empty:
+            return None
+
+        if "순매수대금(억)" in df.columns:
+            df = df.sort_values(
+                "순매수대금(억)", ascending=(trade_type == "순매도"),
+            )
+
+        df = df.head(top_n).copy()
+        df["데이터_출처"] = (
+            f"누적 이력 (수집기가 {picked}에 저장한 값 · 외부 소스 전부 실패)"
+        )
+        return df.reset_index(drop=True)
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("누적 이력 조회 실패: %s", e)
+        return None
 
 
 # ==============================================================================

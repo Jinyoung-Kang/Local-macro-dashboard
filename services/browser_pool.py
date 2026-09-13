@@ -18,18 +18,31 @@ Naver 렌더링을 반복 시도하므로, 최악의 경우 브라우저 기동�
 이 모듈은 Chromium을 Streamlit 세션 전체에서 **한 번만 띄워** 재사용하고,
 페이지(탭)만 매 요청마다 새로 만들고 닫습니다. 탭 생성은 수 밀리초입니다.
 
-[주의: sync_playwright와 스레드]
-Playwright의 sync API는 생성된 스레드에 종속됩니다(greenlet 기반). 따라서
-이 풀은 **생성한 스레드와 동일한 스레드에서만** 사용해야 하며,
-ThreadPoolExecutor 워커에서 호출하면 안 됩니다. 이 프로젝트의 렌더링 수집은
-모두 Streamlit 스크립트 실행 스레드에서 직렬로 호출되므로 안전합니다.
-외부 스레드에서 호출된 경우는 owner_thread_id 비교로 감지하고, 그 경우에만
-해당 스레드 전용 일회성 브라우저로 안전하게 폴백합니다.
+[주의: sync_playwright와 스레드 — 여기서 실제로 터졌던 버그]
+Playwright의 sync API 객체는 **생성된 스레드에 종속**됩니다(greenlet 기반).
+Streamlit은 rerun마다 새 스크립트 실행 스레드를 만들고 이전 스레드는 끝나므로,
+한 스레드에서 만든 브라우저를 다음 rerun에서 쓰면 이렇게 터집니다.
+
+    cannot switch to a different thread (which happens to have exited)
+
+예전 구현은 `threading.get_ident()`를 owner_thread_id로 저장해 두고
+"같은 스레드일 때만 공용 브라우저를 쓴다"로 막으려 했습니다. **이 방어는
+동작하지 않습니다.** OS는 종료된 스레드의 id를 재사용하기 때문에, 완전히
+다른 새 스레드가 죽은 스레드와 같은 id를 받으면 검사를 그대로 통과합니다.
+사용자 로그의 "which happens to have exited"가 정확히 그 상황입니다.
+게다가 실패 후 reset_browser()의 close()도 같은 이유로 실패해서, 죽은
+Chromium 프로세스가 정리되지 않고 남았습니다.
+
+그래서 스레드 id를 비교하는 대신, **Playwright를 전용 워커 스레드 하나가
+소유**하게 하고 모든 호출을 그 스레드로 넘깁니다(단일 워커 Executor).
+워커 스레드는 프로세스가 끝날 때까지 살아 있으므로 종속성 문제가 원천적으로
+사라지고, 어느 스레드에서 불러도 안전합니다. 브라우저 재사용 이득도 그대로
+유지됩니다.
 """
 from __future__ import annotations
 
 import logging
-import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 
@@ -62,9 +75,32 @@ _LAUNCH_ARGS = [
 
 
 class _BrowserHandle:
-    """Playwright 드라이버와 Chromium 인스턴스를 함께 들고 있는 핸들."""
+    """
+    Playwright 드라이버와 Chromium을, **전용 워커 스레드 하나가** 소유합니다.
+
+    생성·렌더링·종료가 전부 같은 스레드(_executor의 유일한 워커)에서
+    실행되므로, 어느 스레드에서 호출하든 sync API의 스레드 종속성 문제가
+    발생하지 않습니다. 워커가 하나뿐이라 탭 생성도 자연히 직렬화됩니다.
+    """
 
     def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="playwright",
+        )
+        self._playwright = None
+        self.browser = None
+
+        try:
+            # 브라우저 기동 자체도 워커 스레드 안에서 해야 합니다.
+            self._executor.submit(self._start).result(timeout=60)
+        except Exception:
+            self._executor.shutdown(wait=False)
+            raise
+
+        global _LIVE_HANDLE
+        _LIVE_HANDLE = self
+
+    def _start(self) -> None:
         from playwright.sync_api import sync_playwright
 
         # start()/stop()을 직접 호출해 컨텍스트 매니저 밖에서도 수명을 유지합니다.
@@ -73,21 +109,33 @@ class _BrowserHandle:
             headless=True,
             args=_LAUNCH_ARGS,
         )
-        self.owner_thread_id = threading.get_ident()
-        # 같은 브라우저에 동시에 탭을 만들지 않도록 직렬화합니다.
-        self.lock = threading.Lock()
-        global _LIVE_HANDLE
-        _LIVE_HANDLE = self
 
-    def close(self) -> None:
+    def run(self, fn, *args, **kwargs):
+        """Playwright를 건드리는 작업을 소유 스레드에서 실행합니다."""
+        return self._executor.submit(fn, *args, **kwargs).result()
+
+    def _stop(self) -> None:
         try:
-            self.browser.close()
+            if self.browser is not None:
+                self.browser.close()
         except Exception as e:
             logger.warning("Chromium 종료 실패: %s", e)
         try:
-            self._playwright.stop()
+            if self._playwright is not None:
+                self._playwright.stop()
         except Exception as e:
             logger.warning("Playwright 드라이버 종료 실패: %s", e)
+
+    def close(self) -> None:
+        try:
+            # 종료도 반드시 소유 스레드에서. 예전에는 호출한 스레드에서 바로
+            # close()를 불러서, 정리마저 "cannot switch to a different thread"로
+            # 실패하고 Chromium 프로세스가 남았습니다.
+            self._executor.submit(self._stop).result(timeout=30)
+        except Exception as e:
+            logger.warning("브라우저 종료 작업 제출 실패: %s", e)
+        finally:
+            self._executor.shutdown(wait=False)
 
 
 @st.cache_resource(show_spinner=False)
@@ -169,25 +217,36 @@ def fetch_rendered_html(
             url, wait_selector, timeout_ms, wait_state, block_assets,
         )
 
-    if handle.owner_thread_id != threading.get_ident():
-        # sync Playwright 객체는 생성 스레드에 종속되어 교차 스레드 사용이
-        # 불가능합니다. 이 경우만 일회성 브라우저를 씁니다.
-        logger.debug("다른 스레드에서 호출됨: 일회성 브라우저 사용")
-        return _fetch_rendered_html_oneshot(
-            url, wait_selector, timeout_ms, wait_state, block_assets,
-        )
-
+    # 스레드 id 비교는 하지 않습니다. OS가 종료된 스레드의 id를 재사용하기
+    # 때문에 "같은 스레드"라는 판정 자체를 믿을 수 없습니다. 대신 모든 호출을
+    # 브라우저를 소유한 워커 스레드로 넘깁니다.
     try:
-        with handle.lock:
-            return _render_with_browser(
-                handle.browser, url, wait_selector,
-                timeout_ms, wait_state, block_assets,
-            )
+        return handle.run(
+            _render_with_browser,
+            handle.browser, url, wait_selector,
+            timeout_ms, wait_state, block_assets,
+        )
     except Exception as e:
-        # 브라우저가 죽었을 수 있으므로 캐시를 비워 다음 호출에서 재기동합니다.
+        # 브라우저가 죽었을 수 있으므로 정리하고 한 번만 재기동해 재시도합니다.
         logger.warning("공용 Chromium 렌더링 실패, 브라우저를 재기동합니다: %s", e)
         reset_browser()
-        raise
+
+        try:
+            retry_handle = _get_shared_browser()
+            return retry_handle.run(
+                _render_with_browser,
+                retry_handle.browser, url, wait_selector,
+                timeout_ms, wait_state, block_assets,
+            )
+        except Exception as e2:
+            # 재기동해도 안 되면 일회성 브라우저까지 시도합니다. 여기까지
+            # 실패해야 진짜 실패입니다. 예전에는 재기동 후 곧바로 raise해서
+            # 한 번의 일시적 오류가 그대로 화면 실패로 이어졌습니다.
+            logger.warning("재기동 후에도 실패, 일회성 브라우저로 폴백: %s", e2)
+            reset_browser()
+            return _fetch_rendered_html_oneshot(
+                url, wait_selector, timeout_ms, wait_state, block_assets,
+            )
 
 
 def _fetch_rendered_html_oneshot(
