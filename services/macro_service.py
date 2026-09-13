@@ -27,13 +27,25 @@ logger = logging.getLogger(__name__)
 # 1. UI 헬퍼 및 텍스트 레이블 정제기
 # ==============================================================================
 def clean_tag_ui(tag_str: str) -> str:
-    """UI 상에 지표 이름의 마크다운 스타일 태그(:gray[...], [[...]] 등)를 정제"""
+    r"""
+    지표 이름에서 UI 표시용 마크다운 태그를 제거합니다.
+
+    [버그 수정] 기존에는 `:gray\[.*?\]`를 **먼저** 적용했습니다. config의
+    실제 이름은 `달러 인덱스 (DXY) :gray[[실시간]]`처럼 대괄호가 중첩돼
+    있는데, non-greedy `.*?\]`가 **첫 번째** `]`에서 멈춰
+    `:gray[[실시간]` 까지만 지우고 닫는 `]` 하나를 남겼습니다.
+    그 결과 차트 선택 목록에 "달러 인덱스 (DXY) ]" 처럼 표시됐습니다.
+
+    중첩 패턴(`:gray[[...]]`)을 먼저 지운 뒤 단일 패턴을 처리해야 합니다.
+    """
     if not isinstance(tag_str, str):
         return str(tag_str)
-    clean = re.sub(r':gray\[.*?\]', '', tag_str)
-    clean = re.sub(r'\[\[.*?\]\]', '', clean)
-    clean = re.sub(r'\[.*?\]', '', clean)
-    return clean.strip()
+
+    clean = re.sub(r':gray\[\[.*?\]\]', '', tag_str)   # :gray[[...]]  (중첩)
+    clean = re.sub(r':gray\[.*?\]', '', clean)         # :gray[...]
+    clean = re.sub(r'\[\[.*?\]\]', '', clean)          # [[...]]
+    clean = re.sub(r'\[.*?\]', '', clean)              # [...]
+    return re.sub(r'\s{2,}', ' ', clean).strip()
 
 
 def _clean_macro_label(text: str) -> str:

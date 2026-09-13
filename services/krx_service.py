@@ -470,6 +470,37 @@ DAUM_FUTURES_CATEGORY_MAP = [
 ]
 
 
+def _detect_measure_unit(df_raw: pd.DataFrame, columns: list[str]) -> str:
+    """
+    파싱된 값이 '원 단위 금액'인지 '계약수'인지 크기로 판별합니다.
+
+    KOSPI200 선물 투자자별 순매수는
+      - 원 단위 금액: 최소 수억 원 (1e8) ~ 수천억 원 (1e12)
+      - 계약수      : 수백 ~ 수만 (1e2 ~ 1e5)
+    이므로 1e7을 경계로 두면 안전하게 구분됩니다.
+
+    반환값:
+      "PRICE"    — 원 단위 금액이 확실함
+      "CONTRACT" — 계약수가 확실함
+      ""         — 판별 불가(컬럼 없음 / 전부 0 / 비수치).
+                   이때는 "API가 요청을 무시했다"고 단정할 근거가 없으므로
+                   호출자가 요청 기준을 그대로 유지해야 합니다.
+    """
+    present = [c for c in columns if c in df_raw.columns]
+    if not present:
+        return ""
+
+    try:
+        peak = float(df_raw[present].abs().to_numpy().max())
+    except (ValueError, TypeError):
+        return ""
+
+    if not peak or peak != peak:          # 0 또는 NaN → 근거 없음
+        return ""
+
+    return "PRICE" if peak >= 1e7 else "CONTRACT"
+
+
 def collect_daum_futures_investor_trend(
     lookback_days: int = 25,
     measure: str = "CONTRACT",
@@ -599,7 +630,30 @@ def collect_daum_futures_investor_trend(
             numeric_only=True
         )
 
-        # type=PRICE 응답은 원 단위이므로 억 원 단위로 변환합니다.
+        # ----------------------------------------------------------------
+        # [버그 수정] type=PRICE를 보내도 Daum이 이를 무시하고 계약수를
+        # 그대로 돌려주는 경우가 있습니다. 그때 계약수(수천 단위)를
+        # 1억으로 나누면 전부 0.0이 되어, 화면의 "금액(억원)" 기준이
+        # 그냥 0만 뜨는 상태가 됩니다("작동하지 않는다"의 실체).
+        #
+        # 원 단위 금액이라면 KOSPI200 선물 순매수는 최소 수억~수천억 원
+        # (1e8~1e12) 규모이고, 계약수라면 1e2~1e5 규모입니다. 두 범위는
+        # 확실히 구분되므로 크기로 판별합니다.
+        # ----------------------------------------------------------------
+        measure_fallback_reason = None
+        if measure == "PRICE" and _detect_measure_unit(
+            df_raw, numeric_columns,
+        ) == "CONTRACT":
+            measure_fallback_reason = (
+                "Daum API가 금액(type=PRICE) 요청을 무시하고 계약수를 "
+                "반환했습니다. 0으로 표시하지 않도록 계약수 기준으로 "
+                "되돌립니다."
+            )
+            logger.warning(
+                "Daum 선물 수급: %s", measure_fallback_reason,
+            )
+            measure = "CONTRACT"
+
         divisor = 100_000_000 if measure == "PRICE" else 1
         unit = "억 원" if measure == "PRICE" else "계약"
         measure_label = "금액" if measure == "PRICE" else "계약수"
@@ -646,6 +700,8 @@ def collect_daum_futures_investor_trend(
         df_result["is_placeholder"] = False
         df_result["data_measure"] = measure
         df_result["data_unit"] = unit
+        # 요청한 기준과 실제 데이터 기준이 다르면 화면이 알려 줘야 합니다.
+        df_result["measure_fallback_reason"] = measure_fallback_reason or ""
         df_result["data_date"] = str(
             today_row.get("date", "")
         )[:10]

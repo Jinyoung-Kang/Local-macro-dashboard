@@ -1355,3 +1355,136 @@ def test_snapshot_labels_placeholder_vs_real_differently():
     assert "placeholder" not in "\n".join(real_lines)
     assert "placeholder" in "\n".join(fake_lines)
     assert "판단 근거로 쓰지 마세요" in "\n".join(fake_lines)
+
+
+# ==============================================================================
+# 24. 지표 이름 정제 — 중첩 대괄호에서 "]"가 남으면 안 된다
+# ==============================================================================
+@pytest.mark.parametrize("raw,expected", [
+    ("달러 인덱스 (DXY) :gray[[실시간]]", "달러 인덱스 (DXY)"),
+    ("미국채 2년물 수익률(%) :gray[[TradingView 참고]]", "미국채 2년물 수익률(%)"),
+    ("WTI 원유 ($) :gray[[15분 지연]]", "WTI 원유 ($)"),
+    ("💵 통화 및 환율 :gray[(실시간)]", "💵 통화 및 환율"),
+    ("태그 없는 이름", "태그 없는 이름"),
+])
+def test_clean_tag_ui_removes_nested_brackets(raw, expected):
+    """
+    [회귀] `:gray\\[.*?\\]`를 먼저 적용하면 non-greedy가 첫 번째 `]`에서
+    멈춰 `:gray[[실시간]`까지만 지우고 닫는 `]` 하나가 남았습니다.
+    화면 선택 목록에 "달러 인덱스 (DXY) ]" 처럼 표시됐습니다.
+    """
+    from services.macro_service import clean_tag_ui
+
+    assert clean_tag_ui(raw) == expected
+
+
+def test_no_bracket_residue_in_any_configured_indicator():
+    from config import MACRO_CATEGORIES
+    from services.macro_service import clean_tag_ui
+
+    names = [n for items in MACRO_CATEGORIES.values() for n in items]
+    assert names, "설정된 지표가 없습니다"
+
+    for name in names:
+        cleaned = clean_tag_ui(name)
+        assert "[" not in cleaned and "]" not in cleaned, (
+            f"대괄호 잔존: {name!r} -> {cleaned!r}"
+        )
+        assert cleaned.strip() == cleaned
+
+
+def test_snapshot_tag_cleaner_delegates_to_single_implementation():
+    """같은 로직이 두 곳에 복제돼 한쪽만 고쳐지는 일이 없어야 합니다."""
+    from config import MACRO_CATEGORIES
+    from services.dashboard_snapshot_service import clean_ui_tag
+    from services.macro_service import clean_tag_ui
+
+    names = [n for items in MACRO_CATEGORIES.values() for n in items]
+    for name in names:
+        assert clean_ui_tag(name) == clean_tag_ui(name)
+
+
+# ==============================================================================
+# 25. KRX 금액(억원) 기준 — 계약수를 1e8로 나눠 0이 되면 안 된다
+# ==============================================================================
+def test_won_amount_detection_separates_contracts_from_won():
+    """
+    KOSPI200 선물 순매수는 원 단위면 1e8~1e12, 계약수면 1e2~1e5 규모라
+    크기로 확실히 구분됩니다.
+
+    판별 근거가 없는 경우(컬럼 없음 / 전부 0)는 ""를 돌려줘야 합니다.
+    "API가 요청을 무시했다"고 단정하면 거짓 경고가 되기 때문입니다.
+    """
+    from services.krx_service import _detect_measure_unit
+
+    cols = ["frgn", "inst"]
+    won = pd.DataFrame({"frgn": [3.4e11, -2.1e11], "inst": [1.2e10, -8e9]})
+    contracts = pd.DataFrame({"frgn": [3450, -2100], "inst": [1200, -800]})
+    zeros = pd.DataFrame({"frgn": [0.0, 0.0], "inst": [0.0, 0.0]})
+
+    assert _detect_measure_unit(won, cols) == "PRICE"
+    assert _detect_measure_unit(contracts, cols) == "CONTRACT"
+    assert _detect_measure_unit(pd.DataFrame(), cols) == ""
+    assert _detect_measure_unit(zeros, cols) == ""
+
+
+def test_price_measure_falls_back_when_api_ignores_type(monkeypatch):
+    """
+    [회귀] Daum이 type=PRICE를 무시하고 계약수를 반환하면, 계약수를
+    1억으로 나눠 화면의 "금액(억원)" 값이 전부 0.0이 됐습니다.
+    이제 계약수 기준으로 되돌리고 그 사유를 데이터에 실어 보냅니다.
+    """
+    import services.krx_service as krx
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            # 계약수 규모의 값 (원 단위가 아님)
+            return {"data": [
+                {"date": "2026-09-11", **{
+                    field: 3450 for _, field in krx.DAUM_FUTURES_CATEGORY_MAP
+                }},
+            ]}
+
+    monkeypatch.setattr(krx, "get_session", lambda: type(
+        "S", (), {"get": staticmethod(lambda *a, **k: _Resp())},
+    )())
+
+    df = krx.collect_daum_futures_investor_trend(25, "PRICE")
+
+    assert not df.empty
+    assert df["data_measure"].iloc[0] == "CONTRACT", "계약수로 되돌려야 합니다"
+    assert df["data_unit"].iloc[0] == "계약"
+    assert df["measure_fallback_reason"].iloc[0], "사유가 비어 있습니다"
+    # 0.0으로 뭉개지지 않아야 합니다.
+    assert df["당일 순매수"].abs().max() > 0
+
+
+def test_price_measure_kept_when_api_returns_won(monkeypatch):
+    """실제 원 단위 금액이 오면 정상적으로 억 원으로 변환돼야 합니다."""
+    import services.krx_service as krx
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"data": [
+                {"date": "2026-09-11", **{
+                    field: 3.45e11 for _, field in krx.DAUM_FUTURES_CATEGORY_MAP
+                }},
+            ]}
+
+    monkeypatch.setattr(krx, "get_session", lambda: type(
+        "S", (), {"get": staticmethod(lambda *a, **k: _Resp())},
+    )())
+
+    df = krx.collect_daum_futures_investor_trend(25, "PRICE")
+
+    assert df["data_measure"].iloc[0] == "PRICE"
+    assert df["data_unit"].iloc[0] == "억 원"
+    assert not df["measure_fallback_reason"].iloc[0]
+    # 3.45e11 원 = 3450 억 원
+    assert df["당일 순매수"].iloc[0] == pytest.approx(3450.0, rel=1e-3)

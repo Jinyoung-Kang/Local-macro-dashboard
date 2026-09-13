@@ -4,13 +4,13 @@ services/dashboard_snapshot_service.py
 UI Markdown 태그 정제 및 데이터 단위 포맷팅, 안전 파싱 로직 포함.
 """
 import logging
-import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
 
 from services.macro_service import (
+    clean_tag_ui,
     get_collected_macro_data,
     get_macro_risk_indicators_for_ai,
     summarize_series_for_ai,
@@ -49,13 +49,14 @@ def safe_call(fn, *args, **kwargs):
 
 
 def clean_ui_tag(text: str) -> str:
-    """텍스트 내 포함된 UI 표시용 마크다운(gray 등)을 깔끔하게 제거합니다."""
-    if not isinstance(text, str):
-        return str(text)
-    text = re.sub(r":gray\[\[.*?\]\]", "", text)
-    text = re.sub(r":gray\[.*?\]", "", text)
-    text = re.sub(r"\[\[.*?\]\]", "", text)
-    return re.sub(r"\s{2,}", " ", text).strip()
+    """
+    텍스트 내 UI 표시용 마크다운 태그를 제거합니다.
+
+    같은 로직이 macro_service.clean_tag_ui와 여기 두 곳에 복제돼 있었고,
+    한쪽만 중첩 대괄호를 잘못 처리해 화면에 "]"가 남는 버그가 살아남았습니다.
+    단일 구현에 위임합니다.
+    """
+    return clean_tag_ui(text)
 
 
 def _get_num(row, *keys, default=0.0):

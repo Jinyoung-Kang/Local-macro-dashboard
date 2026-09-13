@@ -160,13 +160,35 @@ def render_krx_cot_view():
         measure=investor_measure,
     )
     
+    measure_fallback_reason = ""
+
     if df_investors is None or df_investors.empty:
         df_investors = get_krx_investor_derivatives_summary()
-    
+
         # placeholder 함수의 값은 계약수 기준 고정 예시값입니다.
         # 금액(억원) 선택 상태라도 계약수로 잘못 표기하지 않도록 강제합니다.
         display_measure = "CONTRACT"
         display_measure_label = "계약수 (예시 데이터)"
+    else:
+        # [버그 수정] Daum이 type=PRICE 요청을 무시하고 계약수를 돌려주면
+        # 서비스 계층이 계약수 기준으로 되돌립니다. 그 사실을 화면이 그대로
+        # 표시해야 사용자가 "금액 기준이 작동하지 않는다"고 오해하지 않습니다.
+        if "measure_fallback_reason" in df_investors.columns:
+            reasons = [
+                r for r in df_investors["measure_fallback_reason"].tolist()
+                if isinstance(r, str) and r
+            ]
+            if reasons:
+                measure_fallback_reason = reasons[0]
+
+        # 실제 데이터의 기준을 신뢰합니다(요청 기준이 아니라).
+        if "data_measure" in df_investors.columns:
+            actual = str(df_investors["data_measure"].iloc[0]).upper()
+            if actual in ("CONTRACT", "PRICE"):
+                display_measure = actual
+                display_measure_label = (
+                    "금액(억원)" if actual == "PRICE" else "계약수"
+                )
 
     intraday_flow = fetch_daum_futures_intraday_acceleration(lookback_minutes=30)
     
@@ -724,6 +746,14 @@ def render_krx_cot_view():
                 "계약수 기준으로 표시됩니다."
             )
         else:
+            if measure_fallback_reason:
+                st.warning(
+                    f"**금액(억원) 기준을 사용할 수 없습니다.** "
+                    f"{measure_fallback_reason} "
+                    "아래 표는 계약수 기준입니다.",
+                    icon="⚠️",
+                )
+
             if display_measure == "PRICE":
                 measure_caption = (
                     "금액 기준: Daum 원 단위 응답을 억 원 단위로 변환해 표시합니다."
