@@ -45,27 +45,66 @@ def get_secret(key_path: str, default: str = "") -> str:
 
 LS_APP_KEY = get_secret("ls.app_key", get_secret("LS_APP_KEY", get_secret("ls_app_key", "")))
 LS_APP_SECRET = get_secret("ls.app_secret", get_secret("LS_APP_SECRET", get_secret("ls_app_secret", "")))
+
+# LS OPEN API는 문서상 8080 포트를 씁니다. 다만 회사·학교·일부 ISP 망이나
+# VPN 환경에서는 **8080 아웃바운드가 막혀** 연결 자체가 안 되는 경우가
+# 흔합니다(키와 무관하게 ConnectionError). 그래서 8080을 먼저 시도하고,
+# 닿지 않으면 표준 443으로 한 번 더 시도합니다.
+#
+# secrets.toml에 `[ls] base_url = "..."` 을 넣으면 그 값만 씁니다.
 LS_BASE_URL = "https://openapi.ls-sec.co.kr:8080"
+LS_ALT_BASE_URLS = ("https://openapi.ls-sec.co.kr",)
+
+# 실제로 연결에 성공한 주소. 토큰 발급 때 확정해 TR 호출이 같은 주소를
+# 쓰도록 합니다(포트가 갈리면 토큰이 통하지 않습니다).
+_resolved_base_url: str = ""
+
+# 토큰 발급 실패의 종류. 화면이 "키 문제"와 "망 문제"를 섞지 않게 합니다.
+FAIL_NO_KEYS = "no_keys"
+FAIL_NETWORK = "network"
+FAIL_REJECTED = "rejected"
+FAIL_BAD_RESPONSE = "bad_response"
 
 
-def request_ls_token() -> tuple[str, str]:
+def get_ls_base_urls() -> list[str]:
+    """시도할 LS API 주소 목록 (우선순위 순)."""
+    override = get_secret("ls.base_url", get_secret("LS_BASE_URL", ""))
+    if override:
+        return [override.rstrip("/")]
+    if _resolved_base_url:
+        # 이미 닿은 주소를 먼저 씁니다.
+        others = [u for u in (LS_BASE_URL, *LS_ALT_BASE_URLS) if u != _resolved_base_url]
+        return [_resolved_base_url, *others]
+    return [LS_BASE_URL, *LS_ALT_BASE_URLS]
+
+
+def request_ls_token() -> tuple[str, str, str]:
     """
     LS OAuth2 토큰을 실제로 발급받습니다. 캐시를 쓰지 않습니다.
 
-    반환: (토큰, 실패 사유)
-      성공하면 ("eyJ...", ""), 실패하면 ("", "사람이 읽을 수 있는 사유").
+    반환: (토큰, 실패 사유, 실패 종류)
+      성공하면 ("eyJ...", "", "")
 
-    [왜 사유를 돌려주는가] 예전에는 실패 이유가 로그로만 남고 화면에는
-    "연결 실패"만 떴습니다. 앱키 오타인지, 미등록 상태인지, 서버 장애인지
-    구분할 수 없어 사용자가 무엇을 고쳐야 할지 알 수 없었습니다.
+    [왜 종류를 나누는가] 사용자가 받은 실제 오류는 이것이었습니다.
+
+        ConnectionError: HTTPSConnectionPool(host='openapi.ls-sec.co.kr',
+        port=8080): Max retries exceeded with url: /oauth2/token
+
+    **서버에 닿지도 못한 것**이지 키가 거절된 것이 아닙니다. 그런데 화면은
+    "앱키/시크릿이 유효하지 않거나 사용등록이 안 된 상태"라고 말해서,
+    멀쩡한 키를 계속 의심하게 만들었습니다. 망 문제와 키 문제는 조치가
+    전혀 다르므로 반드시 구분해야 합니다.
+
+    8080이 막힌 망이 흔하므로 443으로도 시도합니다.
     """
+    global _resolved_base_url
+
     app_key = get_secret("ls.app_key", get_secret("LS_APP_KEY", get_secret("ls_app_key", "")))
     app_secret = get_secret("ls.app_secret", get_secret("LS_APP_SECRET", get_secret("ls_app_secret", "")))
 
     if not app_key or not app_secret:
-        return "", "secrets.toml에 [ls] app_key / app_secret이 없습니다."
+        return "", "secrets.toml에 [ls] app_key / app_secret이 없습니다.", FAIL_NO_KEYS
 
-    url = f"{LS_BASE_URL}/oauth2/token"
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     payload = {
         "grant_type": "client_credentials",
@@ -74,30 +113,42 @@ def request_ls_token() -> tuple[str, str]:
         "scope": "oob",
     }
 
-    try:
-        res = requests.post(url, headers=headers, data=payload, timeout=10)
-    except Exception as e:                                   # noqa: BLE001
-        logger.warning("LS API Token 발급 예외 발생: %s", e)
-        return "", f"서버 통신 예외: {type(e).__name__}: {str(e)[:120]}"
+    network_errors = []
 
-    if res.status_code == 200:
+    for base in get_ls_base_urls():
+        url = f"{base}/oauth2/token"
         try:
-            token = res.json().get("access_token", "")
-        except Exception:                                    # noqa: BLE001
-            return "", "토큰 응답을 JSON으로 읽지 못했습니다."
-        if token:
-            return token, ""
-        return "", "응답에 access_token이 없습니다."
+            res = requests.post(url, headers=headers, data=payload, timeout=10)
+        except Exception as e:                               # noqa: BLE001
+            logger.warning("LS 토큰 발급 통신 실패 (%s): %s", base, e)
+            network_errors.append(f"{base} → {type(e).__name__}")
+            continue
 
-    detail = (res.text or "")[:200]
-    logger.warning("LS Token 발급 거절 (%s): %s", res.status_code, detail)
-    return "", f"HTTP {res.status_code} — {detail}"
+        # 응답이 왔다는 것은 주소·포트가 맞다는 뜻입니다. 상태코드와 무관하게
+        # 이 주소를 확정하고, 이후 TR도 같은 주소로 보냅니다.
+        _resolved_base_url = base
+
+        if res.status_code == 200:
+            try:
+                token = res.json().get("access_token", "")
+            except Exception:                                # noqa: BLE001
+                return "", "토큰 응답을 JSON으로 읽지 못했습니다.", FAIL_BAD_RESPONSE
+            if token:
+                return token, "", ""
+            return "", "응답에 access_token이 없습니다.", FAIL_BAD_RESPONSE
+
+        detail = (res.text or "")[:200]
+        logger.warning("LS Token 발급 거절 (%s): %s", res.status_code, detail)
+        return "", f"HTTP {res.status_code} — {detail}", FAIL_REJECTED
+
+    tried = " / ".join(network_errors) if network_errors else "시도할 주소 없음"
+    return "", tried, FAIL_NETWORK
 
 
 @st.cache_data(ttl=18000, show_spinner=False)
 def _cached_ls_token(app_key: str, app_secret: str) -> str:
     """키 조합별 토큰 캐시. 인자는 캐시 키로만 쓰입니다."""
-    token, _ = request_ls_token()
+    token, _, _ = request_ls_token()
     return token
 
 
@@ -137,7 +188,10 @@ def call_ls_api(tr_cd: str, tr_url: str, body_params: dict) -> dict:
     if not token:
         return {"rsp_msg": "LS OAuth2 토큰 발급 실패 (API Key / Secret 유효성 확인 필요)"}
 
-    url = f"{LS_BASE_URL}{tr_url}"
+    # 토큰을 받아 낸 바로 그 주소로 보냅니다. 포트가 갈리면 토큰이 통하지
+    # 않으므로 LS_BASE_URL을 고정으로 쓰면 안 됩니다.
+    base = _resolved_base_url or get_ls_base_urls()[0]
+    url = f"{base}{tr_url}"
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "authorization": f"Bearer {token}",

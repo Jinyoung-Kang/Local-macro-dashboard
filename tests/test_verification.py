@@ -681,7 +681,7 @@ def test_ls_diagnostic_reports_auth_success_when_only_data_is_empty(monkeypatch)
     import services.ls_service as ls
 
     monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "dummy")
-    monkeypatch.setattr(ls, "request_ls_token", lambda: ("valid-token", ""))
+    monkeypatch.setattr(ls, "request_ls_token", lambda: ("valid-token", "", ""))
     monkeypatch.setattr(
         rs, "call_ls_api",
         lambda **kw: {"rsp_msg": "해당자료가 없습니다."},
@@ -711,12 +711,12 @@ def test_ls_diagnostic_fails_clearly_when_token_is_rejected(monkeypatch):
     monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "dummy")
     monkeypatch.setattr(
         ls, "request_ls_token",
-        lambda: ("", "HTTP 401 — invalid appkey"),
+        lambda: ("", "HTTP 401 — invalid appkey", ls.FAIL_REJECTED),
     )
 
     ok, msg = rs.test_ls_connection()
     assert ok is False
-    assert "토큰 발급 실패" in msg
+    assert "거절" in msg
     assert "invalid appkey" in msg
 
 
@@ -800,3 +800,136 @@ def test_ls_fetcher_preserves_leading_zero_stock_codes():
     source = pathlib.Path("services/radar_service.py").read_text(encoding="utf-8")
     ls_fn = source.split("def fetch_ls_deal_ranking")[1].split("\ndef ")[0]
     assert ls_fn.count('zfill(6)') >= 2, "LS 경로에 종목코드 zfill이 없습니다"
+
+
+def test_ls_network_failure_is_not_blamed_on_the_keys(monkeypatch):
+    """
+    [회귀] 사용자가 받은 실제 오류:
+
+        ConnectionError: HTTPSConnectionPool(host='openapi.ls-sec.co.kr',
+        port=8080): Max retries exceeded with url: /oauth2/token
+
+    **서버에 닿지도 못한 것**인데 화면은 "앱키/시크릿이 유효하지 않거나
+    사용등록이 안 된 상태"라고 말했습니다. 망 문제와 키 문제는 조치가
+    완전히 다르므로 절대 섞으면 안 됩니다.
+    """
+    import services.radar_service as rs
+    import services.ls_service as ls
+
+    monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "dummy")
+    monkeypatch.setattr(
+        ls, "request_ls_token",
+        lambda: ("", "https://openapi.ls-sec.co.kr:8080 → ConnectionError",
+                 ls.FAIL_NETWORK),
+    )
+
+    ok, msg = rs.test_ls_connection()
+
+    assert ok is False
+    assert "키 문제가 아닙니다" in msg
+    # 키를 의심하게 만드는 문구가 남아 있으면 안 됩니다.
+    assert "유효하지 않" not in msg
+    # 사용자가 직접 확인할 방법을 줘야 합니다.
+    assert "curl" in msg
+    assert "8080" in msg
+
+
+def test_ls_token_tries_the_alternate_port_when_8080_is_blocked(monkeypatch):
+    """
+    8080이 막힌 망이 흔하므로 443으로도 시도해야 합니다.
+    """
+    import services.ls_service as ls
+
+    # base_url 오버라이드는 비워 둬야 기본 후보(8080 → 443)가 쓰입니다.
+    monkeypatch.setattr(
+        ls, "get_secret",
+        lambda key, default="": "" if "base_url" in key else "dummy",
+    )
+    monkeypatch.setattr(ls, "_resolved_base_url", "", raising=False)
+
+    tried = []
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"access_token": "tok-from-443"}
+
+    def fake_post(url, **kw):
+        tried.append(url)
+        if ":8080" in url:
+            raise ConnectionError("8080 blocked")
+        return _Resp()
+
+    monkeypatch.setattr(ls.requests, "post", fake_post)
+
+    token, reason, kind = ls.request_ls_token()
+
+    assert token == "tok-from-443", (reason, kind)
+    assert any(":8080" in u for u in tried), "8080을 먼저 시도해야 합니다"
+    assert len(tried) == 2, tried
+    # 이후 TR 호출이 같은 주소를 쓰도록 확정돼야 합니다.
+    assert ls._resolved_base_url == "https://openapi.ls-sec.co.kr"
+
+
+def test_ls_reports_network_kind_when_every_address_fails(monkeypatch):
+    import services.ls_service as ls
+
+    monkeypatch.setattr(
+        ls, "get_secret",
+        lambda key, default="": "" if "base_url" in key else "dummy",
+    )
+    monkeypatch.setattr(ls, "_resolved_base_url", "", raising=False)
+
+    def always_fail(url, **kw):
+        raise ConnectionError("unreachable")
+
+    monkeypatch.setattr(ls.requests, "post", always_fail)
+
+    token, reason, kind = ls.request_ls_token()
+    assert token == ""
+    assert kind == ls.FAIL_NETWORK
+    assert "ConnectionError" in reason
+
+
+def test_ls_base_url_can_be_overridden_by_secrets(monkeypatch):
+    """포트가 바뀌어도 코드 수정 없이 secrets.toml로 지정할 수 있어야 합니다."""
+    import services.ls_service as ls
+
+    monkeypatch.setattr(
+        ls, "get_secret",
+        lambda key, default="": "https://custom.example:9999/" if "base_url" in key else "",
+    )
+    assert ls.get_ls_base_urls() == ["https://custom.example:9999"]
+
+
+def test_ls_tr_call_uses_the_address_that_worked(monkeypatch):
+    """
+    토큰을 받아 낸 주소와 다른 포트로 TR을 보내면 토큰이 통하지 않습니다.
+    """
+    import services.ls_service as ls
+
+    monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "dummy")
+    monkeypatch.setattr(ls, "_resolved_base_url",
+                        "https://openapi.ls-sec.co.kr", raising=False)
+    monkeypatch.setattr(ls, "get_ls_access_token", lambda: "tok")
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"ok": True}
+
+    def fake_post(url, **kw):
+        seen["url"] = url
+        return _Resp()
+
+    monkeypatch.setattr(ls.requests, "post", fake_post)
+    ls.call_ls_api("t1452", "/stock/market-sum", {})
+
+    assert seen["url"].startswith("https://openapi.ls-sec.co.kr/"), seen
+    assert ":8080" not in seen["url"]

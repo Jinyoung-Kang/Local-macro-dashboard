@@ -195,6 +195,7 @@ def test_ls_connection():
     2단계까지 통과하면 **연결은 성공**입니다. 3단계에서 데이터가 비는 것은
     주말·장 마감 시간대에는 정상입니다.
     """
+    from services import ls_service as ls_mod
     from services.ls_service import get_secret as ls_secret, request_ls_token
 
     # --- 1단계: 키 존재 ---
@@ -206,11 +207,28 @@ def test_ls_connection():
             "LS를 쓰지 않는다면 무시해도 됩니다."
         )
 
-    # --- 2단계: 토큰 발급 (키 유효성의 진짜 판정) ---
-    token, token_error = request_ls_token()
+    # --- 2단계: 토큰 발급 ---
+    # 실패해도 원인이 전혀 다릅니다. 망에서 서버에 닿지 못한 것과 키가
+    # 거절된 것을 섞으면, 멀쩡한 키를 계속 의심하게 됩니다(사용자 신고).
+    token, token_error, fail_kind = request_ls_token()
+
+    if not token and fail_kind == ls_mod.FAIL_NETWORK:
+        return False, (
+            "**LS 서버에 접속하지 못했습니다. 키 문제가 아닙니다.**\n\n"
+            f"{token_error}\n\n"
+            "LS OPEN API는 8080 포트를 쓰는데, 회사·학교 망이나 VPN에서 "
+            "8080 아웃바운드가 막혀 있으면 이렇게 됩니다. 443으로도 시도했지만 "
+            "역시 닿지 않았습니다.\n\n"
+            "터미널에서 확인해 보세요:\n"
+            "`curl -v --max-time 10 https://openapi.ls-sec.co.kr:8080/oauth2/token`\n\n"
+            "VPN을 끄거나 다른 네트워크(휴대폰 핫스팟)에서 다시 시도해 보시고, "
+            "포트가 바뀐 것이 확인되면 secrets.toml에 "
+            "`[ls] base_url = \"https://...\"` 로 지정할 수 있습니다."
+        )
+
     if not token:
         return False, (
-            f"OAuth 토큰 발급 실패 — 앱키/시크릿이 유효하지 않거나 "
+            f"OAuth 토큰 발급 거절 — 앱키/시크릿이 유효하지 않거나 "
             f"OPEN API 사용등록이 안 된 상태입니다.\n\n{token_error}"
         )
 
