@@ -329,36 +329,54 @@ def test_naver_scraping():
 
 def test_daum_scraping():
     """
-    Daum 금융 외국인/기관 매매종목 페이지를 헤드리스 브라우저로 렌더링하여
-    실제 표가 정상적으로 생성되는지 점검합니다.
+    Daum 금융 투자자별 매매종목 연결 점검.
+
+    [버그 수정] 예전에는 finance.daum.net/domestic/influential_investors
+    **페이지를 헤드리스 브라우저로 렌더링**해 표를 찾았습니다. 그런데 화면이
+    실제로 쓰는 Daum 경로는 그 페이지가 아니라 내부 JSON API
+    (finance.daum.net/api/trend/investor_purchase/)입니다.
+
+    서로 다른 것을 재고 있었기 때문에, API가 멀쩡히 30종목을 돌려주는
+    상황에서도 카드가 "Daum 실패"로 빨갛게 떴습니다(사용자 신고). 진단은
+    화면이 실제로 쓰는 경로를 그대로 따라가야 의미가 있습니다. 그렇지 않으면
+    ⓐ 멀쩡한데 실패라고 하거나 ⓑ 망가졌는데 정상이라고 하게 됩니다.
+
+    그래서 화면과 **똑같은 함수**(fetch_daum_deal_ranking)를 호출합니다.
     """
-    url = "https://finance.daum.net/domestic/influential_investors"
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    last_error = None
 
-    try:
-        html = _fetch_rendered_html(url, wait_selector="table")
-        soup = BeautifulSoup(html, "html.parser")
+    # Daum API는 최근 거래일 데이터를 줍니다. 주말·휴장일을 감안해 거슬러 봅니다.
+    for back in range(7):
+        date_str = (now_kst - timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            df = fetch_daum_deal_ranking(
+                date_str, "KOSPI", "외국인", "순매수", 30,
+            )
+        except Exception as e:                               # noqa: BLE001
+            last_error = f"{type(e).__name__}: {str(e)[:120]}"
+            continue
 
-        target_table = None
-        for table in soup.find_all("table"):
-            if "순매수" in table.get_text() and "순매도" in table.get_text():
-                target_table = table
-                break
+        if df is not None and not df.empty:
+            data_date = ""
+            if "데이터_출처" in df.columns:
+                data_date = str(df.iloc[0]["데이터_출처"])
+            return True, (
+                f"정상 통신 성공 (investor_purchase API, 종목 수: {len(df)}개)"
+                + (f"\n\n{data_date}" if data_date else "")
+            )
 
-        if target_table is None:
-            return False, "렌더링 후에도 순매수/순매도 표를 찾지 못했습니다."
-
-        parsed = sum(
-            1 for row in target_table.find_all("tr")
-            if len(row.find_all("td")) >= 8
+    if last_error:
+        return False, (
+            f"investor_purchase API 호출에 실패했습니다. 마지막 오류: "
+            f"{last_error}"
         )
 
-        if parsed == 0:
-            return False, "표는 렌더링됐지만 파싱 가능한 종목 행이 없습니다 (휴장일 가능)."
-
-        return True, f"정상 통신 성공 (렌더링 방식, 파싱된 종목 수: {parsed}개)"
-
-    except Exception as e:
-        return False, f"헤드리스 브라우저 렌더링 실패: {e}"
+    return False, (
+        "investor_purchase API가 최근 7일 내내 빈 응답을 돌려줬습니다. "
+        "Daum이 API 경로나 파라미터를 바꿨을 수 있습니다 "
+        "(services/radar_service.py의 fetch_daum_deal_ranking 확인)."
+    )
 
 
 # ==============================================================================

@@ -569,3 +569,93 @@ def test_radar_history_returns_none_when_nothing_stored(monkeypatch):
     assert rs._read_ranking_from_history(
         dt.date(2026, 9, 11), "KOSPI", "외국인", "순매수", 30,
     ) is None
+
+
+# ==============================================================================
+# 10. 연결 진단은 '화면이 실제로 쓰는 경로'를 재야 한다
+# ==============================================================================
+def test_daum_diagnostic_uses_the_real_data_path(monkeypatch):
+    """
+    [회귀] Daum 카드가 빨간색인데 수집은 멀쩡했던 문제.
+
+    진단은 finance.daum.net의 **페이지를 렌더링**해 표를 찾았고, 화면은
+    내부 JSON API(investor_purchase)를 썼습니다. 서로 다른 것을 재고 있어서
+    API가 30종목을 정상으로 주는 동안에도 "Daum 실패"가 떴습니다.
+
+    진단이 화면과 같은 함수를 부르는지 고정합니다.
+    """
+    import pandas as pd
+    import services.radar_service as rs
+
+    calls = []
+
+    def fake_fetch(date_str, market, investor, trade_type, top_n, **kw):
+        calls.append((market, investor, trade_type))
+        return pd.DataFrame([
+            {"종목코드": "069500", "종목명": "KODEX 200",
+             "순매수대금(억)": 619.5, "데이터_출처": "Daum API (외국인, 당일)"}
+        ])
+
+    monkeypatch.setattr(rs, "fetch_daum_deal_ranking", fake_fetch)
+
+    # 렌더링 경로를 쓰면 테스트가 실패하도록 막아 둡니다.
+    def _no_render(*a, **kw):
+        raise AssertionError("진단이 아직 헤드리스 렌더링 경로를 쓰고 있습니다")
+
+    monkeypatch.setattr(rs, "_fetch_rendered_html", _no_render)
+
+    ok, msg = rs.test_daum_scraping()
+
+    assert ok is True, msg
+    assert calls, "화면이 쓰는 fetch_daum_deal_ranking을 부르지 않았습니다"
+    assert "investor_purchase" in msg
+
+
+def test_daum_diagnostic_reports_failure_when_api_is_empty(monkeypatch):
+    """API가 계속 빈 응답이면 실패로 보고해야 합니다 (조용히 통과 금지)."""
+    import pandas as pd
+    import services.radar_service as rs
+
+    monkeypatch.setattr(
+        rs, "fetch_daum_deal_ranking",
+        lambda *a, **kw: pd.DataFrame(),
+    )
+    ok, msg = rs.test_daum_scraping()
+    assert ok is False
+    assert "빈 응답" in msg
+
+
+def test_daum_diagnostic_surfaces_the_exception(monkeypatch):
+    """예외가 나면 그 내용을 그대로 보여 줘야 고칠 수 있습니다."""
+    import services.radar_service as rs
+
+    def boom(*a, **kw):
+        raise ConnectionError("연결 거부")
+
+    monkeypatch.setattr(rs, "fetch_daum_deal_ranking", boom)
+    ok, msg = rs.test_daum_scraping()
+    assert ok is False
+    assert "ConnectionError" in msg and "연결 거부" in msg
+
+
+def test_naver_diagnostic_still_matches_its_real_path():
+    """
+    Naver는 화면도 진단도 렌더링 스크래핑을 씁니다. 이 대응이 유지되는지
+    (즉 Daum처럼 어긋나지 않는지) 소스에서 확인합니다.
+    """
+    import pathlib
+
+    source = pathlib.Path("services/radar_service.py").read_text(encoding="utf-8")
+
+    # 화면 경로 (렌더링 스크래핑)
+    assert "def fetch_naver_html_ranking" in source
+    naver_fetch = source.split("def fetch_naver_html_ranking")[1].split("\ndef ")[0]
+    assert "_fetch_rendered_html" in naver_fetch
+    # 진단도 같은 렌더링 방식을 씁니다
+    naver_test = source.split("def test_naver_scraping")[1].split("\ndef ")[0]
+    assert "_fetch_rendered_html" in naver_test
+
+    # Daum 진단은 더 이상 렌더링을 쓰지 않아야 합니다
+    daum_test = source.split("def test_daum_scraping")[1].split("\ndef ")[0]
+    assert "_fetch_rendered_html" not in daum_test
+    assert "fetch_daum_deal_ranking" in daum_test

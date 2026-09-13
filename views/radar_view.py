@@ -55,8 +55,11 @@ def render_radar_view():
     with st.expander("연결 상태 테스트", expanded=False):
         st.write("KIS, LS, PyKrx, Naver, Daum 5개 데이터 소스의 연결 상태를 확인합니다.")
         st.caption(
-            "LS API는 현재 LS증권 계좌가 연결된 경우에만 사용됩니다. "
-            "KIS는 장중 가집계, Naver/Daum은 장 마감 후 시장 전체 순위 확인에 사용됩니다."
+            "각 진단은 화면이 **실제로 쓰는 경로**를 그대로 호출합니다 "
+            "(Daum = investor_purchase API, Naver = 렌더링 스크래핑). "
+            "진단과 실제 경로가 다르면 멀쩡한데 실패라고 하거나 그 반대가 됩니다.\n\n"
+            "KIS는 장중 가집계, Naver/Daum은 장 마감 후 시장 전체 순위에 쓰입니다. "
+            "LS API는 LS증권 계좌가 연결된 경우에만 사용됩니다."
         )
 
         if st.button("5개 데이터 소스 연결 상태 테스트", key="btn_test_broker_apis"):
@@ -68,7 +71,7 @@ def render_radar_view():
                 pykrx_ok, pykrx_msg = test_pykrx_connection()
             with st.spinner("Naver 스크래핑 연결 상태를 확인하는 중..."):
                 naver_ok, naver_msg = test_naver_scraping()
-            with st.spinner("Daum 스크래핑 연결 상태를 확인하는 중..."):
+            with st.spinner("Daum API 연결 상태를 확인하는 중..."):
                 daum_ok, daum_msg = test_daum_scraping()
 
             test_col1, test_col2, test_col3, test_col4, test_col5 = st.columns(5)
@@ -101,13 +104,19 @@ def render_radar_view():
             if not naver_ok and not daum_ok:
                 st.error(
                     "Naver와 Daum 모두 연결에 실패했습니다. "
-                    "장 마감 후 시장 전체 순위는 PyKrx 데이터에 의존하며, "
-                    "PyKrx도 실패하면 수급 레이더를 표시할 수 없습니다."
+                    "PyKrx도 실패한 상태라면, 수집기가 쌓아 둔 누적 이력으로 "
+                    "대체 표시됩니다(그때는 화면에 별도 경고가 뜹니다)."
                 )
             elif not naver_ok:
-                st.info("Naver 연결에 실패했지만 Daum API가 정상입니다.")
+                st.info(
+                    "Naver 렌더링에 실패했지만 Daum API가 정상입니다. "
+                    "당일 조회는 Daum이 담당하므로 영향 없습니다."
+                )
             elif not daum_ok:
-                st.info("Daum 연결에 실패했지만 Naver 스크래핑이 정상입니다.")
+                st.info(
+                    "Daum API에 실패했지만 Naver 렌더링이 정상입니다. "
+                    "당일 조회는 Naver로 대체됩니다."
+                )
 
     st.markdown("---")
 
