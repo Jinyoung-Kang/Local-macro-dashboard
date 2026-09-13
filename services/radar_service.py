@@ -177,6 +177,26 @@ def test_kis_connection():
     )
 
 
+# LS 조회에 쓰는 TR 정의 (진단과 수집이 같은 목록을 봅니다).
+#
+# t1664 `/stock/investor`는 정상 응답합니다.
+# t1452 `/stock/market-sum`은 현재 **HTTP 404** — 그 경로가 존재하지 않습니다.
+# 404가 확인됐지만 LS가 되살릴 수도 있으므로 지우지 않고 뒤로 미룹니다.
+LS_PROBE_TRS = (
+    ("t1664", "/stock/investor", {
+        "t1664InBlock": {
+            "gubun1": "1", "gubun2": "1", "gubun3": "1", "cnt": 30,
+        }
+    }),
+    ("t1452", "/stock/market-sum", {
+        "t1452InBlock": {
+            "gubun": "1", "jnilgubun": "1", "paygubun": "2",
+            "ordergubun": "1", "cnt": 30,
+        }
+    }),
+)
+
+
 def test_ls_connection():
     """
     LS증권 OPEN API 연결 점검 — **단계를 나눠** 보고합니다.
@@ -239,22 +259,12 @@ def test_ls_connection():
         and dtime(9, 0) <= now_kst.time() < dtime(15, 30)
     )
 
-    attempts = [
-        ("t1452", "/stock/market-sum", {
-            "t1452InBlock": {
-                "gubun": "1", "jnilgubun": "1", "paygubun": "2",
-                "ordergubun": "1", "cnt": 30,
-            }
-        }),
-        ("t1664", "/stock/investor", {
-            "t1664InBlock": {
-                "gubun1": "1", "gubun2": "1", "gubun3": "1", "cnt": 30,
-            }
-        }),
-    ]
-
+    # 동작이 확인된 TR을 먼저 시도합니다. t1452(/stock/market-sum)는 현재
+    # HTTP 404입니다 — 그 경로는 LS에 존재하지 않습니다(사용자 진단으로 확인).
     messages = []
-    for tr_cd, tr_url, body in attempts:
+    broken_endpoints = []
+
+    for tr_cd, tr_url, body in LS_PROBE_TRS:
         try:
             res = call_ls_api(tr_cd=tr_cd, tr_url=tr_url, body_params=body)
         except Exception as e:                               # noqa: BLE001
@@ -272,13 +282,20 @@ def test_ls_connection():
                 f"{len(block)}개)"
             )
 
-        messages.append(f"{tr_cd}: {res.get('rsp_msg', '데이터 없음')}")
+        reason = str(res.get("rsp_msg", "데이터 없음"))
+
+        # HTTP 4xx/5xx는 "데이터가 없다"와 전혀 다릅니다. 경로·권한 문제이며
+        # 장 시간과 무관합니다. 이걸 "장 시간이 아니라 정상"이라고 뭉뚱그리면
+        # 진짜 고쳐야 할 것을 놓칩니다.
+        if reason.startswith("HTTP "):
+            broken_endpoints.append(f"{tr_cd} {tr_url} → {reason}")
+
+        messages.append(f"{tr_cd}: {reason}")
+
+    detail = " / ".join(messages) if messages else "데이터 없음"
 
     # 토큰이 나왔다는 것은 인증이 된다는 뜻입니다. 이것을 "미연결"이라고
     # 말하면 사용자가 키를 계속 의심하게 됩니다.
-    detail = " / ".join(messages) if messages else "데이터 없음"
-    when = "정규장" if is_regular_session else "장 시간이 아님"
-
     if is_regular_session:
         return False, (
             f"인증은 성공했습니다(토큰 발급 OK). 다만 TR이 데이터를 주지 "
@@ -287,11 +304,17 @@ def test_ls_connection():
             f"입력값을 확인해야 합니다."
         )
 
-    return True, (
+    msg = (
         f"인증 성공 (토큰 발급 OK). 조회 데이터는 비어 있습니다 — {detail}\n\n"
-        f"현재 {when}이라 시세 TR이 빈 값을 주는 것은 정상입니다. "
+        f"현재 장 시간이 아니라 시세 TR이 빈 값을 주는 것은 정상입니다. "
         f"정규장(평일 09:00~15:30)에 다시 확인하세요."
     )
+    if broken_endpoints:
+        msg += (
+            "\n\n⚠️ 다만 아래는 장 시간과 무관한 **경로/권한 문제**입니다:\n"
+            + "\n".join(f"- {b}" for b in broken_endpoints)
+        )
+    return True, msg
 
 
 def test_pykrx_connection():
@@ -619,61 +642,9 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
     mkt_code = "1" if "KOSPI" in market.upper() or "코스피" in market else "2"
     order_code = "1" if trade_type == "순매수" else "2"
 
-    body_params_1452 = {
-        "t1452InBlock": {
-            "gubun": mkt_code,
-            "jnilgubun": "1",
-            "paygubun": "2",
-            "ordergubun": order_code,
-            "cnt": top_n,
-        }
-    }
-
-    try:
-        res = call_ls_api(tr_cd="t1452", tr_url="/stock/market-sum", body_params=body_params_1452)
-        if res and "t1452OutBlock1" in res:
-            data_list = res["t1452OutBlock1"]
-            if data_list:
-                records = []
-                for idx, row in enumerate(data_list[:top_n], start=1):
-                    # [버그 수정] 앞자리 0이 있는 종목코드(069500 등)를 그대로
-                    # 두면 이후 단계에서 정수로 해석돼 69500으로 깨집니다.
-                    # KIS 경로는 zfill(6)을 쓰는데 LS 경로만 빠져 있었습니다.
-                    code = str(row.get("shcode", "")).strip().zfill(6)
-                    name = str(row.get("hname", "")).strip()
-                    price = float(row.get("price", 0))
-                    change_pct = float(row.get("diff", 0))
-
-                    val_key = "forval" if investor == "외국인" else "orgval"
-                    svalue = float(row.get(val_key, row.get("svalue", 0)))
-
-                    if svalue == 0:
-                        continue
-
-                    net_amt_eok = round(svalue / 100.0, 1) if abs(svalue) > 1000 else round(svalue, 1)
-
-                    if trade_type == "순매도" and net_amt_eok > 0:
-                        net_amt_eok = -net_amt_eok
-
-                    if name and code:
-                        records.append({
-                            "순위": idx,
-                            "종목코드": code,
-                            "종목명": name,
-                            "현재가": price,
-                            "등락률(%)": change_pct,
-                            "순매수대금(억)": net_amt_eok,
-                            "시가총액_가중": max(price * 1000, 500),
-                            "수집시각": datetime.now(
-                                ZoneInfo("Asia/Seoul")
-                            ).strftime("%Y-%m-%d %H:%M:%S KST"),
-                            "데이터_출처": f"LS 증권사 API ({target_date})",
-                        })
-                if records:
-                    return pd.DataFrame(records)
-    except Exception:
-        pass
-
+    # [순서 변경] 예전에는 t1452를 먼저 불렀는데, 그 경로
+    # (/stock/market-sum)는 현재 HTTP 404입니다. 매번 실패하는 호출을
+    # 먼저 내보내면 응답만 느려지므로, 정상 응답하는 t1664를 앞에 둡니다.
     inv_map = {"외국인": "1", "기관": "2", "개인": "3", "투신": "4", "연기금": "7", "금융투자": "5"}
     gubun2 = inv_map.get(investor, "1")
     body_params_1664 = {
@@ -728,7 +699,65 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
                 if records:
                     return pd.DataFrame(records)
     except Exception as e:
-        logger.warning(f"LS API 호출 실패: {e}")
+        logger.warning("LS t1664 호출 실패: %s", e)
+
+    # t1664가 비면 t1452로 한 번 더 시도합니다(현재 404이지만 LS가 되살릴
+    # 수 있으므로 남겨 둡니다).
+    body_params_1452 = {
+        "t1452InBlock": {
+            "gubun": mkt_code,
+            "jnilgubun": "1",
+            "paygubun": "2",
+            "ordergubun": order_code,
+            "cnt": top_n,
+        }
+    }
+
+    try:
+        res = call_ls_api(tr_cd="t1452", tr_url="/stock/market-sum", body_params=body_params_1452)
+        if res and "t1452OutBlock1" in res:
+            data_list = res["t1452OutBlock1"]
+            if data_list:
+                records = []
+                for idx, row in enumerate(data_list[:top_n], start=1):
+                    # [버그 수정] 앞자리 0이 있는 종목코드(069500 등)를 그대로
+                    # 두면 이후 단계에서 정수로 해석돼 69500으로 깨집니다.
+                    # KIS 경로는 zfill(6)을 쓰는데 LS 경로만 빠져 있었습니다.
+                    code = str(row.get("shcode", "")).strip().zfill(6)
+                    name = str(row.get("hname", "")).strip()
+                    price = float(row.get("price", 0))
+                    change_pct = float(row.get("diff", 0))
+
+                    val_key = "forval" if investor == "외국인" else "orgval"
+                    svalue = float(row.get(val_key, row.get("svalue", 0)))
+
+                    if svalue == 0:
+                        continue
+
+                    net_amt_eok = round(svalue / 100.0, 1) if abs(svalue) > 1000 else round(svalue, 1)
+
+                    if trade_type == "순매도" and net_amt_eok > 0:
+                        net_amt_eok = -net_amt_eok
+
+                    if name and code:
+                        records.append({
+                            "순위": idx,
+                            "종목코드": code,
+                            "종목명": name,
+                            "현재가": price,
+                            "등락률(%)": change_pct,
+                            "순매수대금(억)": net_amt_eok,
+                            "시가총액_가중": max(price * 1000, 500),
+                            "수집시각": datetime.now(
+                                ZoneInfo("Asia/Seoul")
+                            ).strftime("%Y-%m-%d %H:%M:%S KST"),
+                            "데이터_출처": f"LS 증권사 API ({target_date})",
+                        })
+                if records:
+                    return pd.DataFrame(records)
+    except Exception as e:                                   # noqa: BLE001
+        # 조용히 넘기면 LS가 왜 안 되는지 영영 알 수 없습니다.
+        logger.warning("LS t1452 호출 실패: %s", e)
 
     return pd.DataFrame()
 

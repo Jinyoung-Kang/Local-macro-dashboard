@@ -75,7 +75,7 @@ app_secret = "KIS_APP_SECRET"
 [ls]                                # 선택. https://openapi.ls-sec.co.kr
 app_key    = "LS_APP_KEY"           # LS증권 홈 > 매매시스템 > API > 사용등록/해지
 app_secret = "LS_APP_SECRET"        # ⚠️ "Open API"로 발급 (모의투자 키는 서버가 다릅니다)
-# base_url = "https://openapi.ls-sec.co.kr:8080"   # 포트가 바뀌면 여기로 지정
+# base_url = "https://openapi.ls-sec.co.kr"        # 포트가 바뀌면 여기로 지정
 
 [ai]
 nvidia_api_key   = "..."            # https://build.nvidia.com
@@ -263,10 +263,27 @@ python collector.py --verify
 | `OAuth 토큰 발급 거절` | 서버는 닿았는데 키를 거절 | 앱키·시크릿, "Open API" 사용등록 확인 |
 | `인증 성공 · 조회 데이터 없음` | **연결 성공** | 정규장에 재확인 |
 
-LS API 주소는 `https://openapi.ls-sec.co.kr:8080`입니다. 8080 아웃바운드가
-막힌 망이 흔해서, 닿지 않으면 **443으로 자동 재시도**합니다. 그래도 안 되면
-망 문제이며, 포트가 바뀐 것이 확인되면 `secrets.toml`의
-`[ls] base_url` 로 지정할 수 있습니다.
+**포트 주의** — 문서에는 오랫동안 `:8080`이 적혀 있었지만 **서버가 그 포트를
+더 이상 열어두지 않습니다.**
+
+```
+$ curl -v https://openapi.ls-sec.co.kr:8080/oauth2/token
+connect to 61.106.5.137 port 8080 ... failed: Connection refused   (31ms)
+```
+
+31ms 즉시 refused는 방화벽 드롭(타임아웃)이 아니라 서버가 포트를 닫아 둔
+것입니다. 그래서 표준 **443을 먼저** 쓰고, 옛 환경을 위해 8080을 보조로
+남겨 둡니다. 포트가 또 바뀌면 `secrets.toml`의 `[ls] base_url`로 지정하세요.
+
+**엔드포인트 현황**
+
+| TR | 경로 | 상태 |
+|---|---|---|
+| `t1664` | `/stock/investor` | ✅ 정상 응답 |
+| `t1452` | `/stock/market-sum` | ❌ HTTP 404 (경로 없음) |
+
+`t1664`를 먼저 호출합니다. `HTTP 4xx/5xx`는 "데이터 없음"과 달리 장 시간과
+무관한 **경로·권한 문제**이므로 진단이 따로 표시합니다.
 
 ### 수급 레이더 폴백 체인
 
@@ -421,7 +438,7 @@ python -m pytest tests/ -v
 - `tests/test_browser_pool.py` — 헤드리스 브라우저가 스레드 교체를 견디는지
   (로컬 HTTP 서버만 사용, Chromium 없으면 자동 skip)
 
-모두 외부 네트워크를 쓰지 않으므로 언제든 돌 수 있습니다 (현재 165건).
+모두 외부 네트워크를 쓰지 않으므로 언제든 돌 수 있습니다 (현재 167건).
 
 ---
 
@@ -515,7 +532,7 @@ git push -u origin <브랜치명>
 | `--verify`에서 불일치 발견 | 비공식 소스(Daum·Naver·TradingView)의 페이지 구조 변경을 먼저 의심하세요 |
 | 수급 레이더에서 `PyKrx/KRX` 빨간 카드 | KRX가 pykrx에 JSON 대신 차단 페이지를 주고 있습니다(`Expecting value: line 1 column 1`). **업그레이드로는 해결되지 않습니다**(1.2.8이 최신). 당일 조회는 KIS/Daum/Naver로 정상이며, 과거 조회는 누적 이력으로 대체됩니다 |
 | LS API가 `해당자료가 없습니다` | **인증은 성공한 상태입니다**(토큰 발급 OK). 시세 TR은 정규장에만 데이터를 줍니다. 평일 09:00~15:30에 다시 확인하세요 |
-| LS API가 `LS 서버에 접속하지 못했습니다` | **키 문제가 아닙니다.** LS는 8080 포트를 쓰는데 회사·학교 망이나 VPN이 이를 막는 경우가 많습니다. `curl -v --max-time 10 https://openapi.ls-sec.co.kr:8080/oauth2/token` 로 확인하고, VPN을 끄거나 다른 망(핫스팟)에서 시도하세요. 8080이 막히면 443으로도 자동 재시도합니다 |
+| LS API가 `LS 서버에 접속하지 못했습니다` | **키 문제가 아닙니다.** 443·8080 양쪽 모두 닿지 않은 상태입니다. `curl -v --max-time 10 https://openapi.ls-sec.co.kr/oauth2/token` 로 확인하세요 |
 | LS API가 `OAuth 토큰 발급 거절` | 이때가 진짜 키 문제입니다. LS 홈에서 **"Open API"**로 사용등록했는지 확인하세요(모의투자 Open API 키는 서버가 달라 실전 URL에서 거절됩니다) |
 | 키를 고쳤는데도 계속 실패 | 해결됐습니다. 실패한 토큰을 더 이상 캐시하지 않으므로 재시작 없이 재시도됩니다 |
 | 연결 상태 테스트 결과와 실제 수집이 다름 | 진단은 화면이 쓰는 경로를 그대로 호출합니다(Daum=`investor_purchase` API, Naver=렌더링). 그래도 어긋나면 진단 함수가 다른 경로를 보고 있다는 뜻이니 알려주세요 |

@@ -834,9 +834,11 @@ def test_ls_network_failure_is_not_blamed_on_the_keys(monkeypatch):
     assert "8080" in msg
 
 
-def test_ls_token_tries_the_alternate_port_when_8080_is_blocked(monkeypatch):
+def test_ls_token_prefers_443_and_falls_back_to_8080(monkeypatch):
     """
-    8080이 막힌 망이 흔하므로 443으로도 시도해야 합니다.
+    LS 서버는 8080을 더 이상 열어두지 않습니다(사용자 curl로 확인:
+    31ms 즉시 Connection refused). 443이 먼저여야 하고, 옛 환경을 위해
+    8080은 보조로 남깁니다.
     """
     import services.ls_service as ls
 
@@ -858,8 +860,6 @@ def test_ls_token_tries_the_alternate_port_when_8080_is_blocked(monkeypatch):
 
     def fake_post(url, **kw):
         tried.append(url)
-        if ":8080" in url:
-            raise ConnectionError("8080 blocked")
         return _Resp()
 
     monkeypatch.setattr(ls.requests, "post", fake_post)
@@ -867,10 +867,26 @@ def test_ls_token_tries_the_alternate_port_when_8080_is_blocked(monkeypatch):
     token, reason, kind = ls.request_ls_token()
 
     assert token == "tok-from-443", (reason, kind)
-    assert any(":8080" in u for u in tried), "8080을 먼저 시도해야 합니다"
-    assert len(tried) == 2, tried
+    # 443이 첫 시도여야 합니다 (8080은 서버가 거부합니다).
+    assert tried[0] == "https://openapi.ls-sec.co.kr/oauth2/token", tried
+    assert len(tried) == 1, "443이 성공했는데 8080까지 부르면 안 됩니다"
     # 이후 TR 호출이 같은 주소를 쓰도록 확정돼야 합니다.
     assert ls._resolved_base_url == "https://openapi.ls-sec.co.kr"
+
+    # 443이 죽으면 8080으로 넘어가야 합니다 (옛 환경 호환).
+    ls._resolved_base_url = ""
+    tried.clear()
+
+    def only_8080(url, **kw):
+        tried.append(url)
+        if ":8080" not in url:
+            raise ConnectionError("443 down")
+        return _Resp()
+
+    monkeypatch.setattr(ls.requests, "post", only_8080)
+    token2, _, _ = ls.request_ls_token()
+    assert token2 == "tok-from-443"
+    assert len(tried) == 2 and ":8080" in tried[1], tried
 
 
 def test_ls_reports_network_kind_when_every_address_fails(monkeypatch):
@@ -933,3 +949,51 @@ def test_ls_tr_call_uses_the_address_that_worked(monkeypatch):
 
     assert seen["url"].startswith("https://openapi.ls-sec.co.kr/"), seen
     assert ":8080" not in seen["url"]
+
+
+def test_ls_http_error_is_not_excused_as_market_hours(monkeypatch):
+    """
+    [회귀] 사용자 화면:
+
+        인증 성공 ... 조회 데이터는 비어 있습니다 — t1452: HTTP 404 /
+        t1664: 해당자료가 없습니다.
+        현재 장 시간이 아니라 ... 정상입니다.
+
+    t1664의 "해당자료가 없습니다"는 장 시간 문제가 맞지만, t1452의
+    **HTTP 404는 경로가 존재하지 않는다**는 뜻이라 장 시간과 무관합니다.
+    둘을 뭉뚱그리면 진짜 고쳐야 할 것을 놓칩니다.
+    """
+    import datetime as dt
+    import services.radar_service as rs
+    import services.ls_service as ls
+
+    monkeypatch.setattr(ls, "get_secret", lambda *a, **kw: "dummy")
+    monkeypatch.setattr(ls, "request_ls_token", lambda: ("tok", "", ""))
+
+    def fake_call(tr_cd, tr_url, body_params):
+        return {"rsp_msg": "HTTP 404"} if tr_cd == "t1452" else {
+            "rsp_msg": "해당자료가 없습니다."
+        }
+
+    monkeypatch.setattr(rs, "call_ls_api", fake_call)
+
+    class _Sun(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return dt.datetime(2026, 9, 13, 23, 0, tzinfo=tz)
+
+    monkeypatch.setattr(rs, "datetime", _Sun)
+
+    ok, msg = rs.test_ls_connection()
+
+    assert ok is True, "인증은 성공했으므로 연결은 성공입니다"
+    assert "경로/권한 문제" in msg, "HTTP 404를 장 시간 탓으로 돌렸습니다"
+    assert "t1452" in msg and "404" in msg
+
+
+def test_ls_probe_order_puts_the_working_tr_first():
+    """404가 확정된 TR을 먼저 부르면 매번 헛된 왕복이 생깁니다."""
+    from services.radar_service import LS_PROBE_TRS
+
+    assert LS_PROBE_TRS[0][0] == "t1664", LS_PROBE_TRS
+    assert LS_PROBE_TRS[0][1] == "/stock/investor"

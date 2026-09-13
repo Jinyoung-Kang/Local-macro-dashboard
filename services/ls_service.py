@@ -46,14 +46,21 @@ def get_secret(key_path: str, default: str = "") -> str:
 LS_APP_KEY = get_secret("ls.app_key", get_secret("LS_APP_KEY", get_secret("ls_app_key", "")))
 LS_APP_SECRET = get_secret("ls.app_secret", get_secret("LS_APP_SECRET", get_secret("ls_app_secret", "")))
 
-# LS OPEN API는 문서상 8080 포트를 씁니다. 다만 회사·학교·일부 ISP 망이나
-# VPN 환경에서는 **8080 아웃바운드가 막혀** 연결 자체가 안 되는 경우가
-# 흔합니다(키와 무관하게 ConnectionError). 그래서 8080을 먼저 시도하고,
-# 닿지 않으면 표준 443으로 한 번 더 시도합니다.
+# LS OPEN API 주소.
+#
+# 문서에는 오랫동안 8080 포트가 적혀 있었지만, 실제 확인 결과 **서버가 8080을
+# 더 이상 열어두지 않습니다.**
+#
+#   $ curl -v https://openapi.ls-sec.co.kr:8080/oauth2/token
+#   connect to 61.106.5.137 port 8080 ... failed: Connection refused  (31ms)
+#
+# 31ms 즉시 refused는 방화벽 드롭(타임아웃)이 아니라 서버가 그 포트를 닫아
+# 둔 것입니다. 표준 443에서는 토큰이 정상 발급됩니다. 그래서 443을 먼저
+# 시도하고, 옛 환경을 위해 8080을 보조로 남깁니다.
 #
 # secrets.toml에 `[ls] base_url = "..."` 을 넣으면 그 값만 씁니다.
-LS_BASE_URL = "https://openapi.ls-sec.co.kr:8080"
-LS_ALT_BASE_URLS = ("https://openapi.ls-sec.co.kr",)
+LS_BASE_URL = "https://openapi.ls-sec.co.kr"
+LS_ALT_BASE_URLS = ("https://openapi.ls-sec.co.kr:8080",)
 
 # 실제로 연결에 성공한 주소. 토큰 발급 때 확정해 TR 호출이 같은 주소를
 # 쓰도록 합니다(포트가 갈리면 토큰이 통하지 않습니다).
