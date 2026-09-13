@@ -9,3 +9,9 @@ __pycache__/
 *.log
 .idea/
 .vscode/
+
+# 로컬 수집 데이터 (SQLite + 로그). 커밋하지 않습니다.
+data/
+*.db
+*.db-wal
+*.db-shm

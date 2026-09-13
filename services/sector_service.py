@@ -10,6 +10,8 @@ import yfinance as yf
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from services import datasets, store
+
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
@@ -42,23 +44,154 @@ ROTATION_ASSET_CLASSES = {
 }
 
 
+def collect_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
+    """
+    여러 ETF의 일봉 시계열을 한 번에 수집해 {티커: DataFrame} 으로 반환합니다.
+
+    [성능] 기존 구현은 티커마다 yf.Ticker(t).history()를 따로 호출해
+    20개 티커면 HTTP 왕복이 20번 발생했습니다(스레드로 감췄을 뿐,
+    Yahoo 레이트리밋에도 그만큼 더 노출됩니다). yf.download()는 여러
+    심볼을 한 요청으로 묶어 받으므로 왕복이 사실상 1회로 줄어듭니다.
+
+    배치 요청이 실패하면 기존처럼 티커별 개별 수집으로 폴백해
+    "일부 티커만 실패" 상황에서도 화면이 비지 않게 합니다.
+    """
+    symbols = [t for t in dict.fromkeys(tickers) if t]
+    if not symbols:
+        return {}
+
+    results: dict[str, pd.DataFrame] = {}
+
+    try:
+        raw = yf.download(
+            tickers=" ".join(symbols),
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            actions=False,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+    except Exception as e:
+        logger.warning(f"ETF 배치 수집 실패, 개별 수집으로 폴백합니다: {e}")
+        raw = None
+
+    if raw is not None and not raw.empty:
+        for ticker in symbols:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    if ticker not in raw.columns.get_level_values(0):
+                        continue
+                    df = raw[ticker].dropna(how="all")
+                else:
+                    # 심볼이 1개면 yfinance가 단일 레벨 컬럼을 반환합니다.
+                    df = raw.dropna(how="all")
+
+                if not df.empty and "Close" in df.columns:
+                    results[ticker] = df
+            except Exception as e:
+                logger.warning(f"ETF 배치 결과 분해 실패 ({ticker}): {e}")
+
+    # 배치에서 빠진 티커만 개별로 재시도합니다.
+    missing = [t for t in symbols if t not in results]
+    if missing:
+        logger.info(f"ETF 개별 재시도: {missing}")
+        with ThreadPoolExecutor(max_workers=min(len(missing), 8)) as executor:
+            future_to_ticker = {
+                executor.submit(_fetch_single_history, t, period): t
+                for t in missing
+            }
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    results[ticker] = future.result()
+                except Exception as e:
+                    logger.warning(f"ETF 수집 실패 ({ticker}): {e}")
+                    results[ticker] = pd.DataFrame()
+
+    return results
+
+
+def _fetch_single_history(ticker: str, period: str) -> pd.DataFrame:
+    """배치 수집에서 누락된 개별 티커 폴백 수집."""
+    df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+    return df if df is not None else pd.DataFrame()
+
+
+# ==============================================================================
+# 0-1. 저장본 우선 읽기 경로
+# ==============================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_etf_history_map(tickers: tuple, period: str = "2y") -> dict:
-    results = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_ticker = {
-            executor.submit(yf.Ticker(t).history, period=period): t
-            for t in tickers
-        }
-        for future in as_completed(future_to_ticker):
-            ticker = future_to_ticker[future]
-            try:
-                df = future.result()
-                results[ticker] = df
-            except Exception as e:
-                logger.warning(f"ETF 수집 실패 ({ticker}): {e}")
-                results[ticker] = pd.DataFrame()
-    return results
+    """
+    화면용 진입점. 수집기가 적재해 둔 종가 스냅샷을 먼저 씁니다.
+
+    수집기는 섹터·자산군 전체 티커의 2년 종가를 한 번에 받아 저장하므로,
+    화면은 필요한 티커만 잘라 쓰면 됩니다. 저장본에 없는 티커가 있으면
+    그 티커만 직접 수집합니다.
+    """
+    symbols = [t for t in dict.fromkeys(tickers) if t]
+    if not symbols:
+        return {}
+
+    mode = store.get_read_mode()
+    if mode == store.READ_MODE_LIVE_ONLY:
+        return collect_etf_history_map(tuple(symbols), period=period)
+
+    stored = _read_stored_etf_history(symbols)
+    missing = [t for t in symbols if t not in stored]
+
+    if not missing:
+        return stored
+
+    if mode == store.READ_MODE_STORE_ONLY:
+        if stored:
+            logger.info("store_only: 저장본에 없는 티커는 건너뜁니다: %s", missing)
+        return stored
+
+    logger.info("저장본에 없는 티커를 직접 수집합니다: %s", missing)
+    fetched = collect_etf_history_map(tuple(missing), period=period)
+    stored.update({
+        t: df for t, df in (fetched or {}).items()
+        if df is not None and not df.empty
+    })
+    return stored
+
+
+def _read_stored_etf_history(symbols: list[str]) -> dict:
+    """
+    수집기가 저장한 종가 스냅샷에서 요청 티커만 DataFrame으로 복원합니다.
+
+    저장 형식(collector._task_sector_history):
+        {티커: {"dates": ["YYYY-MM-DD", ...], "close": [float|None, ...]}}
+    """
+    snap = store.read_snapshot(datasets.SNAP_SECTOR_HISTORY)
+    if snap is None or not isinstance(snap.payload, dict):
+        return {}
+
+    if not snap.is_fresh(datasets.MAX_AGE_DAILY):
+        logger.info(
+            "섹터 종가 저장본이 오래됐습니다 (수집 시각 %s)",
+            snap.collected_at_kst_str(),
+        )
+
+    out: dict[str, pd.DataFrame] = {}
+    for ticker in symbols:
+        entry = snap.payload.get(ticker)
+        if not isinstance(entry, dict):
+            continue
+        dates = entry.get("dates") or []
+        closes = entry.get("close") or []
+        if not dates or len(dates) != len(closes):
+            continue
+        df = pd.DataFrame(
+            {"Close": pd.to_numeric(pd.Series(closes), errors="coerce").values},
+            index=pd.to_datetime(dates, errors="coerce"),
+        ).dropna()
+        if not df.empty:
+            out[ticker] = df
+    return out
 
 
 # ==============================================================================
@@ -115,13 +248,22 @@ def calculate_returns_matrix(
         current_price = float(close.iloc[-1])
 
         def calc_return(days: int) -> float:
+            """
+            days 거래일 전 대비 수익률(%).
+
+            [버그 수정] 기존에는 표본이 부족하거나 과거 가격이 0이면 0.0을
+            반환했습니다. 화면에서는 "0.00%"가 '데이터 없음'이 아니라
+            '보합'으로 읽히므로, 신규 상장 ETF의 1Y 수익률이 실제로 보합인
+            것처럼 표시되고 순위 계산에도 섞여 들어갔습니다.
+            데이터가 없으면 NaN을 반환해 구분합니다.
+            """
             if len(close) <= days:
-                return 0.0
+                return float("nan")
 
             old_price = float(close.iloc[-(days + 1)])
 
             if old_price == 0:
-                return 0.0
+                return float("nan")
 
             return (current_price / old_price - 1) * 100
 
@@ -129,18 +271,19 @@ def calculate_returns_matrix(
             ytd_series = close[close.index.year == current_year]
 
             if ytd_series.empty:
-                ytd_return = 0.0
+                ytd_return = float("nan")
             else:
                 ytd_price = float(ytd_series.iloc[0])
 
                 ytd_return = (
                     (current_price / ytd_price - 1) * 100
                     if ytd_price != 0
-                    else 0.0
+                    else float("nan")
                 )
 
-        except Exception:
-            ytd_return = 0.0
+        except Exception as e:
+            logger.warning(f"YTD 수익률 계산 실패 ({ticker}): {e}")
+            ytd_return = float("nan")
 
         records.append({
             "ticker": ticker,

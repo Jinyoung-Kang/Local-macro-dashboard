@@ -6,12 +6,18 @@ services/radar_service.py
 
 """
 import logging
+from importlib import metadata
 import re
 from datetime import datetime, time, timedelta
+from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+
+# 공용 커넥션 풀 세션을 사용해 요청마다 TCP/TLS 핸드셰이크를
+# 반복하지 않습니다 (services/http_client.py).
+from services.http_client import get_session
 import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
@@ -19,6 +25,7 @@ import numpy as np
 
 from services.ls_service import call_ls_api
 from services.kis_service import call_kis_api
+from services import datasets, store
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -37,43 +44,9 @@ COMMON_HEADERS = {
     ),
 }
 
-from playwright.sync_api import sync_playwright
-
-
-def _fetch_rendered_html(
-    url: str,
-    wait_selector: str = "table",
-    timeout_ms: int = 10000,
-    wait_state: str = "attached",
-) -> str:
-    """
-    JS로 렌더링되는 페이지(Naver/Daum 신규 UI)를 헤드리스 브라우저로
-    실제 렌더링한 뒤 최종 HTML을 반환합니다.
-
-    주의: 일반 requests.get()으로는 React/Next.js가 그리는 표를
-    가져올 수 없어서 이 방식이 필요합니다.
-
-    wait_state="attached"를 기본값으로 사용합니다. Naver의 일부 표는
-    CSS로 숨겨져 있거나(display:none) 크기가 0이어서 "visible" 상태를
-    영원히 만족하지 못할 수 있지만, HTML 자체에는 데이터가 완성되어
-    있으므로 DOM에 존재하기만 하면 충분합니다.
-    """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent=COMMON_HEADERS["User-Agent"]
-        )
-        try:
-            page.goto(url, timeout=timeout_ms, wait_until="networkidle")
-            page.wait_for_selector(
-                wait_selector,
-                timeout=timeout_ms,
-                state=wait_state,
-            )
-            html = page.content()
-        finally:
-            browser.close()
-        return html
+# 렌더링 수집은 services/browser_pool.py의 공용 Chromium을 재사용합니다.
+# (기존에는 호출마다 Chromium을 새로 띄워 매번 콜드 스타트 비용을 냈습니다.)
+from services.browser_pool import fetch_rendered_html as _fetch_rendered_html
 
 # ==============================================================================
 # KIS FHPTJ04400000 투자자별 실제 필드 매핑
@@ -204,61 +177,208 @@ def test_kis_connection():
     )
 
 
-def test_ls_connection():
-    body_params_1452 = {
-        "t1452InBlock": {
-            "gubun": "1",
-            "jnilgubun": "1",
-            "paygubun": "2",
-            "ordergubun": "1",
-            "cnt": 30,
-        }
-    }
-
-    try:
-        res = call_ls_api(tr_cd="t1452", tr_url="/stock/market-sum", body_params=body_params_1452)
-        if res and "t1452OutBlock1" in res and len(res["t1452OutBlock1"]) > 0:
-            count = len(res["t1452OutBlock1"])
-            return True, f"정상 통신 성공 (t1452 상위 종목 수: {count}개)"
-    except Exception:
-        pass
-
-    body_params_1664 = {
+# LS 조회에 쓰는 TR 정의 (진단과 수집이 같은 목록을 봅니다).
+#
+# t1664 `/stock/investor`는 정상 응답합니다.
+# t1452 `/stock/market-sum`은 현재 **HTTP 404** — 그 경로가 존재하지 않습니다.
+# 404가 확인됐지만 LS가 되살릴 수도 있으므로 지우지 않고 뒤로 미룹니다.
+LS_PROBE_TRS = (
+    ("t1664", "/stock/investor", {
         "t1664InBlock": {
-            "gubun1": "1", "gubun2": "1", "gubun3": "1", "cnt": 30
+            "gubun1": "1", "gubun2": "1", "gubun3": "1", "cnt": 30,
         }
-    }
+    }),
+    ("t1452", "/stock/market-sum", {
+        "t1452InBlock": {
+            "gubun": "1", "jnilgubun": "1", "paygubun": "2",
+            "ordergubun": "1", "cnt": 30,
+        }
+    }),
+)
 
-    try:
-        res = call_ls_api(tr_cd="t1664", tr_url="/stock/investor", body_params=body_params_1664)
-        if res and "t1664OutBlock1" in res and len(res["t1664OutBlock1"]) > 0:
-            count = len(res["t1664OutBlock1"])
-            return True, f"정상 통신 성공 (t1664 상위 종목 수: {count}개)"
-        elif res:
-            return False, f"LS 서버 응답: {res.get('rsp_msg', str(res))}"
-        return False, "LS 서버 응답 없음"
-    except Exception as e:
-        return False, f"예외 발생: {str(e)}"
+
+def test_ls_connection():
+    """
+    LS증권 OPEN API 연결 점검 — **단계를 나눠** 보고합니다.
+
+    [버그 수정] 예전에는 어떤 이유로 실패하든 화면이
+    "LS 계좌 미연결 또는 미사용"이라고 적었습니다. 그런데 사용자가 실제로
+    받은 응답은 `해당자료가 없습니다`였습니다. 이건 LS 서버가 TR에 **정상
+    응답한 내용**입니다. 즉 앱키/시크릿은 유효했고 토큰도 발급됐는데,
+    화면은 "키가 등록 안 됐다"는 뜻으로 읽히는 문구를 보여 줬습니다.
+
+    무엇이 실제로 막혔는지 알 수 있도록 이렇게 나눕니다.
+        1. 키가 secrets.toml에 있는가
+        2. OAuth 토큰이 발급되는가  ← 앱키/시크릿 유효성의 진짜 판정
+        3. TR이 데이터를 주는가      ← 장 시간·상품 권한의 문제
+
+    2단계까지 통과하면 **연결은 성공**입니다. 3단계에서 데이터가 비는 것은
+    주말·장 마감 시간대에는 정상입니다.
+    """
+    from services import ls_service as ls_mod
+    from services.ls_service import get_secret as ls_secret, request_ls_token
+
+    # --- 1단계: 키 존재 ---
+    app_key = ls_secret("ls.app_key", ls_secret("LS_APP_KEY", ""))
+    app_secret = ls_secret("ls.app_secret", ls_secret("LS_APP_SECRET", ""))
+    if not app_key or not app_secret:
+        return False, (
+            "secrets.toml에 `[ls] app_key` / `app_secret`이 없습니다. "
+            "LS를 쓰지 않는다면 무시해도 됩니다."
+        )
+
+    # --- 2단계: 토큰 발급 ---
+    # 실패해도 원인이 전혀 다릅니다. 망에서 서버에 닿지 못한 것과 키가
+    # 거절된 것을 섞으면, 멀쩡한 키를 계속 의심하게 됩니다(사용자 신고).
+    token, token_error, fail_kind = request_ls_token()
+
+    if not token and fail_kind == ls_mod.FAIL_NETWORK:
+        return False, (
+            "**LS 서버에 접속하지 못했습니다. 키 문제가 아닙니다.**\n\n"
+            f"{token_error}\n\n"
+            "LS OPEN API는 8080 포트를 쓰는데, 회사·학교 망이나 VPN에서 "
+            "8080 아웃바운드가 막혀 있으면 이렇게 됩니다. 443으로도 시도했지만 "
+            "역시 닿지 않았습니다.\n\n"
+            "터미널에서 확인해 보세요:\n"
+            "`curl -v --max-time 10 https://openapi.ls-sec.co.kr:8080/oauth2/token`\n\n"
+            "VPN을 끄거나 다른 네트워크(휴대폰 핫스팟)에서 다시 시도해 보시고, "
+            "포트가 바뀐 것이 확인되면 secrets.toml에 "
+            "`[ls] base_url = \"https://...\"` 로 지정할 수 있습니다."
+        )
+
+    if not token:
+        return False, (
+            f"OAuth 토큰 발급 거절 — 앱키/시크릿이 유효하지 않거나 "
+            f"OPEN API 사용등록이 안 된 상태입니다.\n\n{token_error}"
+        )
+
+    # --- 3단계: TR 조회 ---
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    is_regular_session = (
+        now_kst.weekday() < 5
+        and dtime(9, 0) <= now_kst.time() < dtime(15, 30)
+    )
+
+    # 동작이 확인된 TR을 먼저 시도합니다. t1452(/stock/market-sum)는 현재
+    # HTTP 404입니다 — 그 경로는 LS에 존재하지 않습니다(사용자 진단으로 확인).
+    messages = []
+    broken_endpoints = []
+
+    for tr_cd, tr_url, body in LS_PROBE_TRS:
+        try:
+            res = call_ls_api(tr_cd=tr_cd, tr_url=tr_url, body_params=body)
+        except Exception as e:                               # noqa: BLE001
+            messages.append(f"{tr_cd}: 예외 {type(e).__name__}")
+            continue
+
+        if not res:
+            messages.append(f"{tr_cd}: 응답 없음")
+            continue
+
+        block = res.get(f"{tr_cd}OutBlock1")
+        if isinstance(block, list) and block:
+            return True, (
+                f"정상 통신 성공 (토큰 발급 OK · {tr_cd} 조회 종목 수: "
+                f"{len(block)}개)"
+            )
+
+        reason = str(res.get("rsp_msg", "데이터 없음"))
+
+        # HTTP 4xx/5xx는 "데이터가 없다"와 전혀 다릅니다. 경로·권한 문제이며
+        # 장 시간과 무관합니다. 이걸 "장 시간이 아니라 정상"이라고 뭉뚱그리면
+        # 진짜 고쳐야 할 것을 놓칩니다.
+        if reason.startswith("HTTP "):
+            broken_endpoints.append(f"{tr_cd} {tr_url} → {reason}")
+
+        messages.append(f"{tr_cd}: {reason}")
+
+    detail = " / ".join(messages) if messages else "데이터 없음"
+
+    # 토큰이 나왔다는 것은 인증이 된다는 뜻입니다. 이것을 "미연결"이라고
+    # 말하면 사용자가 키를 계속 의심하게 됩니다.
+    if is_regular_session:
+        return False, (
+            f"인증은 성공했습니다(토큰 발급 OK). 다만 TR이 데이터를 주지 "
+            f"않습니다 — {detail}\n\n"
+            f"지금은 정규장인데도 비어 있으므로, 해당 TR의 사용 권한이나 "
+            f"입력값을 확인해야 합니다."
+        )
+
+    msg = (
+        f"인증 성공 (토큰 발급 OK). 조회 데이터는 비어 있습니다 — {detail}\n\n"
+        f"현재 장 시간이 아니라 시세 TR이 빈 값을 주는 것은 정상입니다. "
+        f"정규장(평일 09:00~15:30)에 다시 확인하세요."
+    )
+    if broken_endpoints:
+        msg += (
+            "\n\n⚠️ 다만 아래는 장 시간과 무관한 **경로/권한 문제**입니다:\n"
+            + "\n".join(f"- {b}" for b in broken_endpoints)
+        )
+    return True, msg
 
 
 def test_pykrx_connection():
+    """
+    PyKrx 연결 점검.
+
+    [개선] 예전에는 실패했을 때 "최근 7일 내 유효한 KOSPI 종목 리스트를
+    가져오지 못했습니다"만 말해서, 무엇을 해야 할지 알 수 없었습니다.
+    PyKrx는 KRX 웹 엔드포인트를 **비공식으로** 긁는 라이브러리라
+    KRX가 응답 형식을 바꾸면 예외 없이 빈 리스트만 돌려주기 시작합니다.
+    그 경우와 진짜 통신 오류를 구분해서 알려 줍니다.
+
+    PyKrx는 수급 레이더의 **마지막 폴백**이며, 여기서 실패해도 KIS/Daum/
+    Naver가 살아 있으면 당일 조회는 정상입니다. 다만 Naver·Daum은 과거
+    날짜 조회를 지원하지 않아, **기준일을 과거로 바꾸면 PyKrx만 남습니다.**
+    """
     if not PYKRX_AVAILABLE:
         return False, "pykrx 패키지가 설치되지 않았습니다 (requirements.txt 확인 필요)."
 
     try:
-        now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
-        check_date = now_kst
+        version = metadata.version("pykrx")
+    except Exception:
+        version = "알 수 없음"
 
-        for _ in range(7):
-            date_str = check_date.strftime("%Y%m%d")
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    check_date = now_kst
+    empty_days = []
+    last_error = None
+
+    for _ in range(7):
+        date_str = check_date.strftime("%Y%m%d")
+        try:
             tickers = stock.get_market_ticker_list(date_str, market="KOSPI")
-            if tickers and len(tickers) > 0:
-                return True, f"정상 통신 성공 (기준일 {date_str}, KOSPI 종목 수: {len(tickers)}개)"
-            check_date -= timedelta(days=1)
+        except Exception as e:                       # noqa: BLE001
+            last_error = f"{type(e).__name__}: {str(e)[:120]}"
+            tickers = None
+        else:
+            if tickers:
+                return True, (
+                    f"정상 통신 성공 (기준일 {date_str}, "
+                    f"KOSPI 종목 수: {len(tickers)}개, pykrx {version})"
+                )
+            empty_days.append(date_str)
+        check_date -= timedelta(days=1)
 
-        return False, "최근 7일 내 유효한 KOSPI 종목 리스트를 가져오지 못했습니다."
-    except Exception as e:
-        return False, f"예외 발생: {str(e)}"
+    if last_error:
+        return False, (
+            f"KRX 서버 통신에 실패했습니다 (pykrx {version}). "
+            f"마지막 오류: {last_error} — 네트워크·방화벽을 먼저 확인하세요."
+        )
+
+    return False, (
+        f"KRX가 JSON이 아닌 응답(차단 페이지 등)을 돌려주고 있습니다 "
+        f"(pykrx {version}). 로그에 'Expecting value: line 1 column 1'이 "
+        f"보이면 같은 증상입니다. PyKrx는 KRX 웹을 비공식으로 긁는 "
+        f"라이브러리라 KRX가 응답 형식·차단 정책을 바꾸면 이렇게 조용히 "
+        f"빈 값만 돌려줍니다. **버전 업그레이드로는 해결되지 않습니다** "
+        f"(1.2.8이 최신). 라이브러리가 KRX 변경을 따라잡을 때까지 기다려야 "
+        f"합니다.\n\n"
+        f"영향 범위: 당일 조회는 KIS/Daum/Naver로 정상 동작합니다. "
+        f"과거 날짜 조회만 영향을 받으며, 수집기가 쌓아 온 누적 이력이 "
+        f"있으면 그것으로 대체됩니다 "
+        f"(🗄️ 데이터 저장소 상태 → 누적 수급 이력)."
+    )
 
 
 def test_naver_scraping():
@@ -313,36 +433,54 @@ def test_naver_scraping():
 
 def test_daum_scraping():
     """
-    Daum 금융 외국인/기관 매매종목 페이지를 헤드리스 브라우저로 렌더링하여
-    실제 표가 정상적으로 생성되는지 점검합니다.
+    Daum 금융 투자자별 매매종목 연결 점검.
+
+    [버그 수정] 예전에는 finance.daum.net/domestic/influential_investors
+    **페이지를 헤드리스 브라우저로 렌더링**해 표를 찾았습니다. 그런데 화면이
+    실제로 쓰는 Daum 경로는 그 페이지가 아니라 내부 JSON API
+    (finance.daum.net/api/trend/investor_purchase/)입니다.
+
+    서로 다른 것을 재고 있었기 때문에, API가 멀쩡히 30종목을 돌려주는
+    상황에서도 카드가 "Daum 실패"로 빨갛게 떴습니다(사용자 신고). 진단은
+    화면이 실제로 쓰는 경로를 그대로 따라가야 의미가 있습니다. 그렇지 않으면
+    ⓐ 멀쩡한데 실패라고 하거나 ⓑ 망가졌는데 정상이라고 하게 됩니다.
+
+    그래서 화면과 **똑같은 함수**(fetch_daum_deal_ranking)를 호출합니다.
     """
-    url = "https://finance.daum.net/domestic/influential_investors"
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    last_error = None
 
-    try:
-        html = _fetch_rendered_html(url, wait_selector="table")
-        soup = BeautifulSoup(html, "html.parser")
+    # Daum API는 최근 거래일 데이터를 줍니다. 주말·휴장일을 감안해 거슬러 봅니다.
+    for back in range(7):
+        date_str = (now_kst - timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            df = fetch_daum_deal_ranking(
+                date_str, "KOSPI", "외국인", "순매수", 30,
+            )
+        except Exception as e:                               # noqa: BLE001
+            last_error = f"{type(e).__name__}: {str(e)[:120]}"
+            continue
 
-        target_table = None
-        for table in soup.find_all("table"):
-            if "순매수" in table.get_text() and "순매도" in table.get_text():
-                target_table = table
-                break
+        if df is not None and not df.empty:
+            data_date = ""
+            if "데이터_출처" in df.columns:
+                data_date = str(df.iloc[0]["데이터_출처"])
+            return True, (
+                f"정상 통신 성공 (investor_purchase API, 종목 수: {len(df)}개)"
+                + (f"\n\n{data_date}" if data_date else "")
+            )
 
-        if target_table is None:
-            return False, "렌더링 후에도 순매수/순매도 표를 찾지 못했습니다."
-
-        parsed = sum(
-            1 for row in target_table.find_all("tr")
-            if len(row.find_all("td")) >= 8
+    if last_error:
+        return False, (
+            f"investor_purchase API 호출에 실패했습니다. 마지막 오류: "
+            f"{last_error}"
         )
 
-        if parsed == 0:
-            return False, "표는 렌더링됐지만 파싱 가능한 종목 행이 없습니다 (휴장일 가능)."
-
-        return True, f"정상 통신 성공 (렌더링 방식, 파싱된 종목 수: {parsed}개)"
-
-    except Exception as e:
-        return False, f"헤드리스 브라우저 렌더링 실패: {e}"
+    return False, (
+        "investor_purchase API가 최근 7일 내내 빈 응답을 돌려줬습니다. "
+        "Daum이 API 경로나 파라미터를 바꿨을 수 있습니다 "
+        "(services/radar_service.py의 fetch_daum_deal_ranking 확인)."
+    )
 
 
 # ==============================================================================
@@ -504,55 +642,9 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
     mkt_code = "1" if "KOSPI" in market.upper() or "코스피" in market else "2"
     order_code = "1" if trade_type == "순매수" else "2"
 
-    body_params_1452 = {
-        "t1452InBlock": {
-            "gubun": mkt_code,
-            "jnilgubun": "1",
-            "paygubun": "2",
-            "ordergubun": order_code,
-            "cnt": top_n,
-        }
-    }
-
-    try:
-        res = call_ls_api(tr_cd="t1452", tr_url="/stock/market-sum", body_params=body_params_1452)
-        if res and "t1452OutBlock1" in res:
-            data_list = res["t1452OutBlock1"]
-            if data_list:
-                records = []
-                for idx, row in enumerate(data_list[:top_n], start=1):
-                    code = row.get("shcode", "")
-                    name = row.get("hname", "")
-                    price = float(row.get("price", 0))
-                    change_pct = float(row.get("diff", 0))
-
-                    val_key = "forval" if investor == "외국인" else "orgval"
-                    svalue = float(row.get(val_key, row.get("svalue", 0)))
-
-                    if svalue == 0:
-                        continue
-
-                    net_amt_eok = round(svalue / 100.0, 1) if abs(svalue) > 1000 else round(svalue, 1)
-
-                    if trade_type == "순매도" and net_amt_eok > 0:
-                        net_amt_eok = -net_amt_eok
-
-                    if name and code:
-                        records.append({
-                            "순위": idx,
-                            "종목코드": code,
-                            "종목명": name,
-                            "현재가": price,
-                            "등락률(%)": change_pct,
-                            "순매수대금(억)": net_amt_eok,
-                            "시가총액_가중": max(price * 1000, 500),
-                            "데이터_출처": f"LS 증권사 API ({target_date})"
-                        })
-                if records:
-                    return pd.DataFrame(records)
-    except Exception:
-        pass
-
+    # [순서 변경] 예전에는 t1452를 먼저 불렀는데, 그 경로
+    # (/stock/market-sum)는 현재 HTTP 404입니다. 매번 실패하는 호출을
+    # 먼저 내보내면 응답만 느려지므로, 정상 응답하는 t1664를 앞에 둡니다.
     inv_map = {"외국인": "1", "기관": "2", "개인": "3", "투신": "4", "연기금": "7", "금융투자": "5"}
     gubun2 = inv_map.get(investor, "1")
     body_params_1664 = {
@@ -571,8 +663,8 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
             if data_list:
                 records = []
                 for idx, row in enumerate(data_list[:top_n], start=1):
-                    code = row.get("shcode", "")
-                    name = row.get("hname", "")
+                    code = str(row.get("shcode", "")).strip().zfill(6)
+                    name = str(row.get("hname", "")).strip()
                     price = float(row.get("price", 0))
                     change_pct = float(row.get("diff", 0))
 
@@ -599,12 +691,73 @@ def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_ty
                             "등락률(%)": change_pct,
                             "순매수대금(억)": net_amt_eok,
                             "시가총액_가중": max(price * 1000, 500),
-                            "데이터_출처": f"LS 증권사 API ({target_date})"
+                            "수집시각": datetime.now(
+                                ZoneInfo("Asia/Seoul")
+                            ).strftime("%Y-%m-%d %H:%M:%S KST"),
+                            "데이터_출처": f"LS 증권사 API ({target_date})",
                         })
                 if records:
                     return pd.DataFrame(records)
     except Exception as e:
-        logger.warning(f"LS API 호출 실패: {e}")
+        logger.warning("LS t1664 호출 실패: %s", e)
+
+    # t1664가 비면 t1452로 한 번 더 시도합니다(현재 404이지만 LS가 되살릴
+    # 수 있으므로 남겨 둡니다).
+    body_params_1452 = {
+        "t1452InBlock": {
+            "gubun": mkt_code,
+            "jnilgubun": "1",
+            "paygubun": "2",
+            "ordergubun": order_code,
+            "cnt": top_n,
+        }
+    }
+
+    try:
+        res = call_ls_api(tr_cd="t1452", tr_url="/stock/market-sum", body_params=body_params_1452)
+        if res and "t1452OutBlock1" in res:
+            data_list = res["t1452OutBlock1"]
+            if data_list:
+                records = []
+                for idx, row in enumerate(data_list[:top_n], start=1):
+                    # [버그 수정] 앞자리 0이 있는 종목코드(069500 등)를 그대로
+                    # 두면 이후 단계에서 정수로 해석돼 69500으로 깨집니다.
+                    # KIS 경로는 zfill(6)을 쓰는데 LS 경로만 빠져 있었습니다.
+                    code = str(row.get("shcode", "")).strip().zfill(6)
+                    name = str(row.get("hname", "")).strip()
+                    price = float(row.get("price", 0))
+                    change_pct = float(row.get("diff", 0))
+
+                    val_key = "forval" if investor == "외국인" else "orgval"
+                    svalue = float(row.get(val_key, row.get("svalue", 0)))
+
+                    if svalue == 0:
+                        continue
+
+                    net_amt_eok = round(svalue / 100.0, 1) if abs(svalue) > 1000 else round(svalue, 1)
+
+                    if trade_type == "순매도" and net_amt_eok > 0:
+                        net_amt_eok = -net_amt_eok
+
+                    if name and code:
+                        records.append({
+                            "순위": idx,
+                            "종목코드": code,
+                            "종목명": name,
+                            "현재가": price,
+                            "등락률(%)": change_pct,
+                            "순매수대금(억)": net_amt_eok,
+                            "시가총액_가중": max(price * 1000, 500),
+                            "수집시각": datetime.now(
+                                ZoneInfo("Asia/Seoul")
+                            ).strftime("%Y-%m-%d %H:%M:%S KST"),
+                            "데이터_출처": f"LS 증권사 API ({target_date})",
+                        })
+                if records:
+                    return pd.DataFrame(records)
+    except Exception as e:                                   # noqa: BLE001
+        # 조용히 넘기면 LS가 왜 안 되는지 영영 알 수 없습니다.
+        logger.warning("LS t1452 호출 실패: %s", e)
 
     return pd.DataFrame()
 
@@ -730,7 +883,7 @@ def fetch_daum_deal_ranking(
     }
 
     try:
-        response = requests.get(
+        response = get_session().get(
             url,
             headers=headers,
             params=params,
@@ -940,7 +1093,7 @@ def debug_daum_investor_purchase_response(interval_type: str = "TODAY") -> dict:
     }
 
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        resp = get_session().get(url, headers=headers, params=params, timeout=8)
         return {
             "status_code": resp.status_code,
             "body": resp.json() if resp.status_code == 200 else resp.text[:500],
@@ -1141,8 +1294,7 @@ def _get_latest_completed_session_str(now_kst: datetime) -> str:
     return d.strftime("%Y%m%d")
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_market_radar_scanner(
+def collect_market_radar_scanner(
     target_date_obj,
     market: str = "KOSPI",
     investor: str = "외국인",
@@ -1150,6 +1302,13 @@ def get_market_radar_scanner(
     top_n: int = 30,
     interval_type: str = "TODAY",
 ) -> pd.DataFrame:
+    """
+    수급 랭킹을 실제로 수집합니다
+    (KIS → Daum → Naver → LS → PyKrx → 누적 이력 폴백 체인).
+
+    화면은 get_market_radar_scanner()를 쓰세요. 이 함수는 항상 네트워크를
+    쓰며, 최악의 경우 7영업일을 거슬러 올라가며 여러 소스를 시도합니다.
+    """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     today_str = now_kst.strftime("%Y%m%d")
     current_time = now_kst.time()
@@ -1235,6 +1394,28 @@ def get_market_radar_scanner(
                 search_date_str,
             )
 
+        # LS증권 OPEN API.
+        #
+        # 이 함수는 오랫동안 정의만 되어 있고 **어디에서도 호출되지
+        # 않았습니다.** 그래서 LS 키를 아무리 정확히 넣어도 화면 데이터는
+        # 하나도 달라지지 않았습니다. 연결 진단만 LS를 찌르고 있었으니,
+        # 사용자 입장에서는 "연결도 안 되고 쓰이지도 않는" 상태였습니다.
+        #
+        # 이미 잘 동작하는 KIS/Daum/Naver 뒤에 둡니다. 그 셋 중 하나라도
+        # 성공하면 LS는 호출되지 않으므로 기존 동작을 해치지 않고,
+        # 셋이 모두 실패했을 때만 한 번 더 기회를 줍니다.
+        if can_use_intraday_sources:
+            df = fetch_ls_deal_ranking(
+                search_date_str, market, investor, trade_type, top_n,
+            )
+            if df is not None and not df.empty:
+                logger.info(
+                    "수급 레이더 성공: source=LS, date=%s, market=%s, "
+                    "investor=%s, trade_type=%s, rows=%s",
+                    search_date_str, market, investor, trade_type, len(df),
+                )
+                return df
+
         if PYKRX_AVAILABLE:
           df = fetch_pykrx_deal_ranking(
               search_date_str,
@@ -1265,13 +1446,211 @@ def get_market_radar_scanner(
 
         current_date_obj -= timedelta(days=1)
 
+    # ------------------------------------------------------------------
+    # 마지막 수단: 수집기가 쌓아 온 우리 자신의 누적 이력.
+    #
+    # Naver·Daum은 과거 날짜 조회를 지원하지 않아 과거 조회는 PyKrx 하나에
+    # 기대고 있었는데, PyKrx는 KRX 웹을 비공식으로 긁는 라이브러리라 KRX가
+    # 응답 형식을 바꾸면 통째로 죽습니다(실제로 그런 상태입니다).
+    #
+    # 다행히 수집기가 돌 때마다 그날의 랭킹을 observations에 적재해 왔습니다.
+    # 외부에서 다시 받을 수 없는 데이터를 우리가 이미 갖고 있으므로,
+    # 빈 화면을 보여주는 대신 그것을 씁니다.
+    # ------------------------------------------------------------------
+    history = _read_ranking_from_history(
+        target_date_obj, market, investor, trade_type, top_n,
+    )
+    if history is not None and not history.empty:
+        logger.info(
+            "수급 레이더: 외부 소스가 모두 실패해 누적 이력으로 대체합니다 "
+            "(date=%s, rows=%s)",
+            target_date_obj, len(history),
+        )
+        return history
+
     logger.error(
         "수급 스캐너 완전 실패: 시작일=%s, 시장=%s, 투자주체=%s, 방향=%s, 기간=%s "
-        "(PYKRX_AVAILABLE=%s)",
+        "(PYKRX_AVAILABLE=%s, 누적 이력에도 없음)",
         target_date_obj, market, investor, trade_type, interval_type,
         PYKRX_AVAILABLE,
     )
     return pd.DataFrame()
+
+
+def _read_ranking_from_history(
+    target_date_obj,
+    market: str,
+    investor: str,
+    trade_type: str,
+    top_n: int,
+):
+    """
+    누적 이력(observations)에서 해당 조건의 랭킹을 꺼냅니다.
+
+    요청한 날짜에 이력이 없으면 **그보다 앞선 가장 가까운 거래일**을 씁니다.
+    어느 날짜를 썼는지는 '데이터_출처'에 남겨 화면이 밝힐 수 있게 합니다.
+    """
+    try:
+        target_str = target_date_obj.strftime("%Y-%m-%d")
+        available = [d for d in list_radar_history_dates() if d <= target_str]
+        if not available:
+            return None
+
+        picked = max(available)
+        df = read_radar_history(
+            market=market,
+            investor=investor,
+            trade_type=trade_type,
+            start_date=picked,
+        )
+        if df is None or df.empty:
+            return None
+
+        if "obs_date" in df.columns:
+            df = df[df["obs_date"] == picked]
+        if df.empty:
+            return None
+
+        if "순매수대금(억)" in df.columns:
+            df = df.sort_values(
+                "순매수대금(억)", ascending=(trade_type == "순매도"),
+            )
+
+        df = df.head(top_n).copy()
+        df["데이터_출처"] = (
+            f"누적 이력 (수집기가 {picked}에 저장한 값 · 외부 소스 전부 실패)"
+        )
+        return df.reset_index(drop=True)
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("누적 이력 조회 실패: %s", e)
+        return None
+
+
+# ==============================================================================
+# 7-1. 저장본 우선 읽기 경로 + 날짜별 이력 누적
+# ==============================================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def get_market_radar_scanner(
+    target_date_obj,
+    market: str = "KOSPI",
+    investor: str = "외국인",
+    trade_type: str = "순매수",
+    top_n: int = 30,
+    interval_type: str = "TODAY",
+) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본 우선 + 날짜별 이력 누적.
+
+    이 화면이 저장 계층에서 가장 크게 이득을 봅니다.
+      - 수집 경로가 무거움: 최대 7영업일 × (Daum → Naver 렌더링 → PyKrx).
+        저장본이 있으면 이 전부를 건너뜁니다.
+      - **Naver/Daum은 과거 날짜 조회를 지원하지 않습니다.** 지금까지는 앱을
+        끄면 그날 수급이 사라졌지만, 이제 수집할 때마다 observations에
+        날짜별로 쌓이므로 이력을 직접 축적합니다.
+        (read_radar_history()로 조회)
+    """
+    snap_name = datasets.snap_radar_scanner(
+        market, investor, trade_type, interval_type,
+    )
+
+    def _collect():
+        df = collect_market_radar_scanner(
+            target_date_obj, market, investor, trade_type, top_n, interval_type,
+        )
+        if df is not None and not df.empty:
+            _accumulate_radar_history(
+                df, market, investor, trade_type, interval_type,
+            )
+        return df
+
+    df = store.cached_or_live(
+        snap_name,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_REALTIME,
+        as_frame=True,
+    )
+    return df if df is not None else pd.DataFrame()
+
+
+def _accumulate_radar_history(
+    df: pd.DataFrame,
+    market: str,
+    investor: str,
+    trade_type: str,
+    interval_type: str,
+) -> None:
+    """
+    수집된 랭킹을 "데이터 기준 거래일"로 observations에 누적합니다.
+
+    기준일은 수집 시각이 아니라 _get_latest_completed_session_str()이
+    계산한 거래일을 씁니다. Naver/Daum이 날짜 파라미터를 받지 않고
+    "가장 최근에 끝난 거래일"만 주기 때문에, 수집 시각으로 찍으면
+    토요일 새벽에 수집한 금요일 데이터가 토요일로 기록됩니다.
+    """
+    try:
+        session_str = _get_latest_completed_session_str(
+            datetime.now(ZoneInfo("Asia/Seoul"))
+        )
+        obs_date = (
+            f"{session_str[:4]}-{session_str[4:6]}-{session_str[6:8]}"
+        )
+
+        records = df.to_dict(orient="records")
+        for rec in records:
+            rec["시장"] = market
+            rec["투자주체"] = investor
+            rec["매매구분"] = trade_type
+            rec["기간구분"] = interval_type
+
+        # 같은 거래일에 조건별로 여러 건이 들어오므로, entity에 조건을
+        # 포함해야 서로 덮어쓰지 않습니다.
+        for rec in records:
+            rec["_entity"] = (
+                f"{market}|{investor}|{trade_type}|{interval_type}|"
+                f"{rec.get('종목코드', '?')}"
+            )
+
+        saved = store.put_observations(
+            datasets.OBS_RADAR, obs_date, records, entity_key="_entity",
+        )
+        logger.info(
+            "수급 레이더 이력 누적: date=%s, rows=%s (%s/%s/%s/%s)",
+            obs_date, saved, market, investor, trade_type, interval_type,
+        )
+    except Exception as e:
+        # 누적 실패가 화면을 막아서는 안 됩니다.
+        logger.warning("수급 레이더 이력 누적 실패: %s", e)
+
+
+def read_radar_history(
+    *,
+    market: str | None = None,
+    investor: str | None = None,
+    trade_type: str | None = None,
+    start_date: str | None = None,
+) -> pd.DataFrame:
+    """
+    누적된 수급 랭킹 이력을 조회합니다 (Naver/Daum이 제공하지 않는 과거 데이터).
+
+    start_date는 'YYYY-MM-DD' 형식입니다.
+    """
+    df = store.read_observations(datasets.OBS_RADAR, start_date=start_date)
+    if df.empty:
+        return df
+
+    if market and "시장" in df.columns:
+        df = df[df["시장"] == market]
+    if investor and "투자주체" in df.columns:
+        df = df[df["투자주체"] == investor]
+    if trade_type and "매매구분" in df.columns:
+        df = df[df["매매구분"] == trade_type]
+
+    return df.drop(columns=[c for c in ["_entity"] if c in df.columns])
+
+
+def list_radar_history_dates() -> list[str]:
+    """이력이 쌓인 거래일 목록."""
+    return store.list_observation_dates(datasets.OBS_RADAR)
 
 
 # ==============================================================================
@@ -1294,7 +1673,7 @@ def fetch_daum_investor_daily_history(stock_code: str, start_date_obj, end_date_
     url = f"https://finance.daum.net/quotes/A{ticker_code}"
 
     try:
-        res = requests.get(url, headers=headers, timeout=8)
+        res = get_session().get(url, headers=headers, timeout=8)
         if res.status_code != 200:
             logger.warning(f"Daum 종목 페이지 실패 (종목={stock_code}): HTTP {res.status_code}")
             return pd.DataFrame()
@@ -1561,7 +1940,7 @@ def fetch_daum_stock_investor_flow(
     def fetch_page(page: int):
         """단일 페이지를 요청합니다. 실패 시 None을 반환합니다."""
         try:
-            response = requests.get(
+            response = get_session().get(
                 DAUM_STOCK_INVESTOR_URL,
                 headers=headers,
                 params={
@@ -2122,61 +2501,67 @@ def debug_daum_investor_periods() -> dict:
     실제로 선택(select_option)했을 때, investor_purchase API 요청이
     어떻게 바뀌는지 옵션별로 구분해서 캡처합니다.
     """
+    from playwright.sync_api import sync_playwright
+
     results_by_option = {}
 
+    # 진단 전용 경로이므로 공용 브라우저 풀을 오염시키지 않도록
+    # 일회성 브라우저를 쓰고, 예외가 나도 반드시 닫습니다.
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=COMMON_HEADERS["User-Agent"])
+        try:
+            page = browser.new_page(user_agent=COMMON_HEADERS["User-Agent"])
 
-        captured = []
+            captured = []
 
-        def on_request(req):
-            if "investor_purchase" in req.url:
-                captured.append(req.url)
+            def on_request(req):
+                if "investor_purchase" in req.url:
+                    captured.append(req.url)
 
-        page.on("request", on_request)
+            page.on("request", on_request)
 
-        page.goto(
-            "https://finance.daum.net/domestic/influential_investors",
-            wait_until="networkidle",
-            timeout=15000,
-        )
-        page.wait_for_timeout(1000)
+            page.goto(
+                "https://finance.daum.net/domestic/influential_investors",
+                wait_until="networkidle",
+                timeout=15000,
+            )
+            page.wait_for_timeout(1000)
 
-        # 페이지 안의 모든 select 요소와 그 안의 option 값을 먼저 조사
-        select_info = page.evaluate(
-            """
-            () => {
-                const selects = Array.from(document.querySelectorAll('select'));
-                return selects.map(sel => ({
-                    name: sel.name || sel.id || '(이름없음)',
-                    options: Array.from(sel.options).map(o => ({
-                        value: o.value,
-                        text: o.text,
-                    })),
-                }));
-            }
-            """
-        )
-        results_by_option["__select_구조__"] = select_info
+            # 페이지 안의 모든 select 요소와 그 안의 option 값을 먼저 조사
+            select_info = page.evaluate(
+                """
+                () => {
+                    const selects = Array.from(document.querySelectorAll('select'));
+                    return selects.map(sel => ({
+                        name: sel.name || sel.id || '(이름없음)',
+                        options: Array.from(sel.options).map(o => ({
+                            value: o.value,
+                            text: o.text,
+                        })),
+                    }));
+                }
+                """
+            )
+            results_by_option["__select_구조__"] = select_info
 
-        captured.clear()
-        results_by_option["초기 로드(당일 추정)"] = list(dict.fromkeys(captured))
-
-        # 기간 관련 값으로 추정되는 option value 시도
-        candidate_values = ["TODAY", "5", "20", "DAYS_5", "DAYS_20"]
-
-        for value in candidate_values:
             captured.clear()
-            try:
-                page.select_option("select", value=value, timeout=3000)
-                page.wait_for_timeout(1500)
-                results_by_option[f"value={value}"] = list(
-                    dict.fromkeys(captured)
-                )
-            except Exception as e:
-                results_by_option[f"value={value}"] = [f"선택 실패: {e}"]
+            results_by_option["초기 로드(당일 추정)"] = list(dict.fromkeys(captured))
 
-        browser.close()
+            # 기간 관련 값으로 추정되는 option value 시도
+            candidate_values = ["TODAY", "5", "20", "DAYS_5", "DAYS_20"]
+
+            for value in candidate_values:
+                captured.clear()
+                try:
+                    page.select_option("select", value=value, timeout=3000)
+                    page.wait_for_timeout(1500)
+                    results_by_option[f"value={value}"] = list(
+                        dict.fromkeys(captured)
+                    )
+                except Exception as e:
+                    results_by_option[f"value={value}"] = [f"선택 실패: {e}"]
+
+        finally:
+            browser.close()
 
     return results_by_option

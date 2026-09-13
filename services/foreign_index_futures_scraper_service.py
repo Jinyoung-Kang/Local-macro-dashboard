@@ -15,7 +15,9 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests
+# 공용 커넥션 풀 세션을 사용해 요청마다 TCP/TLS 핸드셰이크를
+# 반복하지 않습니다 (services/http_client.py).
+from services.http_client import get_session
 import streamlit as st
 import yfinance as yf
 
@@ -133,7 +135,7 @@ _NIKKEI_INVESTING_URL = "https://kr.investing.com/indices/japan-225-futures"
 
 def _fetch_nikkei_from_tradingview() -> dict | None:
     try:
-        res = requests.get(_NIKKEI_TRADINGVIEW_URL, headers=_HEADERS, timeout=8)
+        res = get_session().get(_NIKKEI_TRADINGVIEW_URL, headers=_HEADERS, timeout=8)
         if res.status_code != 200:
             logger.warning(f"닛케이225 TradingView 응답 실패: HTTP {res.status_code}")
             return None
@@ -162,7 +164,7 @@ def _fetch_nikkei_from_tradingview() -> dict | None:
 
 def _fetch_nikkei_from_investing() -> dict | None:
     try:
-        res = requests.get(_NIKKEI_INVESTING_URL, headers=_HEADERS, timeout=8)
+        res = get_session().get(_NIKKEI_INVESTING_URL, headers=_HEADERS, timeout=8)
         if res.status_code != 200:
             logger.warning(f"닛케이225 Investing.com 응답 실패: HTTP {res.status_code}")
             return None
@@ -231,7 +233,7 @@ _HANGSENG_INVESTING_URL = "https://kr.investing.com/indices/hong-kong-40-futures
 
 def _fetch_hangseng_from_tradingview() -> dict | None:
     try:
-        res = requests.get(_HANGSENG_TRADINGVIEW_URL, headers=_HEADERS, timeout=8)
+        res = get_session().get(_HANGSENG_TRADINGVIEW_URL, headers=_HEADERS, timeout=8)
         if res.status_code != 200:
             logger.warning(f"항셍 TradingView 응답 실패: HTTP {res.status_code}")
             return None
@@ -260,7 +262,7 @@ def _fetch_hangseng_from_tradingview() -> dict | None:
 
 def _fetch_hangseng_from_investing() -> dict | None:
     try:
-        res = requests.get(_HANGSENG_INVESTING_URL, headers=_HEADERS, timeout=8)
+        res = get_session().get(_HANGSENG_INVESTING_URL, headers=_HEADERS, timeout=8)
         if res.status_code != 200:
             logger.warning(f"항셍 Investing.com 응답 실패: HTTP {res.status_code}")
             return None

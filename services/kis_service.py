@@ -55,11 +55,39 @@ KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
+def _cached_kis_token(app_key: str, app_secret: str) -> str:
+    """키 조합별 토큰 캐시. 인자는 캐시 키로만 쓰입니다."""
+    return _request_kis_token()
+
+
 def get_kis_access_token() -> str:
-    """KIS OAuth 2.0 Access Token 발급 및 캐싱"""
+    """
+    KIS OAuth 2.0 Access Token (성공한 토큰만 캐싱).
+
+    [버그 수정] 예전에는 발급 실패 시 돌려준 빈 문자열까지 6시간 캐시됐고,
+    그 사이에 secrets.toml의 키를 고쳐도 앱을 재시작하기 전까지 계속
+    실패했습니다. 무엇을 고쳐도 안 되는 것처럼 보이는 상태였습니다.
+    """
     app_key = get_secret("kis.app_key", get_secret("KIS_APP_KEY", get_secret("kis_app_key", "")))
     app_secret = get_secret("kis.app_secret", get_secret("KIS_APP_SECRET", get_secret("kis_app_secret", "")))
-    
+
+    if not app_key or not app_secret:
+        return ""
+
+    token = _cached_kis_token(app_key, app_secret)
+    if not token:
+        try:
+            _cached_kis_token.clear()
+        except Exception:                                    # noqa: BLE001
+            pass
+    return token
+
+
+def _request_kis_token() -> str:
+    """토큰을 실제로 발급받습니다 (캐시 없음)."""
+    app_key = get_secret("kis.app_key", get_secret("KIS_APP_KEY", get_secret("kis_app_key", "")))
+    app_secret = get_secret("kis.app_secret", get_secret("KIS_APP_SECRET", get_secret("kis_app_secret", "")))
+
     if not app_key or not app_secret:
         return ""
 
@@ -142,3 +170,128 @@ def fetch_kis_kospi_index() -> tuple:
                 logger.warning(f"KIS 지수 파싱 오류: {e}")
                 
     return "", 0.0
+
+
+# ==============================================================================
+# 교차 검증용 조회 함수
+# ==============================================================================
+# 이 프로젝트는 공식 API(KRX Open API)와 비공식 스크래핑(Daum·Naver·
+# TradingView)을 섞어 씁니다. 비공식 소스는 페이지 구조가 바뀌면 **조용히**
+# 틀린 값을 주기 시작하고, 화면만 봐서는 알아챌 방법이 없습니다.
+#
+# KIS는 증권사 공식 피드이므로 "제3의 독립 출처"로 쓰기에 적합합니다.
+# 아래 함수들은 services/verification_service.py가 같은 수치를 서로 다른
+# 출처에서 받아 비교하는 데 사용합니다.
+#
+# ⚠️ tr_id 주의
+#   FHPUP02100000(업종지수)과 FHPTJ04400000(외국인/기관 매매종목가집계)은
+#   이 저장소에서 이미 쓰고 있던 값입니다.
+#   FHMIF10000000(국내 선물옵션 시세)은 KIS 문서 기준으로 추가한 값이며
+#   이 환경에서는 실제 응답으로 확인하지 못했습니다. 값이 틀리면
+#   `python collector.py --verify`가 KIS가 돌려준 오류 메시지를 그대로
+#   출력하므로, 아래 상수 한 줄만 고치면 됩니다.
+KIS_TR_INDEX_PRICE = "FHPUP02100000"
+KIS_TR_FUTURES_PRICE = "FHMIF10000000"
+
+# KIS 업종 코드
+KIS_INDEX_CODE_KOSPI = "0001"
+KIS_INDEX_CODE_KOSPI200 = "2001"
+
+
+def _to_float(value) -> float | None:
+    """KIS 응답의 숫자 문자열을 float으로. 비어 있거나 0이면 None."""
+    try:
+        num = float(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return num if num != 0 else None
+
+
+def fetch_kis_index_close(index_code: str = KIS_INDEX_CODE_KOSPI200) -> dict:
+    """
+    KIS 업종 지수 현재가.
+
+    반환: {"ok": bool, "value": float|None, "detail": str}
+      value는 지수 포인트입니다 (코스피200이면 약 300~450 범위).
+    """
+    res = call_kis_api(
+        tr_id=KIS_TR_INDEX_PRICE,
+        endpoint="/uapi/domestic-stock/v1/quotations/inquire-index-price",
+        params={
+            "FID_COND_MRKT_DIV_CODE": "U",
+            "FID_INPUT_ISCD": index_code,
+        },
+    )
+
+    if not res or res.get("rt_cd") != "0":
+        return {
+            "ok": False,
+            "value": None,
+            "detail": (res or {}).get("msg1", "응답 없음"),
+        }
+
+    value = _to_float((res.get("output") or {}).get("bstp_nmix_prpr"))
+    if value is None:
+        return {
+            "ok": False,
+            "value": None,
+            "detail": "응답에 지수 현재가(bstp_nmix_prpr)가 없습니다.",
+        }
+
+    return {"ok": True, "value": value, "detail": f"업종코드 {index_code}"}
+
+
+def fetch_kis_kospi200_futures() -> dict:
+    """
+    KIS 국내 선물 시세(코스피200 최근월물).
+
+    반환: {"ok", "value"(선물 현재가), "open_interest", "symbol", "detail"}
+
+    종목코드는 최근월물을 뜻하는 연속 코드 "101000"을 씁니다. 월물이 바뀌어도
+    코드를 갱신할 필요가 없습니다.
+    """
+    symbol = "101000"
+    res = call_kis_api(
+        tr_id=KIS_TR_FUTURES_PRICE,
+        endpoint="/uapi/domestic-futureoption/v1/quotations/inquire-price",
+        params={
+            "FID_COND_MRKT_DIV_CODE": "F",
+            "FID_INPUT_ISCD": symbol,
+        },
+    )
+
+    if not res or res.get("rt_cd") != "0":
+        return {
+            "ok": False,
+            "value": None,
+            "open_interest": None,
+            "symbol": symbol,
+            "detail": (res or {}).get("msg1", "응답 없음"),
+        }
+
+    output = res.get("output1") or res.get("output") or {}
+    if isinstance(output, list):
+        output = output[0] if output else {}
+
+    price = _to_float(output.get("futs_prpr"))
+    oi = _to_float(output.get("hts_otst_stpl_qty"))
+
+    if price is None:
+        return {
+            "ok": False,
+            "value": None,
+            "open_interest": None,
+            "symbol": symbol,
+            "detail": (
+                "응답에 선물 현재가(futs_prpr)가 없습니다. "
+                f"받은 필드: {sorted(output)[:12]}"
+            ),
+        }
+
+    return {
+        "ok": True,
+        "value": price,
+        "open_interest": int(oi) if oi else None,
+        "symbol": symbol,
+        "detail": f"종목코드 {symbol} (최근월물)",
+    }

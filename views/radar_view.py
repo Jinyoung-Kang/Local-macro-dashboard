@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+from services import store
 from services.radar_service import (
     get_market_radar_scanner,
     get_stock_cumulative_flow_from_base,
@@ -24,7 +25,6 @@ from services.radar_service import (
     test_pykrx_connection,
     test_naver_scraping,
     test_daum_scraping,
-    PYKRX_AVAILABLE,
 )
 
 
@@ -55,8 +55,11 @@ def render_radar_view():
     with st.expander("연결 상태 테스트", expanded=False):
         st.write("KIS, LS, PyKrx, Naver, Daum 5개 데이터 소스의 연결 상태를 확인합니다.")
         st.caption(
-            "LS API는 현재 LS증권 계좌가 연결된 경우에만 사용됩니다. "
-            "KIS는 장중 가집계, Naver/Daum은 장 마감 후 시장 전체 순위 확인에 사용됩니다."
+            "각 진단은 화면이 **실제로 쓰는 경로**를 그대로 호출합니다 "
+            "(Daum = investor_purchase API, Naver = 렌더링 스크래핑). "
+            "진단과 실제 경로가 다르면 멀쩡한데 실패라고 하거나 그 반대가 됩니다.\n\n"
+            "KIS는 장중 가집계, Naver/Daum은 장 마감 후 시장 전체 순위에 쓰입니다. "
+            "LS API는 LS증권 계좌가 연결된 경우에만 사용됩니다."
         )
 
         if st.button("5개 데이터 소스 연결 상태 테스트", key="btn_test_broker_apis"):
@@ -68,7 +71,7 @@ def render_radar_view():
                 pykrx_ok, pykrx_msg = test_pykrx_connection()
             with st.spinner("Naver 스크래핑 연결 상태를 확인하는 중..."):
                 naver_ok, naver_msg = test_naver_scraping()
-            with st.spinner("Daum 스크래핑 연결 상태를 확인하는 중..."):
+            with st.spinner("Daum API 연결 상태를 확인하는 중..."):
                 daum_ok, daum_msg = test_daum_scraping()
 
             test_col1, test_col2, test_col3, test_col4, test_col5 = st.columns(5)
@@ -78,10 +81,15 @@ def render_radar_view():
                 else:
                     st.warning(f"KIS API\n\n{kis_msg}")
             with test_col2:
+                # [버그 수정] 예전에는 실패 사유와 무관하게 "LS 계좌 미연결
+                # 또는 미사용"을 붙였습니다. 실제로는 토큰까지 정상 발급되고
+                # TR만 빈 응답이었는데, 사용자는 키가 등록 안 된 줄 알고
+                # 계속 키를 의심하게 됐습니다. 진단 함수가 만든 메시지를
+                # 그대로 보여 줍니다.
                 if ls_ok:
                     st.success(f"LS API\n\n{ls_msg}")
                 else:
-                    st.warning(f"LS API\n\nLS 계좌 미연결 또는 미사용\n\n{ls_msg}")
+                    st.warning(f"LS API\n\n{ls_msg}")
             with test_col3:
                 if pykrx_ok:
                     st.success(f"PyKrx/KRX\n\n{pykrx_msg}")
@@ -101,13 +109,19 @@ def render_radar_view():
             if not naver_ok and not daum_ok:
                 st.error(
                     "Naver와 Daum 모두 연결에 실패했습니다. "
-                    "장 마감 후 시장 전체 순위는 PyKrx 데이터에 의존하며, "
-                    "PyKrx도 실패하면 수급 레이더를 표시할 수 없습니다."
+                    "PyKrx도 실패한 상태라면, 수집기가 쌓아 둔 누적 이력으로 "
+                    "대체 표시됩니다(그때는 화면에 별도 경고가 뜹니다)."
                 )
             elif not naver_ok:
-                st.info("Naver 연결에 실패했지만 Daum API가 정상입니다.")
+                st.info(
+                    "Naver 렌더링에 실패했지만 Daum API가 정상입니다. "
+                    "당일 조회는 Daum이 담당하므로 영향 없습니다."
+                )
             elif not daum_ok:
-                st.info("Daum 연결에 실패했지만 Naver 스크래핑이 정상입니다.")
+                st.info(
+                    "Daum API에 실패했지만 Naver 렌더링이 정상입니다. "
+                    "당일 조회는 Naver로 대체됩니다."
+                )
 
     st.markdown("---")
 
@@ -190,8 +204,18 @@ def render_radar_view():
             f"{INTERVAL_LABELS.get(interval_sel, interval_sel)}"
         )
     with refresh_col:
-        if st.button("새로고침", use_container_width=True):
-            get_market_radar_scanner.clear()
+        if st.button("새로고침", width="stretch"):
+            # [버그 수정] st.cache_data.clear()만으로는 아직 신선한 SQLite
+            # 저장본이 그대로 반환돼 화면이 전혀 바뀌지 않았습니다.
+            # request_refresh()가 저장본을 낡은 것으로 만들어 실제로 다시
+            # 수집하게 합니다.
+            store.request_refresh()
+            st.cache_data.clear()
+            if store.get_read_mode() == store.READ_MODE_STORE_ONLY:
+                st.toast(
+                    "store_only 모드입니다. 저장본만 다시 읽었습니다.",
+                    icon="ℹ️",
+                )
             st.rerun()
 
     st.markdown("---")
@@ -241,6 +265,16 @@ def render_radar_view():
         "KIS 장중 가집계는 장중 참고용이며, 장 마감 후에는 Daum/Naver/PyKrx의 "
         "최신 거래일 데이터를 우선 사용합니다."
     )
+
+    if "누적 이력" in data_source:
+        # 외부 소스가 전부 실패해 우리 DB에 쌓아 둔 값을 보여주는 상태입니다.
+        # 정보 상자에 묻히면 "지금 받은 최신 데이터"로 오해할 수 있습니다.
+        st.warning(
+            "**외부 데이터 소스가 모두 실패해, 수집기가 이전에 저장해 둔 "
+            "값을 보여주고 있습니다.** 위 출처에 적힌 날짜를 확인하세요. "
+            "지금 시점의 수급이 아닙니다.",
+            icon="🗄️",
+        )
 
     if now_kst.time() < time(15, 30):
         st.warning(
@@ -317,7 +351,7 @@ def render_radar_view():
         margin=dict(t=30, l=10, r=10, b=10),
         height=450,
     )
-    st.plotly_chart(fig_treemap, use_container_width=True)
+    st.plotly_chart(fig_treemap, width="stretch")
 
     # ==========================================================================
     # 데이터 테이블
@@ -347,7 +381,7 @@ def render_radar_view():
             subset=["순매수대금(억)"],
             cmap="Reds" if trade_type_sel == "순매수" else "Blues",
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -365,7 +399,7 @@ def render_radar_view():
         ]
         st.dataframe(
             df_radar[[col for col in debug_cols if col in df_radar.columns]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -967,7 +1001,7 @@ def render_radar_view():
                 ),
                 hovermode="x unified",
             )
-            st.plotly_chart(fig_cum, use_container_width=True)
+            st.plotly_chart(fig_cum, width="stretch")
             st.caption(
                 "KIS API, Daum API, Naver API, PyKrx 데이터의 제공 시점·집계 방식 차이로 "
                 "인해 수급 값은 거래소 최종 확정치와 다를 수 있습니다."
