@@ -597,6 +597,53 @@ def _json_default(obj: Any):
 # ==============================================================================
 # 3. 시계열 누적 (과거 조회가 안 되는 소스의 이력을 직접 쌓는다)
 # ==============================================================================
+_TIMESERIES_UPSERT = """
+    INSERT INTO timeseries (dataset, series_id, obs_date, value, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(dataset, series_id, obs_date) DO UPDATE SET
+        value      = excluded.value,
+        updated_at = excluded.updated_at
+"""
+
+
+def _timeseries_rows(
+    dataset: str,
+    series_id: str,
+    data: pd.Series | pd.DataFrame,
+    value_col: str | None,
+    now: str,
+) -> list[tuple]:
+    """
+    시계열 하나를 INSERT용 행 튜플 리스트로 바꿉니다.
+
+    파라미터:
+        dataset   : 데이터셋 이름 (예: "fred").
+        series_id : 시리즈 식별자 (예: "DGS10").
+        data      : 날짜 인덱스를 가진 Series 또는 DataFrame.
+        value_col : DataFrame일 때 쓸 값 컬럼명. None이면 첫 숫자 컬럼.
+        now       : updated_at에 넣을 UTC ISO 문자열. 한 번의 저장에서
+                    모든 행이 같은 값을 갖도록 호출부가 만들어 넘깁니다.
+
+    반환값:
+        (dataset, series_id, obs_date, value, updated_at) 튜플의 리스트.
+        쓸 수 있는 행이 없으면 빈 리스트.
+
+    주의사항:
+        날짜로 해석되지 않는 인덱스는 조용히 버립니다. 인덱스가 통째로
+        날짜가 아니면 빈 리스트가 나오므로, 호출부에서 "0행 저장"이
+        보이면 인덱스부터 확인하세요.
+    """
+    series = _coerce_series(data, value_col)
+    if series is None or series.empty:
+        return []
+
+    return [
+        (dataset, series_id, _date_key(idx), _to_float_or_none(val), now)
+        for idx, val in series.items()
+        if _date_key(idx) is not None
+    ]
+
+
 def put_timeseries(
     dataset: str,
     series_id: str,
@@ -606,35 +653,31 @@ def put_timeseries(
     db_path: Path | None = None,
 ) -> int:
     """
-    날짜 인덱스를 가진 수치 시계열을 upsert 합니다. 반영된 행 수를 반환합니다.
+    날짜 인덱스를 가진 수치 시계열을 upsert 합니다.
 
-    같은 (dataset, series_id, 날짜)는 최신 값으로 덮어씁니다. 따라서 매일
-    수집하면 과거는 유지되고 최근 값만 갱신됩니다.
+    파라미터:
+        dataset   : 데이터셋 이름. 같은 이름끼리 한 묶음으로 조회됩니다.
+        series_id : 시리즈 식별자.
+        data      : 날짜 인덱스를 가진 Series 또는 DataFrame.
+        value_col : DataFrame일 때 쓸 값 컬럼명. None이면 첫 숫자 컬럼.
+        db_path   : DB 경로 오버라이드(테스트용). None이면 기본 경로.
+
+    반환값:
+        실제로 반영한 행 수(int). 쓸 행이 없으면 0.
+
+    주의사항:
+        같은 (dataset, series_id, 날짜)는 **최신 값으로 덮어씁니다.**
+        그래서 매일 수집하면 과거는 그대로 유지되고 최근 값만 갱신됩니다.
+        추정치를 여기에 넣으면 확정치를 덮어쓸 수 있으니, 호출부에서
+        is_estimated 같은 표시를 먼저 확인하세요
+        (collector.py의 _task_fed_liquidity가 그렇게 합니다).
     """
-    series = _coerce_series(data, value_col)
-    if series is None or series.empty:
-        return 0
-
-    now = _utc_now_iso()
-    rows = [
-        (dataset, series_id, _date_key(idx), _to_float_or_none(val), now)
-        for idx, val in series.items()
-        if _date_key(idx) is not None
-    ]
+    rows = _timeseries_rows(dataset, series_id, data, value_col, _utc_now_iso())
     if not rows:
         return 0
 
     with connect(db_path) as conn:
-        conn.executemany(
-            """
-            INSERT INTO timeseries (dataset, series_id, obs_date, value, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(dataset, series_id, obs_date) DO UPDATE SET
-                value      = excluded.value,
-                updated_at = excluded.updated_at
-            """,
-            rows,
-        )
+        conn.executemany(_TIMESERIES_UPSERT, rows)
     return len(rows)
 
 
@@ -686,18 +729,47 @@ def put_frame_as_timeseries(
     columns: Iterable[str] | None = None,
     db_path: Path | None = None,
 ) -> int:
-    """와이드 DataFrame의 각 숫자 컬럼을 series_id로 삼아 누적합니다."""
+    """
+    와이드 DataFrame의 각 컬럼을 series_id로 삼아 한꺼번에 누적합니다.
+
+    파라미터:
+        dataset : 데이터셋 이름.
+        df      : 날짜 인덱스 + 컬럼마다 하나의 시계열을 담은 DataFrame.
+        columns : 저장할 컬럼 이름들. None이면 숫자형 컬럼을 모두 씁니다.
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        모든 컬럼에 대해 반영한 행 수의 합(int).
+
+    주의사항:
+        - [성능] 예전에는 컬럼마다 put_timeseries()를 불러서, 컬럼 수만큼
+          커넥션을 새로 열고 트랜잭션을 따로 커밋했습니다. 지금은 커넥션
+          하나에서 한 트랜잭션으로 씁니다. 덕분에 **전부 저장되거나 전부
+          저장되지 않거나** 둘 중 하나가 됩니다(예전에는 중간에 실패하면
+          앞쪽 컬럼만 저장된 어중간한 상태가 남았습니다).
+        - df에 없는 컬럼 이름을 columns로 주면 조용히 건너뜁니다.
+    """
     if df is None or df.empty:
         return 0
 
     targets = list(columns) if columns else [
         c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])
     ]
-    total = 0
+
+    now = _utc_now_iso()
+    rows: list[tuple] = []
     for col in targets:
         if col in df.columns:
-            total += put_timeseries(dataset, str(col), df[col], db_path=db_path)
-    return total
+            rows.extend(
+                _timeseries_rows(dataset, str(col), df[col], None, now)
+            )
+
+    if not rows:
+        return 0
+
+    with connect(db_path) as conn:
+        conn.executemany(_TIMESERIES_UPSERT, rows)
+    return len(rows)
 
 
 # ==============================================================================

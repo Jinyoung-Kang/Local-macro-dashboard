@@ -44,7 +44,7 @@ import sys
 import time as time_module
 import traceback
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -240,14 +240,43 @@ def _task_fred_series() -> str:
         *ADVANCED_SERIES_IDS,
     ]
 
+    # [성능] 예전에는 시리즈를 하나씩 순서대로 받았습니다. 12개 시리즈가
+    # 전부 같은 호스트(api.stlouisfed.org)를 향하는 순수 I/O 대기인데,
+    # 왕복 시간이 그대로 12배로 누적됐습니다. 동시에 받으면 전체 소요가
+    # 가장 느린 한 건 수준으로 줄어듭니다.
+    #
+    # 이건 이 저장소에서 새로 꺼내는 방식이 아닙니다. 심화 지표 수집
+    # (services/advanced_macro_service.py의 collect_advanced_macro)이 이미
+    # 같은 FRED 시리즈를 같은 방식으로 병렬 수집하고 있습니다.
+    #
+    # 저장(put_frame/put_timeseries)은 워커 안에서 하지 않고 메인 스레드로
+    # 모읍니다. SQLite는 동시 쓰기를 잠금으로 직렬화하므로, 워커에서
+    # 각자 쓰면 서로를 기다리며 병렬 이득을 깎아먹습니다.
+    # [(series_id, DataFrame)] — 수집에 성공한 것만 모읍니다.
+    fetched = []
+
+    with ThreadPoolExecutor(max_workers=min(len(series_ids), 8)) as executor:
+        futures = {
+            executor.submit(collect_fred_series, sid, period_years=10): sid
+            for sid in series_ids
+        }
+        for future in as_completed(futures):
+            sid = futures[future]
+            try:
+                df = future.result()
+            except Exception as e:                           # noqa: BLE001
+                # 한 시리즈의 실패가 나머지를 막지 않습니다.
+                logger.info("    FRED 수집 실패(저장본 유지): %s — %s", sid, e)
+                continue
+            if df is None or df.empty:
+                # 개별 시리즈가 비면 그 시리즈의 저장본만 건드리지 않고 넘어갑니다.
+                logger.info("    FRED 빈 결과(저장본 유지): %s", sid)
+                continue
+            fetched.append((sid, df))
+
     ok = 0
     rows = 0
-    for sid in series_ids:
-        df = collect_fred_series(sid, period_years=10)
-        if df is None or df.empty:
-            # 개별 시리즈가 비면 그 시리즈의 저장본만 건드리지 않고 넘어갑니다.
-            logger.info("    FRED 빈 결과(저장본 유지): %s", sid)
-            continue
+    for sid, df in fetched:
         store.put_frame(datasets.snap_fred_series(sid), df)
         rows += store.put_timeseries(datasets.TS_FRED, sid, df, value_col=sid)
         ok += 1
@@ -336,9 +365,20 @@ def _task_volatility_history() -> str:
     from services.macro_service import collect_ticker_data
 
     period = datasets.VOLATILITY_STORE_PERIOD
+    symbols = ("^VIX", "^MOVE")
+
+    # 두 심볼 모두 Yahoo 왕복 대기입니다. 순서대로 받을 이유가 없습니다.
+    # (^MOVE는 Yahoo가 제공하지 않아 ^TNX를 받아 역산하므로, 실제로는
+    #  서로 다른 심볼을 받는 독립 요청 두 건입니다.)
+    with ThreadPoolExecutor(max_workers=len(symbols)) as executor:
+        frames = dict(zip(
+            symbols,
+            executor.map(lambda s: collect_ticker_data(s, period), symbols),
+        ))
+
     ok = 0
-    for symbol in ("^VIX", "^MOVE"):
-        df = collect_ticker_data(symbol, period)
+    for symbol in symbols:
+        df = frames.get(symbol)
         if df is None or df.empty:
             logger.info("    변동성 빈 결과(저장본 유지): %s", symbol)
             continue

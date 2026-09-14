@@ -600,6 +600,93 @@ def get_previous_close_from_daily(
 # ==============================================================================
 # 3. 실시간 매크로 전 지표 수집 및 텍스트 브리핑 생성
 # ==============================================================================
+def _tickers_needing_daily_fallback(raw: dict) -> dict:
+    """
+    "일봉에서 전일 종가를 보완해야 하는" 티커와 기준 시각을 골라냅니다.
+
+    파라미터:
+        raw : {카테고리명: {지표명: (ticker, DataFrame|None)}} 형태의
+              1차 수집 결과.
+
+    반환값:
+        {ticker: 마지막 봉의 타임스탬프} 딕셔너리.
+        보완이 필요 없으면 빈 딕셔너리.
+
+    주의사항:
+        - 보완이 필요한 경우는 둘입니다.
+          (a) 봉이 2개 이상인데 마지막 두 종가가 **완전히 같을 때**
+              — 휴장·야간에 마지막 봉이 그대로 복제된 경우입니다.
+          (b) 봉이 1개뿐일 때 — 분봉만으로는 직전값을 알 수 없습니다.
+        - (a)의 판정은 배율(JPY/KRW의 100배)을 적용하기 **전** 원본
+          값으로 합니다. 배율은 현재가·전일값에 똑같이 곱해지므로
+          같음/다름 판정은 배율과 무관하기 때문입니다.
+        - 같은 티커가 두 카테고리에 있으면 키가 겹쳐 한 번만 받습니다.
+          (기준 시각은 같은 df에서 나오므로 어느 쪽을 써도 같습니다.)
+    """
+    needed = {}
+
+    for items in raw.values():
+        for ticker, df in items.values():
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+
+            if len(df) == 1:
+                needed[ticker] = df.index[-1]
+            elif float(df["Close"].iloc[-1]) == float(df["Close"].iloc[-2]):
+                needed[ticker] = df.index[-1]
+
+    return needed
+
+
+def _prefetch_daily_prev_closes(raw: dict) -> dict:
+    """
+    일봉 보완이 필요한 티커들의 직전 거래일 종가를 **한 번에** 받아 옵니다.
+
+    파라미터:
+        raw : {카테고리명: {지표명: (ticker, DataFrame|None)}} 1차 수집 결과.
+
+    반환값:
+        {ticker: 직전 거래일 종가(float)} 딕셔너리.
+        못 구한 티커는 키 자체가 없습니다. 호출부는 .get(ticker)로 읽고
+        None을 "보완 불가"로 해석하면 됩니다.
+
+    주의사항:
+        - [성능] 이 함수가 있는 이유입니다. 예전에는 결과를 정리하는
+          for 루프 **안에서** get_previous_close_from_daily()를 불렀습니다.
+          그 함수는 매번 yfinance를 한 번 더 왕복하는데, 루프가 순차라서
+          왕복이 그대로 직렬로 쌓였습니다. 그리고 이 보완이 필요한
+          상황(휴장·야간)은 예외가 아니라 **한국에서 미국장을 볼 때의
+          평상시**입니다. 최악의 경우 18개 티커 × 왕복 1회가 순서대로
+          붙었습니다.
+        - 보완이 필요 없으면 스레드 풀 자체를 만들지 않습니다.
+          장중처럼 값이 계속 움직일 때는 이 경로가 통째로 비용 0입니다.
+        - 개별 실패는 삼킵니다. 전일 종가 보완은 "있으면 좋은" 정보이고,
+          실패하면 화면이 N/A로 떨어질 뿐 다른 지표를 막지 않습니다.
+    """
+    needed = _tickers_needing_daily_fallback(raw)
+    if not needed:
+        return {}
+
+    resolved = {}
+
+    with ThreadPoolExecutor(max_workers=min(len(needed), 12)) as executor:
+        futures = {
+            executor.submit(get_previous_close_from_daily, ticker, last_ts): ticker
+            for ticker, last_ts in needed.items()
+        }
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                value = future.result()
+            except Exception as e:                           # noqa: BLE001
+                logger.debug("일봉 전일 종가 보완 실패 (%s): %s", ticker, e)
+                continue
+            if value is not None:
+                resolved[ticker] = value
+
+    return resolved
+
+
 def collect_macro_data():
     """
     매크로 전 지표를 실제로 수집합니다 (항상 네트워크를 씁니다).
@@ -629,6 +716,10 @@ def collect_macro_data():
             cat_name, name, ticker = futures[fut]
             raw.setdefault(cat_name, {})[name] = fut.result()
 
+    # 아래 정리 루프는 순차입니다. 그 안에서 네트워크를 다시 타면 왕복이
+    # 그대로 직렬로 쌓이므로, 필요한 일봉 보완을 여기서 한 번에 받아 둡니다.
+    daily_prev_closes = _prefetch_daily_prev_closes(raw)
+
     for cat_name, items in MACRO_CATEGORIES.items():
         for name, ticker in items.items():
             _, df = raw.get(cat_name, {}).get(name, (ticker, None))
@@ -653,9 +744,7 @@ def collect_macro_data():
                 # 그걸로 보완합니다. 그래도 못 구하면 "변화 없음(0.00%)"으로
                 # 위장하지 않고 N/A로 둡니다.
                 if curr == prev:
-                    daily_prev = get_previous_close_from_daily(
-                        ticker, df.index[-1],
-                    )
+                    daily_prev = daily_prev_closes.get(ticker)
                     if daily_prev is not None and daily_prev * scale != curr:
                         prev = daily_prev * scale
                         prev_source = "일봉 직전 거래일 종가"
@@ -749,9 +838,7 @@ def collect_macro_data():
                 # 일봉에서 직전 거래일 종가를 찾아봅니다. 못 찾으면 curr를
                 # prev처럼 위장해 "변화 없음(0.00%)"으로 표시하지 않고
                 # delta/pct를 명시적으로 None(N/A)으로 남깁니다.
-                daily_prev = get_previous_close_from_daily(
-                    ticker, last_timestamp,
-                )
+                daily_prev = daily_prev_closes.get(ticker)
                 prev_single = (
                     daily_prev * scale if daily_prev is not None else None
                 )

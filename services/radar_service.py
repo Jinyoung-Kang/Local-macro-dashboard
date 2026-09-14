@@ -1294,6 +1294,33 @@ def _get_latest_completed_session_str(now_kst: datetime) -> str:
     return d.strftime("%Y%m%d")
 
 
+def _previous_business_day(date_obj):
+    """
+    직전 영업일(주말을 건너뛴 전날)을 돌려줍니다.
+
+    파라미터:
+        date_obj : datetime.date 또는 datetime.datetime.
+
+    반환값:
+        하루 이상 뒤로 물러난 같은 타입의 날짜. 토·일은 건너뜁니다.
+
+    주의사항:
+        - 주말만 압니다. **공휴일은 모릅니다.** 설·추석처럼 며칠씩
+          쉬는 구간에서는 여전히 빈 날짜를 조회하게 됩니다. 한국거래소
+          휴장일 달력을 들이면 더 정확해지지만, 그 달력을 어디서 받아
+          어떻게 갱신할지가 또 하나의 외부 의존이 되므로 지금은 값이
+          가장 큰 주말만 처리합니다.
+        - 폴백 루프의 "최대 7회" 예산을 실제 영업일 7일에 쓰기 위한
+          함수입니다. 예전에는 달력 날짜로 하루씩 물러나서, 월요일에
+          조회하면 7회 중 2회를 토·일에 날렸습니다. 그 두 번은 반드시
+          빈 결과이므로 순수한 왕복 낭비였습니다.
+    """
+    previous = date_obj - timedelta(days=1)
+    while previous.weekday() >= 5:          # 5=토, 6=일
+        previous -= timedelta(days=1)
+    return previous
+
+
 def collect_market_radar_scanner(
     target_date_obj,
     market: str = "KOSPI",
@@ -1307,7 +1334,8 @@ def collect_market_radar_scanner(
     (KIS → Daum → Naver → LS → PyKrx → 누적 이력 폴백 체인).
 
     화면은 get_market_radar_scanner()를 쓰세요. 이 함수는 항상 네트워크를
-    쓰며, 최악의 경우 7영업일을 거슬러 올라가며 여러 소스를 시도합니다.
+    쓰며, 최악의 경우 7영업일을 거슬러 올라가며 여러 소스를 시도합니다
+    (주말은 건너뜁니다 — _previous_business_day 참고).
     """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     today_str = now_kst.strftime("%Y%m%d")
@@ -1417,34 +1445,25 @@ def collect_market_radar_scanner(
                 return df
 
         if PYKRX_AVAILABLE:
-          df = fetch_pykrx_deal_ranking(
-              search_date_str,
-              market,
-              investor,
-              trade_type,
-              top_n,
-          )
-      
-          if df is not None and not df.empty:
-              logger.info(
-                  "수급 레이더 성공: source=PyKrx, date=%s, market=%s, investor=%s, trade_type=%s, rows=%s",
-                  search_date_str,
-                  market,
-                  investor,
-                  trade_type,
-                  len(df),
-              )
-              return df
-      
-          logger.warning(
-              "수급 레이더 PyKrx 실패 또는 빈 결과: date=%s, market=%s, investor=%s, trade_type=%s",
-              search_date_str,
-              market,
-              investor,
-              trade_type,
-          )
+            df = fetch_pykrx_deal_ranking(
+                search_date_str, market, investor, trade_type, top_n,
+            )
 
-        current_date_obj -= timedelta(days=1)
+            if df is not None and not df.empty:
+                logger.info(
+                    "수급 레이더 성공: source=PyKrx, date=%s, market=%s, "
+                    "investor=%s, trade_type=%s, rows=%s",
+                    search_date_str, market, investor, trade_type, len(df),
+                )
+                return df
+
+            logger.warning(
+                "수급 레이더 PyKrx 실패 또는 빈 결과: date=%s, market=%s, "
+                "investor=%s, trade_type=%s",
+                search_date_str, market, investor, trade_type,
+            )
+
+        current_date_obj = _previous_business_day(current_date_obj)
 
     # ------------------------------------------------------------------
     # 마지막 수단: 수집기가 쌓아 온 우리 자신의 누적 이력.

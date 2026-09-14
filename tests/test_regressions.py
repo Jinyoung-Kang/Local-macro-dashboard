@@ -262,3 +262,157 @@ def test_secret_lookup_has_a_single_implementation():
     assert config.get_secret is secrets.get_secret
     assert kis_service.get_secret is secrets.get_secret
     assert ls_service.get_secret is secrets.get_secret
+
+
+# ==============================================================================
+# 9. 일봉 전일 종가 보완은 순차 루프 안에서 네트워크를 타면 안 된다
+# ==============================================================================
+def _stale_intraday(value=8.71):
+    """마지막 두 봉의 종가가 같은(=전일 대비를 못 구하는) 분봉 프레임."""
+    df = pd.DataFrame(
+        {"Close": [value, value]},
+        index=pd.to_datetime(["2026-09-12 06:27", "2026-09-12 06:28"]),
+    )
+    df.attrs["is_intraday"] = True
+    return df
+
+
+def _moving_intraday():
+    """마지막 두 봉이 다른(=보완이 필요 없는) 분봉 프레임."""
+    df = pd.DataFrame(
+        {"Close": [8.60, 8.71]},
+        index=pd.to_datetime(["2026-09-12 06:27", "2026-09-12 06:28"]),
+    )
+    df.attrs["is_intraday"] = True
+    return df
+
+
+def test_only_stalled_or_single_bar_tickers_need_the_daily_fallback():
+    """
+    일봉 보완은 값이 필요한 티커만 대상으로 삼아야 한다.
+    보완이 필요 없는데도 받으면 순수한 왕복 낭비다.
+    """
+    from services.macro_service import _tickers_needing_daily_fallback
+
+    one_bar = pd.DataFrame(
+        {"Close": [8.71]}, index=pd.to_datetime(["2026-09-12 06:28"]),
+    )
+    raw = {
+        "c1": {"a": ("STALE", _stale_intraday()), "b": ("MOVING", _moving_intraday())},
+        "c2": {"c": ("ONEBAR", one_bar), "d": ("NONE", None)},
+    }
+
+    assert sorted(_tickers_needing_daily_fallback(raw)) == ["ONEBAR", "STALE"]
+
+
+def test_daily_fallback_is_prefetched_in_parallel(monkeypatch):
+    """
+    [회귀] collect_macro_data()는 1차 시세를 병렬로 받은 뒤, 결과를 정리하는
+    **순차 루프 안에서** get_previous_close_from_daily()를 불렀다. 그 함수는
+    yfinance를 한 번 더 왕복하므로 왕복이 그대로 직렬로 쌓였고, 이 보완이
+    필요한 상황(휴장·야간)은 예외가 아니라 한국에서 미국장을 볼 때의
+    평상시다.
+    """
+    import threading
+
+    import services.macro_service as ms
+
+    live = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fake_prev(symbol, current_ts=None):
+        nonlocal live, peak
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        try:
+            # 동시 실행이 겹칠 시간을 준다 (sleep 없이는 항상 peak=1).
+            for _ in range(2000):
+                pass
+            return 8.65
+        finally:
+            with lock:
+                live -= 1
+
+    monkeypatch.setattr(ms, "get_previous_close_from_daily", fake_prev)
+
+    raw = {"c": {str(i): (f"T{i}", _stale_intraday()) for i in range(8)}}
+    resolved = ms._prefetch_daily_prev_closes(raw)
+
+    assert len(resolved) == 8
+    assert all(v == 8.65 for v in resolved.values())
+
+
+def test_daily_fallback_failures_do_not_block_other_tickers(monkeypatch):
+    """한 티커의 보완 실패가 나머지 지표를 막으면 안 된다."""
+    import services.macro_service as ms
+
+    def flaky(symbol, current_ts=None):
+        if symbol == "BAD":
+            raise RuntimeError("소스 장애")
+        if symbol == "EMPTY":
+            return None
+        return 8.65
+
+    monkeypatch.setattr(ms, "get_previous_close_from_daily", flaky)
+
+    raw = {"c": {
+        "a": ("BAD", _stale_intraday()),
+        "b": ("EMPTY", _stale_intraday()),
+        "c": ("GOOD", _stale_intraday()),
+    }}
+    resolved = ms._prefetch_daily_prev_closes(raw)
+
+    # 못 구한 티커는 키 자체가 없어야 한다 (호출부가 .get()으로 None 판정).
+    assert "BAD" not in resolved
+    assert "EMPTY" not in resolved
+    assert resolved["GOOD"] == 8.65
+
+
+def test_no_daily_fallback_means_no_network_at_all(monkeypatch):
+    """
+    장중처럼 값이 계속 움직일 때는 이 경로가 통째로 비용 0이어야 한다.
+    """
+    import services.macro_service as ms
+
+    def must_not_be_called(symbol, current_ts=None):
+        pytest.fail(f"보완이 필요 없는데 일봉을 받았습니다: {symbol}")
+
+    monkeypatch.setattr(ms, "get_previous_close_from_daily", must_not_be_called)
+
+    raw = {"c": {"a": ("MOVING", _moving_intraday())}}
+    assert ms._prefetch_daily_prev_closes(raw) == {}
+
+
+# ==============================================================================
+# 10. 수급 폴백 루프가 주말을 조회하느라 예산을 낭비하면 안 된다
+# ==============================================================================
+def test_lookback_steps_over_weekends():
+    """
+    [회귀] collect_market_radar_scanner()의 독스트링은 "최대 7영업일"을
+    거슬러 올라간다고 적혀 있었지만, 코드는 달력 날짜로 하루씩 물러났다
+    (current_date_obj -= timedelta(days=1)). 월요일에 조회하면 7회 예산 중
+    2회를 토·일에 썼고, 그 두 번은 반드시 빈 결과이므로 순수한 왕복
+    낭비였다.
+    """
+    import datetime
+
+    from services.radar_service import _previous_business_day
+
+    monday = datetime.date(2026, 9, 14)
+    assert monday.weekday() == 0, "전제: 2026-09-14는 월요일"
+
+    # 월요일의 직전 영업일은 금요일이어야 한다 (일요일이 아니라).
+    assert _previous_business_day(monday) == datetime.date(2026, 9, 11)
+
+    # 어떤 날짜에서 물러나도 결과는 항상 평일이어야 한다.
+    for day in range(1, 29):
+        stepped = _previous_business_day(datetime.date(2026, 9, day))
+        assert stepped.weekday() < 5, stepped
+
+    # 7회를 물러나면 실제 영업일 7일이 나와야 한다.
+    cursor = monday
+    for _ in range(7):
+        cursor = _previous_business_day(cursor)
+    assert cursor == datetime.date(2026, 9, 3), cursor
