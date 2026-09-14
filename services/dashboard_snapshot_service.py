@@ -340,8 +340,13 @@ def _append_sec_section(lines: list[str], sec_res):
         return
 
     if isinstance(sec_res, dict):
-        lines.append(f"- 모니터링 기관 수: {len(sec_res)}개 기관")
-        for inst_name, payload in list(sec_res.items())[:5]:
+        shown = 5
+        lines.append(
+            f"- 모니터링 기관 수: {len(sec_res)}개 기관"
+            + (f" (아래는 그중 {min(shown, len(sec_res))}곳만 표시)"
+               if len(sec_res) > shown else "")
+        )
+        for inst_name, payload in list(sec_res.items())[:shown]:
             if isinstance(payload, dict) and isinstance(payload.get("df"), pd.DataFrame) and not payload["df"].empty:
                 df_inst = payload["df"]
                 top_row = df_inst.sort_values("weight", ascending=False).iloc[0] if "weight" in df_inst.columns else df_inst.iloc[0]
@@ -354,8 +359,13 @@ def _append_sec_section(lines: list[str], sec_res):
             else:
                 lines.append(f"  * {inst_name}: 보유 데이터 없음")
     elif isinstance(sec_res, pd.DataFrame):
-        lines.append(f"- 모니터링 기관 수: {len(sec_res)}개 기관")
-        for _, r in sec_res.head(5).iterrows():
+        shown = 5
+        lines.append(
+            f"- 모니터링 기관 수: {len(sec_res)}개 기관"
+            + (f" (아래는 그중 {min(shown, len(sec_res))}곳만 표시)"
+               if len(sec_res) > shown else "")
+        )
+        for _, r in sec_res.head(shown).iterrows():
             inst_nm = r.get("institution", r.get("name", "N/A"))
             top_hold = r.get("top_holding", "N/A")
             val_b = r.get("total_value_bil", r.get("value_bil", 0))

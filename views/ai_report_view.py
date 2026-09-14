@@ -27,6 +27,7 @@ from services.ai_service import (
     DEFAULT_REPORT_TYPE,
     call_selected_ai_engine,
     check_all_engines,
+    detect_verdict_conflict,
     extract_report_text,
     format_ai_engine,
     get_ai_engine_options,
@@ -287,13 +288,19 @@ def _judgement_tone(judgement: str | None) -> str:
     return _JUDGEMENT_TONE.get(judgement.strip(), _TONE_NEUTRAL)
 
 
-def _render_verdict_banner(verdict: dict, report_type: str) -> None:
+def _render_verdict_banner(
+    verdict: dict,
+    report_type: str,
+    sections: list | None = None,
+) -> None:
     """
     총평을 색조 배너로 그립니다.
 
     파라미터:
         verdict     : parse_report_sections()가 돌려준 verdict dict.
         report_type : 리포트 유형(배너 라벨에 씁니다).
+        sections    : 같은 결과의 sections. 신뢰도와 본문이 모순되는지
+                      검사하는 데 씁니다. None이면 검사를 건너뜁니다.
 
     반환값:
         없음.
@@ -303,6 +310,9 @@ def _render_verdict_banner(verdict: dict, report_type: str) -> None:
           이라는 잘못된 인상을 줍니다.
         - 신뢰도가 "낮음"이면 경고 문구를 함께 띄웁니다. 낮은 신뢰도
           리포트를 확신처럼 읽는 것이 이 화면의 가장 큰 위험입니다.
+        - 신뢰도가 "높음"인데 본문이 상충을 말하면 **모순 경고**를
+          띄웁니다. 모델이 신뢰도 기준을 지키지 않는 일이 실제로 있어서,
+          프롬프트만으로는 부족합니다.
     """
     judgement = verdict.get("판단")
     if not judgement:
@@ -357,6 +367,14 @@ def _render_verdict_banner(verdict: dict, report_type: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    conflict_note = (verdict.get("상충 신호") or "").strip()
+    if conflict_note and "없음" not in conflict_note:
+        st.caption(f"⚖️ 상충 신호: {conflict_note}")
+
+    mismatch = detect_verdict_conflict(verdict, sections or [])
+    if mismatch:
+        st.warning(mismatch, icon="⚠️")
 
     if (verdict.get("신뢰도") or "").strip() == "낮음":
         st.warning(
@@ -423,7 +441,9 @@ def _render_report_body(result: dict) -> None:
         st.markdown(body)
         return
 
-    _render_verdict_banner(parsed["verdict"], result["report_type"])
+    _render_verdict_banner(
+        parsed["verdict"], result["report_type"], parsed["sections"],
+    )
 
     if parsed["preamble"]:
         st.markdown(parsed["preamble"])

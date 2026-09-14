@@ -32,7 +32,6 @@ from services.macro_service import (
     fetch_fred_cp_spread,
     fetch_fred_series,
     fetch_ticker_data,
-    generate_full_macro_text,
     get_collected_macro_data,
 )
 from services.dashboard_snapshot_service import (
@@ -487,39 +486,12 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
     dgs10_df = fetch_fred_series("DGS10", period_years=10)
     dgs30_df = fetch_fred_series("DGS30", period_years=10)
 
-    risk_data = {
-        "VIX": vix_hist,
-        "MOVE": move_hist,
-        "HY_OAS": hy_df,
-        "CP_SPREAD": cp_spread_df,
-        "STLFSI4": stlfsi_df,
-    }
-
-    report_text = generate_full_macro_text(
-        collected_data=collected_data,
-        rate_10y_curr=rate_10y_curr,
-        rate_10y_prev=rate_10y_prev,
-        rate_2y_curr=rate_2y_curr,
-        rate_2y_prev=rate_2y_prev,
-        risk_data=risk_data,
-    )
-
     header_left, header_right = st.columns([2.7, 1.3])
     with header_left:
         st.title("📊 Global Macro Dashboard")
         st.caption(f"최근 데이터 갱신 시각: {now_str_kst} (KST) | 갱신 주기: {refresh_interval}초")
     with header_right:
         st.write("")
-        with st.popover("📋 매크로 텍스트 브리핑 보기 / 복사", width="stretch"):
-            st.markdown("**거시경제 매크로 지표 전체 원본 데이터**")
-            st.caption(
-                "환율·국채·원자재·미국/아시아 지수·선물·장단기 금리차·"
-                "신용 리스크·은행권·시장 변동성의 최신값을 모두 표시합니다."
-            )
-            st.code(report_text, language="text")
-
-        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-
         with st.popover(
             "📚 전체 대시보드 원본 데이터 보기 / 복사",
             width="stretch",

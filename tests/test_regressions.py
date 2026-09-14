@@ -279,7 +279,7 @@ def _stale_intraday(value=8.71):
 
 
 def _moving_intraday():
-    """마지막 두 봉이 다른(=보완이 필요 없는) 분봉 프레임."""
+    """마지막 두 봉이 다른 분봉 프레임 (그래도 전일 종가는 모릅니다)."""
     df = pd.DataFrame(
         {"Close": [8.60, 8.71]},
         index=pd.to_datetime(["2026-09-12 06:27", "2026-09-12 06:28"]),
@@ -288,22 +288,57 @@ def _moving_intraday():
     return df
 
 
-def test_only_stalled_or_single_bar_tickers_need_the_daily_fallback():
+def _daily_bars():
+    """일봉 프레임. iloc[-2]가 진짜 직전 거래일 종가입니다."""
+    df = pd.DataFrame(
+        {"Close": [8.60, 8.71]},
+        index=pd.to_datetime(["2026-09-11", "2026-09-12"]),
+    )
+    df.attrs["is_intraday"] = False
+    return df
+
+
+def test_every_intraday_ticker_needs_the_daily_fallback():
     """
-    일봉 보완은 값이 필요한 티커만 대상으로 삼아야 한다.
-    보완이 필요 없는데도 받으면 순수한 왕복 낭비다.
+    [회귀] 분봉에서 `Close.iloc[-2]`는 **1분 전 봉**이지 전일 종가가
+    아니다. 그런데 그 차이를 "전일 대비"로 표시했다. 실제 스냅샷에서
+    코스피가 -3.26% 떨어진 날 화면에는 +0.09%로 찍혔고, 같은 스냅샷의
+    KODEX 레버리지(2배) -7.18%가 진짜 하락을 증명했다.
+
+    옛 코드는 두 봉이 **정확히 같을 때만** 일봉으로 보완했기 때문에,
+    값이 조금이라도 다르면 1분 변화율이 그대로 전일 대비로 둔갑했다.
+    분봉이면 값이 어떻든 일봉에서 전일 종가를 가져와야 한다.
     """
     from services.macro_service import _tickers_needing_daily_fallback
 
     one_bar = pd.DataFrame(
         {"Close": [8.71]}, index=pd.to_datetime(["2026-09-12 06:28"]),
     )
-    raw = {
-        "c1": {"a": ("STALE", _stale_intraday()), "b": ("MOVING", _moving_intraday())},
-        "c2": {"c": ("ONEBAR", one_bar), "d": ("NONE", None)},
-    }
+    one_bar.attrs["is_intraday"] = True
 
-    assert sorted(_tickers_needing_daily_fallback(raw)) == ["ONEBAR", "STALE"]
+    raw = {
+        "c1": {
+            "정체된 분봉": ("STALE", _stale_intraday()),
+            "움직이는 분봉": ("MOVING", _moving_intraday()),
+        },
+        "c2": {
+            "봉 하나": ("ONEBAR", one_bar),
+            "일봉": ("DAILY", _daily_bars()),
+            "없음": ("NONE", None),
+        },
+    }
+    needed = _tickers_needing_daily_fallback(raw)
+
+    # 분봉은 값이 움직이든 정체돼 있든 전부 대상이다.
+    assert "STALE" in needed
+    assert "MOVING" in needed, (
+        "움직이는 분봉을 빼면 1분 변화율이 전일 대비로 표시된다"
+    )
+    assert "ONEBAR" in needed
+
+    # 일봉은 iloc[-2]가 진짜 전일 종가이므로 대상이 아니다.
+    assert "DAILY" not in needed
+    assert "NONE" not in needed
 
 
 def test_daily_fallback_is_prefetched_in_parallel(monkeypatch):
@@ -371,19 +406,86 @@ def test_daily_fallback_failures_do_not_block_other_tickers(monkeypatch):
     assert resolved["GOOD"] == 8.65
 
 
-def test_no_daily_fallback_means_no_network_at_all(monkeypatch):
+def test_daily_frames_need_no_extra_network_call(monkeypatch):
     """
-    장중처럼 값이 계속 움직일 때는 이 경로가 통째로 비용 0이어야 한다.
+    일봉으로 받은 티커는 이미 전일 종가를 갖고 있다. 그 경우에는 추가
+    왕복이 한 건도 나가면 안 된다.
     """
     import services.macro_service as ms
 
     def must_not_be_called(symbol, current_ts=None):
-        pytest.fail(f"보완이 필요 없는데 일봉을 받았습니다: {symbol}")
+        pytest.fail(f"일봉인데 추가 조회를 했습니다: {symbol}")
 
     monkeypatch.setattr(ms, "get_previous_close_from_daily", must_not_be_called)
 
-    raw = {"c": {"a": ("MOVING", _moving_intraday())}}
+    raw = {"c": {"일봉": ("DAILY", _daily_bars())}}
     assert ms._prefetch_daily_prev_closes(raw) == {}
+
+
+def test_intraday_change_is_measured_against_the_previous_session(monkeypatch):
+    """
+    분봉으로 받은 지표의 등락률이 **전일 종가 기준**으로 계산돼야 한다.
+    1분 전 봉과 비교하면 종일 -3% 빠진 장이 +0.09%로 보인다.
+    """
+    import services.macro_service as ms
+
+    # 장중 분봉: 1분 사이에는 거의 안 움직였지만, 전일 종가 대비로는 큰 하락
+    intraday = pd.DataFrame(
+        {"Close": [6680.0, 6677.81]},
+        index=pd.to_datetime(["2026-09-14 14:59", "2026-09-14 15:00"]),
+    )
+    intraday.attrs["is_intraday"] = True
+
+    monkeypatch.setattr(
+        ms, "fetch_ticker_data", lambda symbol, period="1mo": intraday,
+    )
+    monkeypatch.setattr(
+        ms, "MACRO_CATEGORIES", {"아시아": {"코스피 (KOSPI)": "^KS11"}},
+    )
+    monkeypatch.setattr(ms, "_apply_bond_scanner_override", lambda *a, **k: a)
+    # 전일 종가는 6,909.91 (실제 스냅샷의 TradingView 값)
+    monkeypatch.setattr(
+        ms, "get_previous_close_from_daily", lambda symbol, current_ts=None: 6909.91,
+    )
+
+    item = ms.collect_macro_data()[0]["아시아"][0]
+
+    assert item["prev_source"] == "일봉 직전 거래일 종가"
+    assert item["pct"] == pytest.approx(-3.36, abs=0.05), (
+        f"전일 대비가 아닌 값이 계산됐습니다: {item['pct']}"
+    )
+    assert item["delta"] < 0
+
+
+def test_intraday_without_a_daily_close_shows_na_not_a_one_minute_change(monkeypatch):
+    """
+    일봉을 못 구하면 전일 대비를 **알 수 없다**. 1분 변화율을 전일 대비로
+    위장하느니 N/A가 정직하다.
+    """
+    import services.macro_service as ms
+
+    intraday = pd.DataFrame(
+        {"Close": [6680.0, 6677.81]},
+        index=pd.to_datetime(["2026-09-14 14:59", "2026-09-14 15:00"]),
+    )
+    intraday.attrs["is_intraday"] = True
+
+    monkeypatch.setattr(
+        ms, "fetch_ticker_data", lambda symbol, period="1mo": intraday,
+    )
+    monkeypatch.setattr(
+        ms, "MACRO_CATEGORIES", {"아시아": {"코스피 (KOSPI)": "^KS11"}},
+    )
+    monkeypatch.setattr(ms, "_apply_bond_scanner_override", lambda *a, **k: a)
+    monkeypatch.setattr(
+        ms, "get_previous_close_from_daily", lambda symbol, current_ts=None: None,
+    )
+
+    item = ms.collect_macro_data()[0]["아시아"][0]
+
+    assert item["delta"] is None and item["pct"] is None
+    assert item["delta_str"] == "N/A"
+    assert item["prev_str"] == "N/A"
 
 
 # ==============================================================================
@@ -1257,3 +1359,83 @@ def test_html_escaping_neutralises_a_malicious_verdict():
         assert "<script>" not in safe
         assert "<img" not in safe
     assert "정상 문장" in html.escape(verdict["핵심 근거"])
+
+
+# ==============================================================================
+# 16. 신뢰도가 본문과 모순되면 화면이 알려야 한다
+# ==============================================================================
+def test_conflict_warning_fires_on_the_real_report_that_prompted_it():
+    """
+    2026-09-15 실제 리포트는 신뢰도를 '높음'으로 쓰면서 본문에
+    "국내외 수급은 상반된다", "미국 주식에 대한 위험회피"라고 적었다.
+    프롬프트의 신뢰도 기준(상충 0개일 때만 높음)을 20B 모델이 지키지
+    않은 것이다. 프롬프트만으로는 부족하므로 화면에서도 잡는다.
+    """
+    from services.ai_service import detect_verdict_conflict, parse_report_sections
+
+    real = (
+        "### 총평\n"
+        "- **판단**: 위험선호\n"
+        "- **신뢰도**: 높음\n"
+        "- **핵심 근거**: 에너지 섹터 3개월 상승률 14.86%\n\n"
+        "### 수급 진단\n"
+        "국내외 수급은 상반된다: 외국인 순매수, 기관 순매도.\n"
+    )
+    parsed = parse_report_sections(real)
+    note = detect_verdict_conflict(parsed["verdict"], parsed["sections"])
+
+    assert note is not None, "모순을 잡지 못했습니다"
+    assert "높음" in note
+
+
+def test_conflict_warning_does_not_cry_wolf():
+    """
+    경고가 늘 떠 있으면 아무도 읽지 않는다. 모순이 아닌 경우에는
+    조용해야 한다.
+    """
+    from services.ai_service import detect_verdict_conflict
+
+    # 상충이 없으면 경고하지 않는다.
+    assert detect_verdict_conflict(
+        {"신뢰도": "높음", "상충 신호": "없음"},
+        [{"body": "모든 지표가 같은 방향을 가리킨다."}],
+    ) is None
+
+    # 신뢰도를 이미 낮춰 썼으면 문제가 아니다 — 모델이 정직하게 군 것이다.
+    for level in ("보통", "낮음"):
+        assert detect_verdict_conflict(
+            {"신뢰도": level}, [{"body": "국내외 수급은 상반된다."}],
+        ) is None
+
+    # 총평이 없으면 검사할 것도 없다.
+    assert detect_verdict_conflict({}, []) is None
+
+
+def test_conflict_warning_catches_a_self_declared_conflict():
+    """총평이 스스로 상충을 적어 놓고 신뢰도를 '높음'으로 두면 잡아야 한다."""
+    from services.ai_service import detect_verdict_conflict
+
+    note = detect_verdict_conflict(
+        {"신뢰도": "높음", "상충 신호": "2개 — 금리는 위험회피/섹터는 위험선호"},
+        [{"body": "특별한 표현 없음"}],
+    )
+    assert note is not None and "2개" in note
+
+
+def test_prompt_forces_an_explicit_conflict_count():
+    """
+    신뢰도를 '고르게' 두면 모델이 느낌으로 고른다. 상충 개수를 먼저
+    세게 하고, 그 개수가 신뢰도를 결정하도록 절차를 못 박아야 한다.
+    """
+    from services.prompts import REPORT_PROFILES, VERDICT_FIELDS
+
+    assert VERDICT_FIELDS["conflicts"] == "상충 신호"
+
+    for report_type, profile in REPORT_PROFILES.items():
+        prompt = profile["system_prompt"]
+        assert "상충 신호" in prompt, report_type
+        assert "1단계" in prompt and "2단계" in prompt, (
+            f"{report_type}: 신뢰도 판정이 절차로 못 박혀 있지 않습니다"
+        )
+        assert "자기 점검" in prompt, report_type
+        assert "'높음'으로 쓸 수 없습니다" in prompt, report_type

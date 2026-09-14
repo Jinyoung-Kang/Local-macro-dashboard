@@ -642,7 +642,7 @@ def get_previous_close_from_daily(
 # ==============================================================================
 def _tickers_needing_daily_fallback(raw: dict) -> dict:
     """
-    "일봉에서 전일 종가를 보완해야 하는" 티커와 기준 시각을 골라냅니다.
+    일봉에서 전일 종가를 가져와야 하는 티커와 기준 시각을 골라냅니다.
 
     파라미터:
         raw : {카테고리명: {지표명: (ticker, DataFrame|None)}} 형태의
@@ -653,15 +653,12 @@ def _tickers_needing_daily_fallback(raw: dict) -> dict:
         보완이 필요 없으면 빈 딕셔너리.
 
     주의사항:
-        - 보완이 필요한 경우는 둘입니다.
-          (a) 봉이 2개 이상인데 마지막 두 종가가 **완전히 같을 때**
-              — 휴장·야간에 마지막 봉이 그대로 복제된 경우입니다.
-          (b) 봉이 1개뿐일 때 — 분봉만으로는 직전값을 알 수 없습니다.
-        - (a)의 판정은 배율(JPY/KRW의 100배)을 적용하기 **전** 원본
-          값으로 합니다. 배율은 현재가·전일값에 똑같이 곱해지므로
-          같음/다름 판정은 배율과 무관하기 때문입니다.
+        - **분봉으로 받은 티커는 전부 대상입니다.** 분봉에서 iloc[-2]는
+          1분(또는 5분) 전 봉이지 전일 종가가 아닙니다. 그 차이를 전일
+          대비로 쓰면 실제로 -3% 움직인 지수가 +0.09%로 보입니다.
+        - 일봉으로 받은 티커는 iloc[-2]가 진짜 직전 거래일 종가이므로
+          대상이 아닙니다. 단 봉이 하나뿐이면 비교 대상이 없어 포함합니다.
         - 같은 티커가 두 카테고리에 있으면 키가 겹쳐 한 번만 받습니다.
-          (기준 시각은 같은 df에서 나오므로 어느 쪽을 써도 같습니다.)
     """
     needed = {}
 
@@ -670,9 +667,9 @@ def _tickers_needing_daily_fallback(raw: dict) -> dict:
             if df is None or not isinstance(df, pd.DataFrame) or df.empty:
                 continue
 
-            if len(df) == 1:
-                needed[ticker] = df.index[-1]
-            elif float(df["Close"].iloc[-1]) == float(df["Close"].iloc[-2]):
+            is_intraday = bool(df.attrs.get("is_intraday", False))
+
+            if is_intraday or len(df) == 1:
                 needed[ticker] = df.index[-1]
 
     return needed
@@ -803,18 +800,27 @@ def collect_macro_data():
                 prev = raw_prev * scale
 
                 prev_source = None
+                is_intraday = bool(df.attrs.get("is_intraday", False))
 
-                # [수정] 최근 2개 봉의 종가가 완전히 동일하면(휴장·야간시간대에
-                # 마지막 봉이 그대로 복제되는 경우 포함) 분봉으로는 전일 대비를
-                # 알 수 없습니다. 예전에는 여기서 끝내 버려 전일 종가까지
-                # N/A로 사라졌는데, 일봉에는 직전 거래일 종가가 남아 있으므로
-                # 그걸로 보완합니다. 그래도 못 구하면 "변화 없음(0.00%)"으로
-                # 위장하지 않고 N/A로 둡니다.
-                if curr == prev:
+                # [버그 수정] 분봉에서 iloc[-2]는 **1분 전 봉**이지 전일 종가가
+                # 아닙니다. 예전에는 그 차이를 "전일 대비"로 표시해서, 실제로
+                # -3.26% 떨어진 코스피가 +0.09%로 보였습니다(같은 스냅샷의
+                # KODEX 레버리지 -7.18%가 진짜 하락을 증명합니다).
+                # 일봉 폴백이 `curr == prev`일 때만 걸려 있어, 두 봉이 조금이라도
+                # 다르면 1분 변화율이 그대로 전일 대비로 둔갑했습니다.
+                #
+                # 분봉이면 **항상** 일봉에서 직전 거래일 종가를 가져옵니다.
+                # 일봉으로 받은 경우에만 iloc[-2]가 진짜 전일 종가입니다.
+                if is_intraday:
                     daily_prev = daily_prev_closes.get(ticker)
-                    if daily_prev is not None and daily_prev * scale != curr:
+                    if daily_prev is not None:
                         prev = daily_prev * scale
                         prev_source = "일봉 직전 거래일 종가"
+                    else:
+                        # 일봉을 못 구했으면 전일 대비를 알 수 없습니다.
+                        # 1분 변화율을 전일 대비로 위장하지 않습니다.
+                        prev = curr
+                        prev_source = None
 
                 if curr == prev:
                     delta = None
@@ -824,7 +830,6 @@ def collect_macro_data():
                     pct = (delta / prev) * 100 if prev != 0 else 0.0
 
                 last_timestamp = df.index[-1]
-                is_intraday = bool(df.attrs.get("is_intraday", False))
 
                 try:
                     if is_intraday and hasattr(last_timestamp, "tzinfo") and last_timestamp.tzinfo is not None:

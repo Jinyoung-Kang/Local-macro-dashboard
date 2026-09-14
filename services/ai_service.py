@@ -525,6 +525,64 @@ def parse_report_sections(text: str) -> dict:
     }
 
 
+
+# 본문이 상충을 말할 때 쓰이는 표현들. 모델은 어휘를 바꿔 쓰므로
+# 넉넉히 잡되, 일상적으로 쓰이는 단어는 넣지 않습니다(오탐이 나면
+# 경고가 늘 떠서 아무도 안 읽게 됩니다).
+_CONFLICT_MARKERS = (
+    "상충", "상반", "어긋", "엇갈", "반대 방향", "역방향",
+    "모순", "배치되", "다른 신호", "괴리",
+)
+
+
+def detect_verdict_conflict(verdict: dict, sections: list) -> str | None:
+    """
+    총평의 신뢰도가 본문의 서술과 모순되는지 검사합니다.
+
+    파라미터:
+        verdict  : parse_report_sections()가 돌려준 verdict dict.
+        sections : 같은 결과의 sections 리스트.
+
+    반환값:
+        모순이 있으면 사람이 읽을 설명 문자열, 없으면 None.
+
+    주의사항:
+        - 잡는 것은 **한 방향뿐입니다** — "본문은 상충을 말하는데
+          신뢰도가 높음"인 경우. 반대(본문은 일치하는데 신뢰도가 낮음)는
+          모델이 보수적으로 군 것이라 문제가 아닙니다.
+        - 어휘 매칭이라 완벽하지 않습니다. 모델이 "A는 X, B는 Y"처럼
+          접속사 없이 나열하면 놓칩니다. 이 검사는 **보조 장치**이고,
+          1차 방어선은 프롬프트의 신뢰도 판정 절차입니다.
+        - 오탐을 줄이려고 마커를 좁게 잡았습니다. 경고가 늘 떠 있으면
+          아무도 읽지 않게 되기 때문입니다.
+    """
+    confidence = (verdict.get("신뢰도") or "").strip()
+    if confidence != "높음":
+        return None
+
+    body = "\n".join(s.get("body", "") for s in (sections or []))
+    hits = sorted({m for m in _CONFLICT_MARKERS if m in body})
+
+    declared = (verdict.get("상충 신호") or "").strip()
+    declared_some = bool(declared) and "없음" not in declared
+
+    if not hits and not declared_some:
+        return None
+
+    reasons = []
+    if declared_some:
+        reasons.append(f"총평이 상충 신호를 '{declared}'로 적었습니다")
+    if hits:
+        reasons.append("본문에 " + ", ".join(f"'{h}'" for h in hits) + " 표현이 있습니다")
+
+    return (
+        "신뢰도가 **높음**인데 " + ", ".join(reasons) + ". "
+        "이 리포트의 기준상 상충이 하나라도 있으면 신뢰도는 '보통' 이하여야 "
+        "합니다. 결론을 그대로 받아들이기 전에 본문의 상충 부분을 직접 "
+        "확인하세요."
+    )
+
+
 def get_confidence_levels() -> tuple:
     """
     신뢰도 어휘 집합.
