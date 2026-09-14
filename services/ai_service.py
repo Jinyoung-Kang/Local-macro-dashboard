@@ -233,7 +233,21 @@ def get_ai_engine_options(include_auto: bool = True, only_available: bool = Fals
 
 
 def format_ai_engine(engine_id: str) -> str:
-    """엔진 ID를 UI 표기용 레이블로 변환"""
+    """
+    엔진 ID를 화면 표기용 레이블로 바꿉니다.
+
+    파라미터:
+        engine_id : AI_MODEL_REGISTRY의 키.
+
+    반환값:
+        "🟢 NVIDIA — Nemotron-3 Super 120B" 형태의 문자열.
+        등록되지 않은 ID면 **그 ID를 그대로** 돌려줍니다.
+
+    주의사항:
+        모르는 ID에 예외를 내지 않습니다. 화면이 죽는 것보다 낫지만,
+        레이블 대신 날것의 ID가 보인다면 레지스트리에 없는 엔진이
+        흘러든 것이니 호출부를 확인하세요.
+    """
     reg = AI_MODEL_REGISTRY.get(engine_id)
     if reg:
         return reg["label"]
@@ -532,7 +546,22 @@ def get_confidence_levels() -> tuple:
 # 1. 자동 번역기 (한국어 판별 및 Gemma 4 연동)
 # ==============================================================================
 def is_korean_response(text: str) -> bool:
-    """모델 응답이 한국어인지 간단하게 판별 (한글 비중 5% 이상)"""
+    """
+    모델 응답이 한국어인지 판별합니다.
+
+    파라미터:
+        text : 판별할 문자열.
+
+    반환값:
+        bool. 한글이 8자 이상이고 전체 알파벳 문자 중 5% 이상이면 True.
+
+    주의사항:
+        - 기준이 느슨합니다(5%). 영어 리포트에 한국어 고유명사가 몇 개
+          섞인 경우를 한국어로 오판할 수 있지만, 그 대가는 "번역을 한 번
+          건너뛴다"뿐이라 받아들일 만합니다.
+        - 반대로 오판하면(한국어인데 아니라고 하면) 불필요한 번역 호출이
+          한 번 더 나가 느려집니다.
+    """
     if not text or not text.strip():
         return False
     korean_chars = len(re.findall(r"[가-힣]", text))
@@ -557,6 +586,22 @@ KOREAN_TRANSLATION_PROMPT = """
 
 
 def translate_with_cloudflare_gemma(account_id: str, api_token: str, text: str) -> dict:
+    """
+    Cloudflare 번역 모델로 텍스트를 한국어로 옮깁니다.
+
+    파라미터:
+        account_id : Cloudflare 계정 ID.
+        api_token  : Cloudflare API 토큰.
+        text       : 번역할 원문.
+
+    반환값:
+        표준 결과 dict. response에 번역문이 들어갑니다.
+
+    주의사항:
+        표·마크다운 서식을 보존하도록 프롬프트가 지시하지만 **보장되지
+        않습니다.** 번역 후 표가 깨질 수 있으므로, 화면은 번역 전 원문도
+        함께 볼 수 있게 해야 합니다.
+    """
     config = TRANSLATION_MODELS["cloudflare"]
     return call_cloudflare_model(
         model=config["model"],
@@ -568,6 +613,20 @@ def translate_with_cloudflare_gemma(account_id: str, api_token: str, text: str) 
 
 
 def translate_with_nvidia_gemma(api_key: str, text: str) -> dict:
+    """
+    NVIDIA 번역 모델로 텍스트를 한국어로 옮깁니다.
+
+    파라미터:
+        api_key : NVIDIA API 키.
+        text    : 번역할 원문.
+
+    반환값:
+        표준 결과 dict. response에 번역문이 들어갑니다.
+
+    주의사항:
+        translate_with_cloudflare_gemma와 같습니다 — 표 서식 보존이
+        보장되지 않습니다.
+    """
     config = TRANSLATION_MODELS["nvidia"]
     return _call_openai_format(
         engine_name=config["label"],
@@ -587,7 +646,27 @@ def translate_response_if_needed(
     cloudflare_account_id: str,
     cloudflare_token: str,
 ) -> dict:
-    """AI 분석 결과가 외국어일 때만 제공자별 Gemma 번역기를 호출합니다."""
+    """
+    응답이 한국어가 아닐 때만 번역기를 호출합니다.
+
+    파라미터:
+        result                : 번역 대상 결과 dict.
+        source_provider       : 원래 응답을 만든 제공자.
+        nvidia_key            : NVIDIA 키.
+        cloudflare_account_id : Cloudflare 계정 ID.
+        cloudflare_token      : Cloudflare 토큰.
+
+    반환값:
+        result를 **제자리에서 수정해** 돌려줍니다.
+        번역했으면 response가 번역문으로 바뀌고 original_response에 원문이
+        남습니다. 번역이 필요 없거나 실패하면 response는 그대로입니다.
+
+    주의사항:
+        - **번역 실패가 분석 실패는 아닙니다.** 실패해도 원문을 그대로
+          내보내고 translation_info에 사실만 적습니다.
+        - 번역은 모델 호출을 한 번 더 하므로 그만큼 느려집니다. 프롬프트
+          에서 한국어를 지시해 이 경로를 아예 안 타는 편이 낫습니다.
+    """
     response_text = result.get("response", "")
 
     if not response_text or is_korean_response(response_text):
@@ -946,6 +1025,23 @@ def call_nvidia_model(
     system_prompt: str = None,
     generation: dict | None = None,
 ) -> dict:
+    """
+    NVIDIA NIM 엔진을 호출합니다 (스트리밍).
+
+    파라미터:
+        engine_id     : AI_MODEL_REGISTRY의 키.
+        api_key       : NVIDIA API 키.
+        prompt        : 사용자 메시지.
+        system_prompt : 시스템 메시지.
+        generation    : {"temperature", "max_tokens"}. None이면 엔진 기본값.
+
+    반환값:
+        표준 결과 dict. 등록되지 않은 engine_id면 status=False.
+
+    주의사항:
+        스트리밍으로 받습니다. 비스트리밍으로 되돌리면 긴 리포트가
+        read 타임아웃으로 통째로 실패합니다.
+    """
     config = AI_MODEL_REGISTRY.get(engine_id)
     if not config:
         return {
@@ -970,6 +1066,26 @@ def call_cloudflare_model(
     system_prompt: str = None,
     generation: dict | None = None,
 ) -> dict:
+    """
+    Cloudflare Workers AI 엔진을 호출합니다.
+
+    파라미터:
+        model         : "@cf/..." 형태의 모델 ID.
+        account_id    : Cloudflare 계정 ID.
+        api_token     : Cloudflare API 토큰.
+        prompt        : 사용자 메시지.
+        system_prompt : 시스템 메시지.
+        generation    : {"temperature", "max_tokens"}.
+
+    반환값:
+        표준 결과 dict (다른 제공자와 같은 모양).
+
+    주의사항:
+        - **비스트리밍입니다.** Cloudflare의 SSE 형식이 OpenAI 호환과
+          달라서인데, 대신 제한 시간을 길게 잡아 긴 생성을 감당합니다.
+        - 응답이 200이어도 본문의 success가 False일 수 있습니다. 상태
+          코드만 보고 성공으로 판단하지 마세요.
+    """
     if not account_id or not api_token:
         return {
             "status": False, "response": "", "error": "Cloudflare 인증 정보 누락",
@@ -1512,10 +1628,30 @@ def generate_ai_briefing_with_failover(
 
 
 # ==============================================================================
-# 4. 레거시 및 개별 테스트 호환 함수 (ImportError 완벽 방어)
+# 4. 레거시 호환 래퍼
 # ==============================================================================
+# 아래 test_* 함수들은 전부 한 줄짜리 통과 함수입니다. 개별 독스트링을
+# 달아도 이름 이상의 정보가 없어 오히려 읽기를 방해하므로 생략합니다.
+#
+# 남겨 두는 이유는 하나입니다 — 예전 화면 코드가 이 이름들을 직접
+# import 하고 있어서, 지우면 ImportError로 앱이 뜨지 않습니다.
+# 새 코드는 call_selected_ai_engine()을 쓰세요.
 def ask_krx_cot_agent(prompt: str, engine_name: str = "auto") -> dict:
-    """krx_cot_view 하위 호환용 헬퍼"""
+    """
+    KRX 파생 수급 해설을 요청합니다.
+
+    파라미터:
+        prompt      : 시장 데이터가 담긴 사용자 메시지.
+        engine_name : 엔진 ID. 기본 "auto"(자동 탐색).
+
+    반환값:
+        표준 결과 dict.
+
+    주의사항:
+        파생 전용 시스템 프롬프트가 고정돼 있습니다. 리포트 화면의
+        유형별 프로파일과는 별개이므로, 두 곳의 지시를 함께 바꿔야 할
+        때는 빠뜨리지 마세요.
+    """
     return call_selected_ai_engine(
         engine_name=engine_name,
         prompt=prompt,

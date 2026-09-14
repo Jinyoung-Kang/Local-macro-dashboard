@@ -415,7 +415,23 @@ _TUPLE_TAG = "__tuple__"
 
 
 def _encode_obj(obj: Any) -> Any:
-    """dict/list를 재귀적으로 돌며 DataFrame만 태깅해 JSON-safe로 만듭니다."""
+    """
+    중첩 구조를 JSON으로 쓸 수 있는 형태로 바꿉니다 (DataFrame은 태깅).
+
+    파라미터:
+        obj : dict/list/DataFrame/스칼라가 섞인 임의의 구조.
+
+    반환값:
+        JSON 직렬화 가능한 구조. DataFrame과 tuple은 되살릴 수 있도록
+        특별한 키로 감쌉니다.
+
+    주의사항:
+        - **pickle을 쓰지 않는 이유**는 역직렬화 시 임의 코드 실행이
+          가능해지기 때문입니다. DB 파일이 공유·이동될 수 있으므로
+          받아들일 수 없는 위험입니다.
+        - 코덱이 모르는 타입은 str()로 떨어집니다. 되읽을 때 문자열이
+          되어 있다면 여기를 의심하세요.
+    """
     if isinstance(obj, pd.DataFrame):
         return {
             _DF_TAG: obj.to_json(orient="split", date_format="iso"),
@@ -444,7 +460,20 @@ def _encode_obj(obj: Any) -> Any:
 
 
 def _decode_obj(obj: Any) -> Any:
-    """_encode_obj의 역변환."""
+    """
+    _encode_obj가 만든 구조를 원래 타입으로 되살립니다.
+
+    파라미터:
+        obj : _encode_obj의 결과를 JSON에서 읽은 값.
+
+    반환값:
+        DataFrame·tuple이 복원된 구조.
+
+    주의사항:
+        DataFrame 복원에 실패하면 경고만 남기고 **빈 DataFrame**을
+        돌려줍니다. 예외로 화면을 죽이지 않기 위해서지만, 조용히 빈
+        표가 보이면 로그를 확인하세요.
+    """
     from io import StringIO
 
     if isinstance(obj, dict):
@@ -741,7 +770,20 @@ def read_snapshot(name: str, db_path: Path | None = None) -> Snapshot | None:
 
 
 def _revive_frame(raw: Any) -> pd.DataFrame | None:
-    """put_frame이 저장한 payload를 DataFrame으로 되살립니다."""
+    """
+    put_frame이 저장한 payload를 DataFrame으로 되살립니다.
+
+    파라미터:
+        raw : 스냅샷에서 읽은 dict.
+
+    반환값:
+        복원된 DataFrame. 형식이 맞지 않으면 None.
+
+    주의사항:
+        저장 당시의 dtype과 attrs(is_proxy 등)를 함께 복원합니다. 이
+        복원이 빠지면 종목코드의 앞자리 0이 사라지고, 추정치 표시가
+        없어져 화면이 추정치를 공식 지표처럼 보여 줍니다.
+    """
     if not isinstance(raw, dict) or "__frame__" not in raw:
         return None
 
@@ -1165,7 +1207,20 @@ def start_run(
 
 
 def heartbeat_run(run_id: int, db_path: Path | None = None) -> None:
-    """진행 중임을 알리는 타임스탬프를 갱신합니다."""
+    """
+    실행이 살아 있음을 기록합니다.
+
+    파라미터:
+        run_id  : start_run이 돌려준 id.
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        없음.
+
+    주의사항:
+        13F처럼 한 태스크가 10분을 넘기는 경우가 있어 태스크마다 찍어야
+        합니다. 이게 없으면 죽은 수집기를 "진행 중"으로 오인합니다.
+    """
     try:
         with connect(db_path) as conn:
             conn.execute(
@@ -1209,7 +1264,19 @@ def record_task_run(
 
 
 def _pid_is_alive(pid: int | None) -> bool:
-    """해당 PID가 살아 있는지 확인합니다 (같은 머신일 때만 의미 있음)."""
+    """
+    해당 PID의 프로세스가 살아 있는지 확인합니다.
+
+    파라미터:
+        pid : 확인할 프로세스 id. None도 받습니다.
+
+    반환값:
+        bool. 살아 있으면 True.
+
+    주의사항:
+        **같은 머신에서만 의미가 있습니다.** 다른 호스트에서 기록된 PID는
+        이 머신의 무관한 프로세스와 우연히 겹칠 수 있습니다.
+    """
     if not pid:
         return False
     try:
@@ -1225,10 +1292,19 @@ def _pid_is_alive(pid: int | None) -> bool:
 
 def resolve_run_status(run: dict | None) -> str:
     """
-    기록된 status를 실제 상태로 보정합니다.
+    기록된 status를 실제 상태로 해석합니다.
 
-    'running'으로 남아 있지만 프로세스가 죽었거나 heartbeat가 끊긴 경우
-    'interrupted'로 보고합니다. 그래야 --status가 거짓말을 하지 않습니다.
+    파라미터:
+        run : read_last_run()이 돌려준 실행 기록 dict. None도 받습니다.
+
+    반환값:
+        "ok" | "partial" | "fail" | "running" | "interrupted" | "none".
+
+    주의사항:
+        DB에 'running'으로 남아 있어도 프로세스가 죽었거나 heartbeat가
+        끊겼으면 **'interrupted'로 판정합니다.** 화면·CLI에 상태를 보여
+        줄 때는 DB 값이 아니라 반드시 이 함수를 거치세요. 그래야
+        --status가 거짓말을 하지 않습니다.
     """
     if not run:
         return "none"
@@ -1254,8 +1330,17 @@ def resolve_run_status(run: dict | None) -> str:
 
 def mark_stale_runs_interrupted(db_path: Path | None = None) -> int:
     """
-    죽은 'running' 레코드를 정리합니다. 수집기 시작 시 호출합니다.
-    정리한 건수를 반환합니다.
+    비정상 종료로 'running'에 남은 기록을 정리합니다.
+
+    파라미터:
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        정리한 행 수(int).
+
+    주의사항:
+        수집기가 시작할 때 부릅니다. 빠뜨리면 절전·강제 종료로 남은
+        기록이 영원히 "진행 중"으로 보입니다.
     """
     try:
         with connect(db_path, readonly=True) as conn:
@@ -1411,10 +1496,17 @@ def store_stats(db_path: Path | None = None) -> dict:
 
 def read_task_summary(db_path: Path | None = None) -> list[dict]:
     """
-    태스크별 '가장 최근 실행 결과'를 반환합니다.
+    태스크별 가장 최근 실행 결과를 1건씩 추립니다.
 
-    집계(성공 N·실패 M)만으로는 어떤 태스크가 왜 실패했는지 알 수 없어서,
-    태스크 단위로 최신 1건씩 추립니다.
+    파라미터:
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        태스크별 최신 기록 dict의 리스트. 실패하면 빈 리스트.
+
+    주의사항:
+        집계(성공 N·실패 M)만으로는 **어떤** 태스크가 **왜** 실패했는지
+        알 수 없어서 태스크 단위로 추립니다.
     """
     try:
         with connect(db_path, readonly=True) as conn:
@@ -1480,9 +1572,16 @@ def missing_datasets(db_path: Path | None = None) -> list[dict]:
     """
     "있어야 하는데 없는" 데이터셋을 찾습니다.
 
-    기존 store_stats()는 존재하는 스냅샷만 나열해서, 수집이 아예 안 된
-    데이터셋은 목록에서 조용히 빠져 있었습니다. 그래서 무엇이 누락됐는지
-    알아챌 수 없었습니다.
+    파라미터:
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        {"name", "label"} dict의 리스트. 누락이 없으면 빈 리스트.
+
+    주의사항:
+        기대 목록이 **이 함수 안에 하드코딩**돼 있습니다. 수집 대상을
+        바꾸면 여기도 함께 고쳐야 합니다. 안 그러면 멀쩡한 상태가
+        "누락"으로 보이거나, 진짜 누락이 안 보입니다.
     """
     from services import datasets as ds
 
@@ -1823,8 +1922,20 @@ def is_empty_result(value: Any) -> bool:
 
 def purge_older_than(days: int, db_path: Path | None = None) -> dict[str, int]:
     """
-    오래된 누적 이력을 정리합니다. 기본 운용에서는 불필요하지만
-    (하루 수집량이 작습니다) 장기 운영 시 관리용으로 둡니다.
+    지정 일수보다 오래된 누적 이력을 삭제합니다.
+
+    파라미터:
+        days    : 보관할 일수. 이보다 오래된 행을 지웁니다.
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        {"timeseries": 삭제행수, "observations": 삭제행수} dict.
+
+    주의사항:
+        - **되돌릴 수 없습니다.** observations의 수급 이력은 외부에서
+          다시 받을 수 없습니다(Naver·Daum은 과거 조회 미지원).
+          지우기 전에 data/dashboard.db를 백업하세요.
+        - 기본 운용에서는 쓸 일이 없습니다. 하루 수집량이 작습니다.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     with connect(db_path) as conn:

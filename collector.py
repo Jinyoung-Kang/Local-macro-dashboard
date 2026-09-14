@@ -235,8 +235,21 @@ def _task_macro_collected() -> str:
 
 def _task_radar_rankings() -> str:
     """
-    수급 레이더는 조건 조합이 많습니다. 화면 기본값 조합만 미리 받아 둡니다.
-    (전부 받으면 수집 시간이 과도하게 길어집니다.)
+    수급 랭킹 기본 조합을 미리 받아 저장하고 이력에 누적합니다.
+
+    파라미터:
+        없음. 대상 조합은 함수 안에 적혀 있습니다.
+
+    반환값:
+        "3/3 조합 수집" 형태의 요약 문자열.
+
+    주의사항:
+        - **화면 기본값 조합 3개만** 받습니다. 조건 조합이 많아 전부
+          받으면 수집 시간이 과도해집니다. 사용자가 다른 조합을 고르면
+          화면이 직접 수집하므로 느립니다 — 의도된 절충입니다.
+        - 빈 결과인 조합은 저장본을 덮지 않고 건너뜁니다.
+        - observations에도 누적합니다. Naver·Daum이 과거 조회를 지원하지
+          않아, 이 누적이 유일한 과거 이력입니다.
     """
     from services import datasets, store
     from services.radar_service import (
@@ -428,7 +441,20 @@ def _task_krx_futures() -> str:
 
 
 def _task_daum_futures_trend() -> str:
-    """KRX 화면이 페이지 로드 시 바로 쓰는 Daum 선물 수급을 미리 받습니다."""
+    """
+    Daum 선물 투자주체별 매매동향을 미리 받아 저장합니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        "25행" 형태의 요약 문자열.
+
+    주의사항:
+        lookback 기간(25)이 화면(views/krx_cot_view.py)과 **같아야**
+        합니다. 다르면 스냅샷 이름이 어긋나 수집은 되는데 화면에는
+        안 보입니다.
+    """
     from services import datasets, store
     from services.krx_service import collect_daum_futures_investor_trend
 
@@ -446,13 +472,21 @@ def _task_daum_futures_trend() -> str:
 
 def _task_volatility_history() -> str:
     """
-    ^VIX / ^MOVE 시계열.
+    ^VIX / ^MOVE 변동성 시계열을 받아 저장합니다.
 
-    화면이 여러 기간으로 요청하므로 가장 긴 기간(5y)으로 한 번만 저장하고,
-    짧은 기간은 화면에서 잘라 씁니다.
+    파라미터:
+        없음.
 
-    ⚠️ ^MOVE는 Yahoo가 제공하지 않아 ^TNX 변동성에서 역산한 추정치입니다.
-    df.attrs["is_proxy"]로 표시되며, 저장 계층이 이 표시를 보존합니다.
+    반환값:
+        "2/2 지수 (5y)" 형태의 요약 문자열.
+
+    주의사항:
+        - 가장 긴 기간(5y)으로 **한 번만** 저장하고 짧은 기간 요청은
+          화면에서 잘라 씁니다. 기간마다 스냅샷을 만들면 난립합니다.
+        - **^MOVE는 실제 지표가 아닙니다.** Yahoo가 ICE BofA MOVE를
+          제공하지 않아 ^TNX 변동성에서 역산한 추정치이고,
+          df.attrs["is_proxy"]로 표시됩니다. 저장 계층이 이 표시를
+          보존하므로 화면과 AI 리포트까지 그대로 전달돼야 합니다.
     """
     from services import datasets, store
     from services.macro_service import collect_ticker_data
@@ -604,16 +638,22 @@ def _task_cot_history() -> str:
 
 def _task_sec_13f() -> str:
     """
-    SEC 13F 수집 — 전체 수집에서 가장 오래 걸리는 작업입니다.
+    SEC 13F 기관 포트폴리오를 받아 저장합니다.
 
-    [최적화 2가지]
-    1) q1은 q8의 부분집합입니다. collect_sec_13f_multi_quarters()는 공시를
-       최신순으로 훑어 max_quarters개만 자르므로, q8[:1] == q1 입니다.
-       따라서 q8만 수집하고 q1은 잘라서 저장합니다 (수집 24건 → 12건).
-    2) 기존에는 기관을 순차 처리했습니다. SEC 한도는 초당 10건인데
-       time.sleep(0.2) 직렬 방식으로는 초당 5건도 못 썼습니다.
-       _sec_rate_limit() 토큰 버킷으로 바꿨으므로 기관을 병렬 처리해도
-       전체 합계 한도는 지켜집니다.
+    파라미터:
+        없음. 대상 기관은 config.INSTITUTIONS가 정합니다.
+
+    반환값:
+        "12/12 기관, 스냅샷 24건" 형태의 요약 문자열.
+
+    주의사항:
+        - **전체 수집에서 가장 오래 걸립니다**(10분 이상). 그래서 weekly
+          작업군으로 분리했습니다. 13F는 분기 공시라 자주 받을 이유가
+          없습니다.
+        - q1은 q8의 첫 분기와 같은 데이터이므로 q8만 받아 잘라서
+          저장합니다. 이 관계를 깨면 수집 시간이 두 배가 됩니다.
+        - 기관을 병렬 처리하지만 SEC 초당 10건 한도는 토큰 버킷이 전역
+          으로 지킵니다. 워커 수를 늘려도 한도는 안전합니다.
     """
     from services import datasets, store
     from services.sec_service import collect_sec_13f_multi_quarters
@@ -734,14 +774,22 @@ def _lock_path() -> Path:
 @contextmanager
 def process_lock(force: bool = False):
     """
-    수집기 중복 실행을 막습니다.
+    수집기 중복 실행을 막는 락을 잡습니다 (with 전용).
 
-    두 프로세스가 동시에 돌면 같은 외부 소스를 두 배로 호출하고(레이트리밋
-    위험), SQLite 쓰기 경쟁도 늘어납니다. 무엇보다 --status 출력이 뒤섞여
-    원인 파악이 어려워집니다.
+    파라미터:
+        force : True면 다른 프로세스의 락을 무시하고 진행합니다.
 
-    락 파일에 PID를 적고, 죽은 프로세스의 락은 자동으로 회수합니다
-    (절전/강제종료로 락이 남는 것을 방지).
+    반환값:
+        컨텍스트 매니저. 블록을 벗어나면 **자기 락만** 지웁니다.
+
+    주의사항:
+        - 두 수집기가 동시에 돌면 같은 외부 소스를 두 배로 호출해
+          레이트리밋에 걸리고, SQLite 쓰기 경쟁도 늘어납니다.
+        - 죽은 프로세스의 락은 PID를 확인해 자동 회수합니다. 절전이나
+          강제 종료로 락이 남아도 다음 실행이 막히지 않습니다.
+        - force로 빼앗긴 경우 **남의 락을 지우지 않습니다.** 락 파일의
+          PID가 자기 것일 때만 삭제합니다.
+        - 다른 수집기가 돌고 있으면 AlreadyRunning을 올립니다.
     """
     from services import store
 
@@ -922,15 +970,23 @@ def run_loop(
 
 def run_verification_cli() -> int:
     """
-    `python collector.py --verify`
+    서로 다른 출처가 같은 수치를 말하는지 대조해 출력합니다 (--verify).
 
-    KRX·KIS 키를 써서 "같은 수치를 서로 다른 출처가 같게 말하는지"를 대조하고
-    결과를 출력합니다. 수집도, 저장도 하지 않습니다.
+    파라미터:
+        없음. KRX·KIS 키를 secrets/환경변수에서 읽습니다.
 
-    종료 코드
-      0 : 불일치 없음 (확인 못 한 항목은 있을 수 있습니다)
-      1 : 불일치 발견 — 조사 필요
-      2 : 키가 없어 검증 자체를 할 수 없음
+    반환값:
+        프로세스 종료 코드.
+          0 : 불일치 없음 (확인 못 한 항목은 있을 수 있습니다)
+          1 : 불일치 발견 — 조사 필요
+          2 : 키가 없어 검증 자체가 불가능
+
+    주의사항:
+        - **수집도 저장도 하지 않습니다.** 대조만 합니다.
+        - "확인 못 함"은 "일치"가 아닙니다. 시세 대조는 장 마감 후,
+          수급 대조는 정규장 중에만 가능합니다.
+        - 불일치가 나오면 비공식 소스(Daum·Naver·TradingView)의 페이지
+          구조 변경을 먼저 의심하세요.
     """
     from config import get_krx_key
     from services import verification_service as vs
@@ -961,7 +1017,20 @@ def run_verification_cli() -> int:
 
 
 def print_status(verbose: bool = False) -> None:
-    """저장 상태를 출력합니다. '무엇이 왜 실패했는지'가 핵심입니다."""
+    """
+    저장소 상태를 터미널에 출력합니다.
+
+    파라미터:
+        verbose : True면 스냅샷 상세와 누락 목록 전체를 함께 출력합니다.
+
+    반환값:
+        없음.
+
+    주의사항:
+        이 출력의 핵심은 "무엇이 **왜** 실패했는지"입니다. 성공/실패
+        개수만으로는 어느 태스크를 고쳐야 할지 알 수 없어서, 태스크별
+        최근 결과와 실패 사유를 함께 보여 줍니다.
+    """
     from services import store
 
     stats = store.store_stats()
@@ -1051,7 +1120,19 @@ def print_status(verbose: bool = False) -> None:
 
 
 def _fmt_kst(iso: str | None) -> str | None:
-    """UTC ISO 문자열을 KST 표시 문자열로."""
+    """
+    저장된 UTC ISO 문자열을 터미널 표시용 KST로 바꿉니다.
+
+    파라미터:
+        iso : ISO 8601 문자열. None도 받습니다.
+
+    반환값:
+        "MM-DD HH:MM:SS" 문자열. 못 읽으면 None.
+
+    주의사항:
+        연도를 생략합니다. 터미널 폭을 아끼려는 것이므로, 오래된 기록을
+        볼 때는 --history의 전체 값을 참고하세요.
+    """
     from services import store
 
     dt = store._parse_iso(iso)
@@ -1061,7 +1142,19 @@ def _fmt_kst(iso: str | None) -> str | None:
 
 
 def print_launchd_plist(fast_interval: int) -> None:
-    """macOS launchd 설정 예시를 출력합니다."""
+    """
+    macOS launchd 등록용 plist 예시를 출력합니다.
+
+    파라미터:
+        fast_interval : plist에 적을 fast 작업군 주기(초).
+
+    반환값:
+        없음. 표준 출력으로 찍습니다.
+
+    주의사항:
+        출력만 하고 **파일을 쓰지 않습니다.** 사용자가 내용을 확인한 뒤
+        직접 저장·등록하도록 의도한 것입니다.
+    """
     project = Path(__file__).resolve().parent
     python_bin = project / "venv" / "bin" / "python"
     label = "com.local.macro-dashboard.collector"
