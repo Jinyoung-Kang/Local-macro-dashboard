@@ -22,7 +22,7 @@ pip install -r requirements.txt
 playwright install chromium
 
 # 수정 후 pull(다운로드)
-git pull origin claude/eager-euler-2hpyfe
+git pull origin claude/cool-ptolemy-n9b7vs
 ```
 
 ---
