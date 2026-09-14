@@ -1,26 +1,22 @@
 """
 views/ai_report_view.py
-AI 매크로 & 멀티에셋 종합 리포트 뷰.
+AI 매크로 & 멀티에셋 종합 리포트 화면.
 
-대시보드 원본 스냅샷을 수집해 AI 프롬프트 주입용 Context를 조립하고,
-선택한 엔진으로 리포트를 생성해 보여 줍니다.
+대시보드 저장본으로 Context를 조립하고, 선택한 엔진으로 리포트를 생성해
+구조화된 문서로 보여 줍니다.
 
-[이 화면에서 고쳤던 것 — 다시 깨뜨리지 않도록]
-1. 생성된 리포트가 잠시 뒤 사라졌습니다.
-   화면 전체가 `if generate_btn:` 블록 **안에서** 그려지고 결과를 아무 데도
-   보관하지 않았기 때문입니다. Streamlit은 위젯 조작·자동 새로고침마다
-   스크립트를 처음부터 다시 실행하는데, 그때 generate_btn은 False라서
-   블록이 통째로 건너뛰어졌습니다. 사이드바의 "실시간 자동 새로고침"을
-   켜 두면 주기마다 리포트가 사라집니다.
-   → 결과를 st.session_state에 보관하고, 렌더링은 버튼 블록 **밖에서**
-     합니다.
-
-2. 리포트 본문이 비어 있는데 원인을 알 수 없었습니다.
-   `res.get("response", res.get("error", ...))` 로 본문을 꺼냈는데, 실패한
-   결과에도 `"response": ""` 키가 **존재**합니다. dict.get의 기본값은 키가
-   없을 때만 쓰이므로 오류 메시지는 영원히 선택되지 않았습니다.
-   → services.ai_service.extract_report_text()만 씁니다.
+[이 화면을 고칠 때 반드시 지켜야 할 것]
+- **렌더링은 생성 버튼 블록 밖에서** 하고, 결과는 st.session_state에
+  보관합니다. 버튼 블록 안에서 그리면 자동 새로고침이 스크립트를 다시
+  돌릴 때마다 리포트가 사라집니다.
+- 엔진 결과에서 본문을 꺼낼 때는 **ai_service.extract_report_text()만**
+  씁니다. `res.get("response", ...)`는 실패 시 빈 화면이 됩니다 — 실패한
+  결과에도 response 키가 빈 문자열로 존재하기 때문입니다.
+- 모델이 만든 문자열을 unsafe_allow_html에 넣을 때는 **반드시
+  html.escape()** 를 거칩니다. 모델 입력에 스크래핑 데이터가 섞이므로
+  외부 텍스트로 취급해야 합니다.
 """
+import html
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -37,7 +33,6 @@ from services.ai_service import (
     LARGE_CONTEXT_TOKENS,
     estimate_prompt_tokens,
     get_configured_providers,
-    get_engine_availability,
     get_report_generation_params,
     get_report_system_prompt,
     get_report_types,
@@ -219,9 +214,9 @@ def _generate_report(
 # ==============================================================================
 # 리포트 본문 렌더링 (프롬프트가 지시한 구조를 시각화)
 # ==============================================================================
-# 판단 값 → 색조. 리포트 유형마다 어휘가 달라 전부 적어 둡니다.
-# 여기 없는 값이 오면 중립으로 떨어집니다(모델이 임의의 문구를 쓸 수 있으므로
-# 정확히 일치할 때만 색을 줍니다).
+# 판단 값 → 색조. 리포트 유형마다 어휘가 다릅니다.
+# 정확히 일치할 때만 색을 줍니다 — 부분 일치시키면 "위험회피"에
+# "위험선호"가 들어 있는 식으로 오판합니다.
 _TONE_POSITIVE = "positive"
 _TONE_NEUTRAL = "neutral"
 _TONE_NEGATIVE = "negative"
@@ -317,6 +312,19 @@ def _render_verdict_banner(verdict: dict, report_type: str) -> None:
     rationale = verdict.get("핵심 근거") or ""
     style = _TONE_STYLE[_judgement_tone(judgement)]
 
+    # [보안] 아래 세 값은 **모델이 생성한 문자열**이고, 모델의 입력에는
+    # Naver·Daum·TradingView에서 스크래핑한 내용이 들어갑니다. 즉 외부에서
+    # 흘러들어온 텍스트입니다. 그것을 unsafe_allow_html로 그대로 넣으면
+    #
+    #   스크래핑 페이지 → Context → 모델 출력 → 브라우저에서 실행
+    #
+    # 경로가 열립니다. 모델이 `<img src=x onerror=...>`를 한 번만 뱉어도
+    # 사용자 브라우저에서 스크립트가 돕니다. 반드시 이스케이프하세요.
+    # 색·아이콘처럼 코드가 정하는 값만 이스케이프 없이 넣습니다.
+    safe_judgement = html.escape(judgement)
+    safe_confidence = html.escape(confidence)
+    safe_rationale = html.escape(rationale)
+
     st.markdown(
         f"""
         <div style="
@@ -328,14 +336,14 @@ def _render_verdict_banner(verdict: dict, report_type: str) -> None:
             margin:8px 0 18px 0;">
           <div style="color:#8B949E;font-size:0.78rem;letter-spacing:0.04em;
                       text-transform:uppercase;margin-bottom:6px;">
-            {report_type}
+            {html.escape(report_type)}
           </div>
           <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;">
             <span style="color:{style['fg']};font-size:1.6rem;font-weight:700;">
-              {style['icon']} {judgement}
+              {style['icon']} {safe_judgement}
             </span>
             <span style="color:#8B949E;font-size:0.9rem;">
-              신뢰도 <b style="color:#C9D1D9;">{confidence}</b>
+              신뢰도 <b style="color:#C9D1D9;">{safe_confidence}</b>
               <span style="letter-spacing:2px;">
                 {_CONFIDENCE_ICON.get(confidence, '')}
               </span>
@@ -343,7 +351,7 @@ def _render_verdict_banner(verdict: dict, report_type: str) -> None:
           </div>
           <div style="color:#C9D1D9;font-size:0.97rem;margin-top:10px;
                       line-height:1.6;">
-            {rationale}
+            {safe_rationale}
           </div>
         </div>
         """,
@@ -438,7 +446,10 @@ def _render_failure_help(result: dict) -> None:
         가장 정확한 단서이기 때문입니다. 요약하거나 예쁘게 바꾸면
         디버깅이 어려워집니다.
     """
-    st.error(f"리포트를 생성하지 못했습니다.\n\n```\n{result['body']}\n```")
+    # 오류 원문을 st.code로 넘깁니다. f-string으로 코드펜스를 만들면
+    # 본문에 ```가 섞였을 때 펜스를 빠져나가 서식이 깨집니다.
+    st.error("리포트를 생성하지 못했습니다.")
+    st.code(result["body"], language="text")
 
     lowered = result["body"].lower()
     providers = get_configured_providers()
@@ -742,9 +753,11 @@ def render_ai_report_view():
 
     c1, c2, c3 = st.columns([1.5, 1.5, 1])
     with c1:
+        # 응답이 확인된 엔진만 고를 수 있게 합니다. 사라진 엔진과 그 사유는
+        # 아래 "엔진 점검" 패널이 설명합니다.
         ai_engine = st.selectbox(
             "분석 AI 엔진 선택",
-            options=get_ai_engine_options(include_auto=True),
+            options=get_ai_engine_options(include_auto=True, only_available=True),
             format_func=format_ai_engine,
             index=0,
             key="ai_report_engine",
@@ -770,21 +783,6 @@ def render_ai_report_view():
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
         generate_btn = st.button("🚀 리포트 생성", type="primary", width="stretch")
 
-    # 고른 엔진이 죽은 것으로 기록돼 있으면 호출하기 전에 알려 줍니다.
-    # (호출 자체를 막지는 않습니다 — 제공자가 되살렸을 수도 있고, 계정
-    #  권한 문제라면 사용자 쪽에서 해결됐을 수도 있습니다.)
-    availability, note = get_engine_availability(ai_engine)
-    if availability == "eol":
-        st.error(
-            f"이 엔진은 제공자가 서비스를 종료했습니다. {note}",
-            icon="⛔",
-        )
-    elif availability == "unverified":
-        st.warning(
-            f"이 엔진은 마지막 점검에서 응답하지 않았습니다. {note}",
-            icon="⚠️",
-        )
-
     if (
         include_recent_cot_history
         and ai_engine not in LONG_CONTEXT_MODELS
@@ -804,9 +802,7 @@ def render_ai_report_view():
 
     _render_engine_health()
 
-    # ------------------------------------------------------------------
     # 생성은 버튼을 눌렀을 때만. 결과는 세션에 남깁니다.
-    # ------------------------------------------------------------------
     if generate_btn:
         with st.spinner("⚡ 8개 영역 시장 데이터 병렬 수집 및 AI 심층 추론 중..."):
             st.session_state[_RESULT_KEY] = _generate_report(
@@ -815,10 +811,8 @@ def render_ai_report_view():
                 include_recent_cot_history=include_recent_cot_history,
             )
 
-    # ------------------------------------------------------------------
     # 렌더링은 버튼과 **무관하게** 실행됩니다. 이래야 자동 새로고침이
     # 스크립트를 다시 돌려도 리포트가 사라지지 않습니다.
-    # ------------------------------------------------------------------
     result = st.session_state.get(_RESULT_KEY)
     if not result:
         st.markdown("---")

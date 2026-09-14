@@ -42,6 +42,8 @@ def render_ai_test_view():
     # 1. 모델 선택 및 세부 사양 표시
     c1, c2 = st.columns([2, 1])
     with c1:
+        # 여기는 진단 화면이므로 **죽은 엔진도 포함해** 전부 보여 줍니다.
+        # 무엇이 왜 응답하지 않는지 확인하는 것이 이 화면의 목적입니다.
         selected_api = st.selectbox(
             "테스트할 AI 분석 모델 선택",
             options=get_ai_engine_options(include_auto=True),

@@ -810,7 +810,7 @@ def render_krx_cot_view():
     with col_ai1:
         selected_engine = st.selectbox(
             "AI 엔진 선택",
-            options=get_ai_engine_options(include_auto=True),
+            options=get_ai_engine_options(include_auto=True, only_available=True),
             format_func=format_ai_engine,
             index=0,
             key="krx_cot_ai_engine",
@@ -856,4 +856,5 @@ conclusion section.
                 if ok:
                     st.markdown(body)
                 else:
-                    st.error(f"AI 해설을 생성하지 못했습니다.\n\n```\n{body}\n```")
+                    st.error("AI 해설을 생성하지 못했습니다.")
+                    st.code(body, language="text")

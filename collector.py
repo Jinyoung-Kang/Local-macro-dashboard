@@ -313,20 +313,10 @@ def _task_fred_series() -> str:
         *ADVANCED_SERIES_IDS,
     ]
 
-    # [성능] 예전에는 시리즈를 하나씩 순서대로 받았습니다. 12개 시리즈가
-    # 전부 같은 호스트(api.stlouisfed.org)를 향하는 순수 I/O 대기인데,
-    # 왕복 시간이 그대로 12배로 누적됐습니다. 동시에 받으면 전체 소요가
-    # 가장 느린 한 건 수준으로 줄어듭니다.
-    #
-    # 이건 이 저장소에서 새로 꺼내는 방식이 아닙니다. 심화 지표 수집
-    # (services/advanced_macro_service.py의 collect_advanced_macro)이 이미
-    # 같은 FRED 시리즈를 같은 방식으로 병렬 수집하고 있습니다.
-    #
-    # 저장(put_frame/put_timeseries)은 워커 안에서 하지 않고 메인 스레드로
-    # 모읍니다. SQLite는 동시 쓰기를 잠금으로 직렬화하므로, 워커에서
-    # 각자 쓰면 서로를 기다리며 병렬 이득을 깎아먹습니다.
-    # [(series_id, DataFrame)] — 수집에 성공한 것만 모읍니다.
-    fetched = []
+    # 전부 같은 호스트를 향하는 순수 I/O 대기라 병렬로 받습니다.
+    # 저장은 워커가 아니라 메인 스레드에서 합니다 — SQLite는 동시 쓰기를
+    # 잠금으로 직렬화하므로, 워커마다 쓰면 서로를 기다려 이득이 깎입니다.
+    fetched = []          # [(series_id, DataFrame)] 수집 성공분만
 
     with ThreadPoolExecutor(max_workers=min(len(series_ids), 8)) as executor:
         futures = {
@@ -915,9 +905,8 @@ def run_loop(
         while True:
             now = time_module.monotonic()
 
-            # [수정] 예전에는 weekly를 먼저 돌렸습니다. 그런데 13F(weekly)는
-            # 10분 이상 걸려서, 기동 직후 가장 자주 보는 fast 데이터가
-            # 그만큼 늦게 채워졌습니다. 싼 것부터 처리합니다.
+            # 싼 것부터 처리합니다. 13F(weekly)는 10분 이상 걸려서, 먼저
+            # 돌리면 가장 자주 보는 fast 데이터가 그만큼 늦게 채워집니다.
             for group in ("fast", "slow", "weekly"):
                 if now >= next_run[group]:
                     run_once(group)

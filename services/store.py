@@ -70,9 +70,18 @@ _initialized_paths: set[str] = set()
 
 def get_db_path() -> Path:
     """
-    DB 파일 경로. DASHBOARD_DB 환경변수로 덮어쓸 수 있습니다(테스트용).
+    저장소 파일 경로를 돌려줍니다.
 
-    기본값은 프로젝트 루트의 data/dashboard.db 입니다.
+    파라미터:
+        없음.
+
+    반환값:
+        DB 파일 경로(Path). 기본값은 프로젝트 루트의 data/dashboard.db.
+
+    주의사항:
+        DASHBOARD_DB 환경변수로 덮어쓸 수 있습니다(테스트용). WAL 모드라
+        실제로는 .db / .db-wal / .db-shm 세 파일이 생기므로, 백업·이동
+        시 셋을 함께 옮기세요.
     """
     override = os.environ.get("DASHBOARD_DB", "").strip()
     if override:
@@ -83,7 +92,23 @@ def get_db_path() -> Path:
 
 
 def get_read_mode() -> str:
-    """DASHBOARD_READ_MODE 환경변수로 결정되는 읽기 모드."""
+    """
+    현재 읽기 모드를 돌려줍니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        "auto" | "store_only" | "live_only" 중 하나.
+          auto       : 신선하면 저장본, 아니면 수집 후 저장 (기본)
+          store_only : 저장본만. 화면이 절대 외부를 기다리지 않음
+          live_only  : 저장 계층 무시. collector.py가 이 모드로 돕니다
+
+    주의사항:
+        알 수 없는 값이 오면 경고만 남기고 "auto"로 처리합니다. 오타 때문에
+        앱이 뜨지 않는 것보다 낫지만, 의도한 모드가 아닐 수 있으니 로그를
+        확인하세요.
+    """
     mode = os.environ.get("DASHBOARD_READ_MODE", READ_MODE_AUTO).strip().lower()
     if mode not in _VALID_READ_MODES:
         logger.warning(
@@ -168,7 +193,20 @@ _MIGRATIONS = [
 
 
 def _apply_migrations(conn) -> None:
-    """없는 컬럼만 추가합니다 (멱등)."""
+    """
+    스키마에 나중에 추가된 컬럼을 보강합니다.
+
+    파라미터:
+        conn : 열려 있는 sqlite3 커넥션.
+
+    반환값:
+        없음.
+
+    주의사항:
+        CREATE TABLE IF NOT EXISTS는 **이미 있는 테이블에 컬럼을 더해
+        주지 않습니다.** 그래서 기존 사용자의 DB를 위해 ALTER TABLE로
+        따로 보강합니다. 여러 번 실행해도 안전합니다.
+    """
     for table, column, coltype in _MIGRATIONS:
         existing = {
             r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -303,15 +341,55 @@ class Snapshot:
 
     @property
     def age_seconds(self) -> float:
+        """
+        이 저장본이 수집된 지 몇 초 지났는지.
+
+        파라미터:
+            없음.
+
+        반환값:
+            경과 초(float). 수집 시각을 모르면 **무한대**입니다.
+
+        주의사항:
+            무한대를 돌려주는 것은 의도적입니다. 어떤 신선도 기준과
+            비교해도 "오래됨"으로 판정되어, 시각을 모르는 저장본을
+            신선한 것처럼 쓰는 사고를 막습니다.
+        """
         if self.collected_at is None:
             return float("inf")
         delta = datetime.now(timezone.utc) - self.collected_at
         return max(0.0, delta.total_seconds())
 
     def is_fresh(self, max_age_seconds: float) -> bool:
+        """
+        주어진 기준 안에 수집된 저장본인지.
+
+        파라미터:
+            max_age_seconds : 신선하다고 볼 최대 나이(초).
+                              services/datasets.py의 MAX_AGE_* 를 쓰세요.
+
+        반환값:
+            bool.
+
+        주의사항:
+            수집 시각을 모르면 항상 False입니다(age_seconds 참고).
+        """
         return self.age_seconds <= max_age_seconds
 
     def collected_at_kst_str(self) -> str:
+        """
+        수집 시각을 화면에 쓸 KST 문자열로.
+
+        파라미터:
+            없음.
+
+        반환값:
+            "YYYY-MM-DD HH:MM:SS KST" 문자열. 시각을 모르면 "알 수 없음".
+
+        주의사항:
+            화면은 이 값을 **반드시** 함께 보여 줘야 합니다. 오래된 값을
+            최신처럼 보여주는 것이 수집/표시 분리 구조의 가장 큰 위험입니다.
+        """
         if self.collected_at is None:
             return "알 수 없음"
         from zoneinfo import ZoneInfo
@@ -805,8 +883,24 @@ def read_timeseries(
     db_path: Path | None = None,
 ) -> pd.DataFrame:
     """
-    누적된 시계열을 DatetimeIndex DataFrame으로 반환합니다.
-    값 컬럼명은 value_name(기본: series_id)입니다.
+    누적된 시계열을 DataFrame으로 읽습니다.
+
+    파라미터:
+        dataset    : 데이터셋 이름.
+        series_id  : 시리즈 식별자.
+        start_date : "YYYY-MM-DD". 주면 그 날짜 이후만.
+        value_name : 값 컬럼의 이름. None이면 series_id를 씁니다.
+        db_path    : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        DatetimeIndex를 가진 DataFrame. 데이터가 없거나 조회에 실패하면
+        **빈 DataFrame**입니다(None이 아닙니다).
+
+    주의사항:
+        - 값이 NULL인 행은 버립니다(dropna). 행 수가 기대와 다르면
+          이것을 먼저 의심하세요.
+        - 조회 실패도 빈 DataFrame이라 "데이터 없음"과 구분되지 않습니다.
+          구분이 필요하면 로그를 보세요.
     """
     sql = (
         "SELECT obs_date, value FROM timeseries "
@@ -899,10 +993,24 @@ def put_observations(
     db_path: Path | None = None,
 ) -> int:
     """
-    (dataset, 날짜, entity) 단위로 레코드를 upsert 합니다.
+    날짜별 레코드를 (dataset, 날짜, entity) 단위로 upsert 합니다.
 
-    Naver/Daum 수급 랭킹은 "현재 시점"만 제공하고 과거 조회가 불가능하므로,
-    수집할 때마다 날짜별로 적재해 이력을 직접 만듭니다.
+    파라미터:
+        dataset    : 데이터셋 이름.
+        obs_date   : "YYYY-MM-DD" 관측 날짜.
+        records    : 레코드 dict의 리스트.
+        entity_key : 각 레코드에서 종목 식별자로 쓸 키 이름.
+        db_path    : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        반영한 행 수(int). entity_key가 없는 레코드는 건너뛰므로
+        len(records)보다 작을 수 있습니다.
+
+    주의사항:
+        **이 테이블이 곧 백업입니다.** Naver·Daum 수급 랭킹은 "현재
+        시점"만 제공하고 과거 조회가 불가능합니다. 수집기가 도는 동안
+        여기에 쌓이는 것이 외부에서 다시 받을 수 없는 유일한 이력이므로,
+        data/dashboard.db는 백업할 가치가 있습니다.
     """
     if not records:
         return 0
@@ -946,8 +1054,21 @@ def read_observations(
     db_path: Path | None = None,
 ) -> pd.DataFrame:
     """
-    누적된 날짜별 레코드를 DataFrame으로 반환합니다.
-    obs_date를 주면 그 날짜만, start_date를 주면 그 이후 전체를 반환합니다.
+    누적된 날짜별 레코드를 DataFrame으로 읽습니다.
+
+    파라미터:
+        dataset    : 데이터셋 이름.
+        obs_date   : 특정 날짜만 읽을 때.
+        start_date : 그 날짜 이후 전체를 읽을 때.
+        db_path    : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        레코드를 행으로 펼친 DataFrame. 없으면 빈 DataFrame.
+        각 행에 "수집일자" 컬럼이 채워집니다.
+
+    주의사항:
+        JSON으로 되읽으므로 저장 당시의 dtype이 보존되지 않습니다.
+        종목코드처럼 앞자리 0이 중요한 값은 문자열인지 확인하세요.
     """
     sql = "SELECT obs_date, payload FROM observations WHERE dataset = ?"
     params: list[Any] = [dataset]
@@ -982,7 +1103,20 @@ def read_observations(
 
 
 def list_observation_dates(dataset: str, db_path: Path | None = None) -> list[str]:
-    """해당 dataset에 이력이 쌓인 날짜 목록(오름차순)."""
+    """
+    이력이 쌓인 날짜 목록을 돌려줍니다.
+
+    파라미터:
+        dataset : 데이터셋 이름.
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        "YYYY-MM-DD" 문자열의 오름차순 리스트. 없으면 빈 리스트.
+
+    주의사항:
+        거래일만 들어 있지 않습니다. 수집기가 돈 날만 쌓이므로, 수집기를
+        꺼 둔 날은 빠져 있습니다.
+    """
     try:
         with connect(db_path, readonly=True) as conn:
             rows = conn.execute(
@@ -1217,7 +1351,23 @@ def read_last_run(db_path: Path | None = None) -> dict | None:
 
 
 def store_stats(db_path: Path | None = None) -> dict:
-    """상태 화면용 요약 통계."""
+    """
+    저장소 상태 화면용 요약 통계를 모읍니다.
+
+    파라미터:
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        dict. exists / size_bytes / snapshots / timeseries_rows /
+        observation_rows / last_run / last_run_status / task_summary.
+        DB 파일이 없으면 exists=False이고 나머지는 기본값입니다.
+
+    주의사항:
+        - 행 수를 COUNT(*)로 셉니다. 누적이 수백만 행으로 커지면 이
+          화면이 느려집니다. 그때는 purge_older_than()으로 정리하세요.
+        - last_run의 status는 DB에 적힌 값 그대로입니다. 비정상 종료를
+          가려내려면 last_run_status(resolve_run_status 결과)를 보세요.
+    """
     stats: dict[str, Any] = {
         "db_path": str(get_db_path() if db_path is None else db_path),
         "exists": False,
@@ -1291,7 +1441,22 @@ def read_task_history(
     limit: int = 50,
     db_path: Path | None = None,
 ) -> list[dict]:
-    """태스크 실행 이력(최신순). task를 주면 그 태스크만."""
+    """
+    태스크 실행 이력을 최신순으로 읽습니다.
+
+    파라미터:
+        task    : 태스크 이름. None이면 전체.
+        limit   : 최대 행 수.
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        실행 기록 dict의 리스트(최신순). 없거나 실패하면 빈 리스트.
+
+    주의사항:
+        `python collector.py --history <태스크>` 가 이 함수를 씁니다.
+        터미널을 닫으면 사라지는 로그와 달리 여기에는 남으므로, 간헐적
+        실패를 추적할 때 먼저 보세요.
+    """
     sql = (
         "SELECT run_id, task, speed, status, started_at, duration_ms, detail "
         "FROM collector_task_runs"
@@ -1414,10 +1579,21 @@ def _schema_matches(
     name: str,
 ) -> bool:
     """
-    저장된 DataFrame이 화면이 기대하는 컬럼을 갖고 있는지 확인합니다.
+    저장본이 화면이 기대하는 컬럼을 갖고 있는지 확인합니다.
 
-    DataFrame이 아니거나 요구 컬럼이 없으면 검사를 통과시킵니다
-    (스냅샷 종류마다 형태가 달라 일괄 검증이 불가능합니다).
+    파라미터:
+        payload          : 저장본에서 읽은 값.
+        required_columns : 반드시 있어야 할 컬럼들. None이면 검사 생략.
+        name             : 경고 로그에 쓸 스냅샷 이름.
+
+    반환값:
+        bool. False면 저장본을 버리고 다시 수집해야 합니다.
+
+    주의사항:
+        DataFrame이 아니면 **통과시킵니다.** 스냅샷 종류마다 형태가 달라
+        일괄 검증이 불가능하기 때문입니다. 이 검사는 예전 버전이 저장해 둔
+        컬럼 구성이 다른 DataFrame이 화면에 넘어가 KeyError로 페이지를
+        죽이는 것을 막는 용도입니다.
     """
     if required_columns is None or not isinstance(payload, pd.DataFrame):
         return True
@@ -1433,31 +1609,34 @@ def _schema_matches(
 
 
 # ==============================================================================
-# 수동 새로고침 (화면의 "새로고침" 버튼)
+# 수동 새로고침
 # ==============================================================================
-# [버그 수정] 화면의 새로고침 버튼은 st.cache_data.clear()만 했습니다. 그건
-# Streamlit의 메모리 캐시만 비울 뿐이고, 그 다음 조회는 다시 cached_or_live로
-# 들어와 **아직 신선한 SQLite 저장본**을 그대로 돌려줬습니다. 결과적으로
-# 버튼을 눌러도 화면의 숫자가 하나도 바뀌지 않았습니다(사용자 신고).
-#
-# 저장본을 지우는 방식은 쓰지 않습니다. 수집이 실패하면 보여 줄 값이 아예
-# 없어지기 때문입니다. 대신 "이 시각 이전에 수집된 저장본은 낡은 것으로
-# 본다"는 기준 시각을 하나 들고, 그보다 오래된 저장본만 다시 수집합니다.
+# 저장본을 **지우지 않고** 기준 시각 하나를 듭니다. "이 시각 이전에 수집된
+# 저장본은 낡은 것으로 본다"는 뜻입니다. 지워 버리면 재수집이 실패했을 때
+# 보여 줄 값이 아예 없어집니다.
 _refresh_token: float = 0.0
 
-# 한 번의 새로고침에서 이미 수집을 시도한 스냅샷. 수집이 실패하면 저장본의
-# 수집 시각이 그대로 남아, 이후 모든 rerun마다 실패하는 외부 호출을 반복하게
-# 됩니다(화면이 계속 느려짐). 새로고침 1회당 1번만 시도합니다.
+# 한 번의 새로고침에서 이미 시도한 스냅샷. 실패한 소스를 rerun마다 다시
+# 부르면 화면이 계속 느려지므로, 새로고침 1회당 1번만 시도합니다.
 _refresh_attempted: dict[str, float] = {}
 
 
 def request_refresh() -> None:
     """
-    다음 조회에서 저장본의 신선도를 무시하고 다시 수집하게 합니다.
+    다음 조회에서 저장본을 낡은 것으로 보고 다시 수집하게 합니다.
 
-    화면의 새로고침 버튼이 st.cache_data.clear()와 함께 호출합니다.
-    store_only 모드에서는 외부를 호출하지 않는다는 약속이 우선이므로
-    아무 효과가 없습니다(저장본 재조회만 일어납니다).
+    파라미터:
+        없음.
+
+    반환값:
+        없음. 모듈 전역의 기준 시각만 바꿉니다.
+
+    주의사항:
+        - 화면의 새로고침 버튼은 이것과 st.cache_data.clear()를 **함께**
+          불러야 합니다. 캐시만 비우면 아직 신선한 저장본이 그대로
+          반환돼 화면이 바뀌지 않습니다.
+        - store_only 모드에서는 효과가 없습니다. "화면이 절대 외부를
+          기다리지 않는다"는 약속이 우선이라 저장본 재조회만 일어납니다.
     """
     global _refresh_token
     _refresh_token = time.time()
@@ -1465,12 +1644,37 @@ def request_refresh() -> None:
 
 
 def refresh_requested_at() -> float:
-    """마지막 수동 새로고침 요청 시각(epoch). 요청이 없었으면 0.0."""
+    """
+    마지막 새로고침 요청 시각.
+
+    파라미터:
+        없음.
+
+    반환값:
+        epoch 초(float). 요청이 없었으면 0.0.
+
+    주의사항:
+        프로세스 전역 상태입니다. 앱을 재시작하면 0.0으로 돌아갑니다.
+    """
     return _refresh_token
 
 
 def _superseded_by_refresh(name: str, snap: "Snapshot | None") -> bool:
-    """이 저장본이 수동 새로고침 요청보다 오래됐는지."""
+    """
+    이 저장본이 새로고침 요청보다 먼저 수집된 것인지 판정합니다.
+
+    파라미터:
+        name : 스냅샷 이름.
+        snap : 읽어 둔 Snapshot 또는 None.
+
+    반환값:
+        bool. True면 다시 수집해야 합니다.
+
+    주의사항:
+        같은 이름을 **새로고침 1회당 한 번만** True로 봅니다. 수집이
+        실패하면 저장본의 시각이 그대로 남아, 이후 모든 rerun에서
+        실패하는 외부 호출을 반복하게 되기 때문입니다.
+    """
     if not _refresh_token:
         return False
     if _refresh_attempted.get(name) == _refresh_token:
@@ -1555,10 +1759,8 @@ def cached_or_live(
     )
 
     if mode == READ_MODE_STORE_ONLY:
-        # [버그 수정] 예전에는 저장본이 '오래됐을 때' 여기를 그냥 통과해
-        # live_fn()을 불렀습니다. store_only의 약속은 "화면이 절대 외부를
-        # 기다리지 않는다"이므로, 오래됐더라도 있는 저장본을 그대로 주고
-        # 없으면 빈 값을 줍니다. 갱신은 수집기의 몫입니다.
+        # store_only의 약속은 "화면이 절대 외부를 기다리지 않는다"입니다.
+        # 오래됐더라도 있는 저장본을 그대로 주고, 없으면 빈 값을 줍니다.
         return snap.payload if snap_ok else empty_value
 
     forced = _superseded_by_refresh(name, snap)
@@ -1567,8 +1769,7 @@ def cached_or_live(
         return snap.payload
 
     if _refresh_token:
-        # 수집 성공/실패와 무관하게 "이번 새로고침에서 시도했음"을 남깁니다.
-        # 실패한 소스를 매 rerun마다 다시 호출하면 화면이 계속 느려집니다.
+        # 성공·실패와 무관하게 "이번 새로고침에서 시도했음"을 남깁니다.
         _refresh_attempted[name] = _refresh_token
 
     try:
@@ -1598,7 +1799,19 @@ def cached_or_live(
 
 
 def is_empty_result(value: Any) -> bool:
-    """수집 결과가 '비어 있음'인지 판정합니다."""
+    """
+    수집 결과가 "비어 있음"인지 판정합니다.
+
+    파라미터:
+        value : 수집 함수가 돌려준 값.
+
+    반환값:
+        bool. None·빈 DataFrame·빈 컨테이너면 True.
+
+    주의사항:
+        숫자 0과 False는 **비어 있지 않은 것**으로 봅니다. 0도 유효한
+        관측값이기 때문입니다.
+    """
     if value is None:
         return True
     if isinstance(value, pd.DataFrame):

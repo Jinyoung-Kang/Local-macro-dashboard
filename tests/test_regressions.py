@@ -1150,3 +1150,110 @@ def test_context_size_is_estimated_for_the_warning():
     assert estimate_prompt_tokens(None) == 0
     assert estimate_prompt_tokens("가" * 1000) == 500
     assert LARGE_CONTEXT_TOKENS > 0
+
+
+def test_report_selector_only_offers_working_engines():
+    """
+    [회귀] 서비스가 끝났거나 이 계정에서 404인 엔진이 리포트 화면의
+    드롭다운에 그대로 있었다. 고르고, 기다리고, 실패하는 일이 반복된다.
+    진단 화면(ai_test_view)은 반대로 전부 보여야 한다 — 무엇이 왜
+    응답하지 않는지 확인하는 곳이기 때문이다.
+    """
+    import ast
+    import pathlib
+
+    def _selector_calls(path):
+        tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+        found = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "get_ai_engine_options"
+            ):
+                kwargs = {k.arg: getattr(k.value, "value", None) for k in node.keywords}
+                found.append(kwargs)
+        return found
+
+    for path in ("views/ai_report_view.py", "views/krx_cot_view.py"):
+        calls = _selector_calls(path)
+        assert calls, f"{path}: 엔진 목록 호출을 찾지 못했습니다"
+        for kwargs in calls:
+            assert kwargs.get("only_available") is True, (
+                f"{path}: 쓸 수 없는 엔진까지 고를 수 있습니다"
+            )
+
+    # 진단 화면은 전부 보여 준다.
+    for kwargs in _selector_calls("views/ai_test_view.py"):
+        assert kwargs.get("only_available") is not True, (
+            "진단 화면에서 죽은 엔진이 숨겨지면 원인을 확인할 수 없습니다"
+        )
+
+
+# ==============================================================================
+# 15. 모델 출력을 원시 HTML에 넣지 않는다 (XSS)
+# ==============================================================================
+def test_verdict_banner_escapes_model_output():
+    """
+    [보안] 총평 배너는 판단·신뢰도·핵심 근거를 unsafe_allow_html로 그립니다.
+    그 세 값은 **모델이 생성한 문자열**이고, 모델의 입력에는 Naver·Daum·
+    TradingView에서 스크래핑한 내용이 들어갑니다. 즉
+
+        스크래핑 페이지 → Context → 모델 출력 → 사용자 브라우저에서 실행
+
+    경로가 열립니다. 이스케이프 없이 넣으면 모델이 뱉은 <script> 한 줄이
+    실제로 동작합니다.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    banner = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_render_verdict_banner"
+    )
+
+    escaped = {
+        node.args[0].id
+        for node in ast.walk(banner)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "escape"
+        and node.args
+        and isinstance(node.args[0], ast.Name)
+    }
+    assert {"judgement", "confidence", "rationale"} <= escaped, (
+        f"이스케이프되지 않은 모델 출력이 있습니다 (현재: {escaped})"
+    )
+
+    # f-string 안에 날것의 변수가 남아 있으면 안 된다.
+    for raw in ("{judgement}", "{rationale}", "{confidence}"):
+        assert raw not in source, f"원시 모델 출력이 HTML에 그대로 있습니다: {raw}"
+
+
+def test_html_escaping_neutralises_a_malicious_verdict():
+    """실제로 악성 문자열이 무력화되는지 확인한다."""
+    import html
+
+    from services.ai_service import parse_report_sections
+
+    evil = (
+        "### 총평\n"
+        '- **판단**: 위험선호<img src=x onerror="alert(1)">\n'
+        "- **신뢰도**: 보통\n"
+        "- **핵심 근거**: <script>alert(2)</script>정상 문장\n\n"
+        "### 거시 국면\n본문\n"
+    )
+    verdict = parse_report_sections(evil)["verdict"]
+
+    # 파서는 원문을 그대로 돌려준다 (가공하지 않는다).
+    assert "<img" in verdict["판단"]
+
+    # 화면에 넣기 전 이스케이프하면 실행형 태그가 사라진다.
+    for value in verdict.values():
+        safe = html.escape(value or "")
+        assert "<script>" not in safe
+        assert "<img" not in safe
+    assert "정상 문장" in html.escape(verdict["핵심 근거"])

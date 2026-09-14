@@ -75,6 +75,24 @@ def _build_session(
     backoff_factor: float,
     status_forcelist: tuple[int, ...],
 ) -> requests.Session:
+    """
+    커넥션 풀과 재시도 정책을 갖춘 Session을 만듭니다.
+
+    파라미터:
+        user_agent       : 기본 User-Agent 헤더.
+        total_retries    : 재시도 횟수. 0이면 재시도하지 않습니다.
+        backoff_factor   : 재시도 간 대기 증가 계수.
+        status_forcelist : 재시도할 HTTP 상태코드들.
+
+    반환값:
+        https/http 양쪽에 어댑터가 물린 requests.Session.
+
+    반환한 Session은 호출자가 캐시해 재사용해야 커넥션 풀이 의미가 있습니다.
+
+    주의사항:
+        raise_on_status=False라서 재시도를 모두 소진해도 예외가 아니라
+        **응답 객체**가 돌아옵니다. 호출부는 status_code를 직접 봐야 합니다.
+    """
     session = requests.Session()
     session.headers.update({**_SESSION_DEFAULT_HEADERS, "User-Agent": user_agent})
 
@@ -100,11 +118,23 @@ def _build_session(
 @st.cache_resource(show_spinner=False)
 def get_session() -> requests.Session:
     """
-    일반 웹 스크래핑/공개 API 공용 세션.
+    공개 웹 스크래핑·공개 API용 공용 세션.
 
-    재시도는 2회까지만 둡니다. 대시보드는 "빠르게 실패하고 다른 소스로
-    폴백"하는 구조이므로, 한 소스에서 오래 버티는 것이 전체 응답을 더
-    느리게 만듭니다.
+    파라미터:
+        없음.
+
+    반환값:
+        프로세스당 하나만 만들어지는 requests.Session.
+        일시적 5xx·429에 2회까지 재시도합니다.
+
+    주의사항:
+        - 재시도를 2회로 묶은 이유는 이 대시보드가 "빠르게 실패하고 다른
+          소스로 폴백"하는 구조이기 때문입니다. 한 소스에서 오래 버티면
+          전체 응답이 더 느려집니다.
+        - 인증이 필요한 증권사·AI API에는 get_api_session()을 쓰세요.
+          그쪽은 호출부가 상태코드를 직접 해석하므로 재시도가 방해됩니다.
+        - 여러 스레드가 공유합니다. session.headers를 요청 중에 바꾸지
+          말고 per-request headers= 를 쓰세요.
     """
     return _build_session(
         user_agent=DEFAULT_USER_AGENT,
@@ -119,8 +149,16 @@ def get_fred_session() -> requests.Session:
     """
     FRED(stlouisfed.org) 전용 세션.
 
-    FRED는 과거 기본 UA에 403을 반환한 이력이 있어 403도 재시도 대상에
-    포함하고, backoff를 조금 더 길게 둡니다.
+    파라미터:
+        없음.
+
+    반환값:
+        프로세스당 하나만 만들어지는 requests.Session.
+
+    주의사항:
+        **403도 재시도 대상에 넣습니다.** FRED는 기본 User-Agent에 403을
+        돌려준 이력이 있어, 영구 거부가 아니라 일시적 차단일 때가 있습니다.
+        그래서 backoff도 공용 세션보다 길게 잡았습니다.
     """
     return _build_session(
         user_agent=(
@@ -177,9 +215,22 @@ def fetch_text(
     params: dict | None = None,
 ) -> str:
     """
-    GET 후 본문 텍스트를 반환합니다. 4xx/5xx는 예외로 올립니다.
+    GET 요청을 보내고 본문 텍스트를 반환합니다.
 
-    호출자는 예외를 잡아 폴백 소스로 넘어가면 됩니다.
+    파라미터:
+        url     : 요청 주소.
+        session : 쓸 세션. None이면 get_session().
+        timeout : 초 단위 제한 시간.
+        headers : per-request 헤더. HTML이 필요하면 BROWSER_HEADERS를 주세요.
+        params  : 쿼리 문자열 파라미터.
+
+    반환값:
+        응답 본문 문자열.
+
+    주의사항:
+        **4xx/5xx는 예외로 올립니다.** 호출자가 예외를 잡아 다음 폴백
+        소스로 넘어가는 구조를 전제합니다. 상태코드를 직접 보고 싶으면
+        세션의 .get()을 쓰세요.
     """
     sess = session or get_session()
     response = sess.get(url, timeout=timeout, headers=headers, params=params)
@@ -195,7 +246,24 @@ def fetch_json(
     headers: dict | None = None,
     params: dict | None = None,
 ):
-    """GET 후 JSON을 파싱해 반환합니다. 4xx/5xx는 예외로 올립니다."""
+    """
+    GET 요청을 보내고 JSON을 파싱해 반환합니다.
+
+    파라미터:
+        url     : 요청 주소.
+        session : 쓸 세션. None이면 get_session().
+        timeout : 초 단위 제한 시간.
+        headers : per-request 헤더.
+        params  : 쿼리 문자열 파라미터.
+
+    반환값:
+        파싱된 JSON(dict 또는 list).
+
+    주의사항:
+        4xx/5xx는 예외로 올리고, 본문이 JSON이 아니면 ValueError가 납니다.
+        일부 소스는 차단 페이지를 200으로 돌려주므로 그 경우도 여기서
+        터집니다 — 호출부에서 잡아 폴백하세요.
+    """
     sess = session or get_session()
     response = sess.get(url, timeout=timeout, headers=headers, params=params)
     response.raise_for_status()
