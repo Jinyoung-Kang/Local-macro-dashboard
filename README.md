@@ -1,4 +1,4 @@
-# Local Macro Dashboard
+# Local Macro Dashboard - v3
 
 글로벌 매크로 지표·연준 순유동성·섹터 로테이션·CFTC COT·KRX 파생·SEC 13F·
 국내 수급 레이더를 한 화면에서 보는 Streamlit 대시보드입니다.
