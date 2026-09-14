@@ -650,3 +650,155 @@ def test_engine_registry_is_internally_consistent():
         assert engine_id in AI_MODEL_REGISTRY, (
             f"Failover 순서에 등록되지 않은 엔진이 있습니다: {engine_id}"
         )
+
+
+# ==============================================================================
+# 12. 실측(2026-09-14)으로 드러난 죽은 엔진 처리
+# ==============================================================================
+# 사용자 계정으로 엔진 점검을 돌린 실제 결과:
+#   ✅ nvidia/nemotron-3-super-120b-a12b            1,650ms
+#   ⛔ openai/gpt-oss-120b                          HTTP 410 (2026-09-03 종료)
+#   ✅ openai/gpt-oss-20b                           1,200ms
+#   ⛔ meta/llama-3.3-70b-instruct                  HTTP 410 (2026-08-26 종료)
+#   ✅ @cf/deepseek-ai/deepseek-r1-distill-qwen-32b 2,940ms
+#   ✅ @cf/meta/llama-3.3-70b-instruct-fp8-fast       600ms
+#   🟥 llama-3.3-70b (Cerebras)                     HTTP 404
+_NVIDIA_EOL_410 = (
+    'HTTP 410: {"type":"about:blank","title":"Gone","status":410,'
+    '"detail":"The model \'openai/gpt-oss-120b\' has reached its end of life '
+    'on 2026-09-03T08:00:00Z and is"}'
+)
+
+
+def test_end_of_life_is_not_lumped_in_with_generic_errors():
+    """
+    [회귀] NVIDIA는 종료된 모델에 HTTP 410 + "end of life"를 준다. 그런데
+    판정 함수가 404와 "model + not found" 류만 봤기 때문에, 확정적으로
+    죽은 모델이 망 오류·타임아웃과 같은 '일반 오류' 칸으로 떨어졌다.
+    조치가 전혀 다르므로(410은 대체 모델로 갈아타는 수밖에 없다) 반드시
+    구분해야 한다.
+    """
+    from services.ai_service import (
+        _looks_like_end_of_life,
+        _looks_like_unknown_model,
+    )
+
+    assert _looks_like_end_of_life(_NVIDIA_EOL_410) is True
+
+    # 404(모델 모름)와 망 오류는 EOL이 아니다.
+    assert _looks_like_end_of_life("HTTP 404: model_not_found") is False
+    assert _looks_like_end_of_life("Connection timed out") is False
+    assert _looks_like_end_of_life("") is False
+
+    # 반대로 Cerebras의 404는 EOL이 아니라 bad_model이어야 한다.
+    cerebras_404 = (
+        'HTTP 404: {"message":"Model does not exist or you do not have '
+        'access to it.","type":"not_found_error"}'
+    )
+    assert _looks_like_end_of_life(cerebras_404) is False
+    assert _looks_like_unknown_model(cerebras_404) is True
+
+
+def test_provider_error_is_not_truncated_before_the_useful_part():
+    """
+    [회귀] 오류 본문을 200자에서 잘랐다. NVIDIA의 410 응답은 그 뒤에
+    **대체 모델 이름**을 알려주는데, 실측 결과가 정확히
+    "...end of life on 2026-09-03T08:00:00Z and is" 에서 끊겨 있었다.
+    가장 쓸모 있는 정보를 버린 셈이다.
+    """
+    from services.ai_service import PROVIDER_ERROR_CHARS
+
+    assert PROVIDER_ERROR_CHARS >= 500, (
+        "제공자가 대체 모델을 안내하는 문장이 잘려 나갑니다"
+    )
+
+    # 화면도 상세를 자르면 안 된다.
+    import pathlib
+
+    view = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+    assert 'item["detail"][:' not in view, (
+        "점검 표에서 제공자 메시지를 다시 자르고 있습니다"
+    )
+
+
+def test_auto_failover_never_includes_a_dead_engine():
+    """
+    [회귀] AUTO_FAILOVER_ORDER에 gpt_oss_120b(410)와 cerebras_llama(404)가
+    2·4번째로 들어 있었다. 첫 엔진이 실패하면 **반드시 실패하는 호출을 두 번
+    더** 하고서야 살아 있는 엔진에 닿았다(실측 270ms + 370ms 낭비).
+    """
+    from services.ai_service import AUTO_FAILOVER_ORDER, get_unavailable_engines
+
+    dead = set(get_unavailable_engines())
+    in_chain = [e for e in AUTO_FAILOVER_ORDER if e in dead]
+
+    assert not in_chain, (
+        f"자동 탐색 순서에 쓸 수 없는 엔진이 있습니다: {in_chain}"
+    )
+    assert AUTO_FAILOVER_ORDER, "폴백 순서가 비었습니다"
+
+
+def test_dead_engines_are_recorded_with_a_reason_not_deleted():
+    """
+    죽은 엔진을 목록에서 조용히 지우면 "왜 없어졌지"를 알 수 없다.
+    남겨 두되 사유를 함께 기록해야 한다.
+    """
+    from services.ai_service import (
+        AI_MODEL_REGISTRY,
+        get_ai_engine_options,
+        get_engine_availability,
+        get_unavailable_engines,
+    )
+
+    unavailable = get_unavailable_engines()
+    assert unavailable, "실측에서 확인된 불가 엔진이 기록돼 있어야 합니다"
+
+    for engine_id, info in unavailable.items():
+        assert engine_id in AI_MODEL_REGISTRY, engine_id
+        assert info["note"], f"{engine_id}: 사유가 비어 있습니다"
+        assert info["availability"] in ("eol", "unverified"), engine_id
+
+        availability, note = get_engine_availability(engine_id)
+        assert availability == info["availability"]
+        assert note == info["note"]
+
+    # 기본 목록에는 남아 있고, 원하면 걸러 낼 수 있어야 한다.
+    assert set(unavailable) <= set(get_ai_engine_options())
+    assert not (set(unavailable) & set(get_ai_engine_options(only_available=True)))
+
+
+def test_long_context_recommendation_only_names_live_engines():
+    """
+    죽은 엔진을 "긴 분석에 권장"으로 안내하면 그 안내가 거짓말이 된다.
+    """
+    import views.ai_report_view as view
+    from services.ai_service import get_unavailable_engines
+
+    dead = set(get_unavailable_engines())
+    assert not (view.LONG_CONTEXT_MODELS & dead), (
+        f"권장 목록에 쓸 수 없는 엔진이 있습니다: "
+        f"{view.LONG_CONTEXT_MODELS & dead}"
+    )
+
+
+def test_probe_reports_eol_state_for_a_410(monkeypatch):
+    """410을 받은 엔진은 점검 표에서 '서비스 종료'로 나와야 한다."""
+    import services.ai_service as ai
+
+    monkeypatch.setattr(
+        ai, "get_configured_providers",
+        lambda: {"nvidia": True, "cloudflare": True, "cerebras": True},
+    )
+    monkeypatch.setattr(
+        ai, "_probe_call",
+        lambda engine_id, config: {
+            "status": False, "response": "", "error": _NVIDIA_EOL_410,
+            "latency_ms": 270,
+        },
+    )
+
+    result = ai.probe_engine("nvidia_gpt_oss_120b")
+
+    assert result["state"] == "eol", result
+    assert result["ok"] is False
+    assert "end of life" in result["detail"]

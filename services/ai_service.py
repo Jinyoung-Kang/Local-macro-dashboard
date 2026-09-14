@@ -35,10 +35,15 @@ AI_MODEL_REGISTRY = {
         "description": "장문 투자 분석 및 구조화된 리포트",
     },
     "nvidia_gpt_oss_120b": {
-        "label": "🟢 NVIDIA — OpenAI GPT-OSS 120B",
+        "label": "⛔ NVIDIA — OpenAI GPT-OSS 120B (2026-09-03 종료)",
         "provider": "nvidia",
         "model": "openai/gpt-oss-120b",
-        "description": "고난도 추론·장문 종합 분석",
+        "description": "NVIDIA가 서비스를 종료한 모델입니다(HTTP 410).",
+        "availability": "eol",
+        "availability_note": (
+            "NVIDIA가 2026-09-03에 서비스를 종료했습니다. 엔진 점검을 다시 "
+            "돌리면 제공자 응답에 대체 모델이 안내될 수 있습니다."
+        ),
     },
     "nvidia_gpt_oss_20b": {
         "label": "🟢 NVIDIA — OpenAI GPT-OSS 20B",
@@ -47,10 +52,16 @@ AI_MODEL_REGISTRY = {
         "description": "비교적 빠른 보조 분석",
     },
     "nvidia_llama_33_70b": {
-        "label": "🟢 NVIDIA — Meta Llama 3.3 70B Instruct (종료 예정)",
+        "label": "⛔ NVIDIA — Meta Llama 3.3 70B Instruct (2026-08-26 종료)",
         "provider": "nvidia",
         "model": "meta/llama-3.3-70b-instruct",
-        "description": "범용 지시 이행·다국어 분석 (NVIDIA API 지원 종료 예정 모델)",
+        "description": "NVIDIA가 서비스를 종료한 모델입니다(HTTP 410).",
+        "availability": "eol",
+        "availability_note": (
+            "NVIDIA가 2026-08-26에 서비스를 종료했습니다. 같은 모델이 "
+            "Cloudflare에는 살아 있으므로 'Cloudflare — Llama 3.3 70B FP8 "
+            "Fast'를 대신 쓰면 됩니다."
+        ),
     },
     "cloudflare_deepseek": {
         "label": "🟠 Cloudflare — DeepSeek-R1 (32B)",
@@ -65,10 +76,19 @@ AI_MODEL_REGISTRY = {
         "description": "장문 매크로·투자 분석용 70B급 고속 모델",
     },
     "cerebras_llama": {
-        "label": "🔵 Cerebras — Llama 3.3 70B",
+        "label": "⚠️ Cerebras — Llama 3.3 70B (응답 없음)",
         "provider": "cerebras",
         "model": "llama-3.3-70b",
-        "description": "초고속 장문 생성",
+        "description": "이 계정에서 404입니다. 모델 ID가 다르거나 권한이 없습니다.",
+        # 404 본문이 "Model does not exist **or you do not have access to
+        # it**" 이라, 모델 ID가 틀린 것인지 계정 권한 문제인지 응답만으로는
+        # 구분할 수 없습니다. 그래서 eol이 아니라 unverified로 둡니다.
+        "availability": "unverified",
+        "availability_note": (
+            "이 계정에서 HTTP 404가 납니다. Cerebras 콘솔에서 사용 가능한 "
+            "모델 ID를 확인해 이 항목의 model 값을 고치거나, 계정에 해당 "
+            "모델 권한을 추가하세요."
+        ),
     },
 }
 
@@ -88,13 +108,27 @@ TRANSLATION_MODELS = {
     },
 }
 
+# 자동 탐색이 시도하는 순서.
+#
+# [성능·정확성] 예전 순서에는 nvidia_gpt_oss_120b(410 종료)와
+# cerebras_llama(404)가 2·4번째로 들어 있었습니다. 첫 엔진이 실패하면
+# **반드시 실패하는 호출을 두 번 더** 하고 나서야 살아 있는 엔진에
+# 닿았습니다(실측 270ms + 370ms 낭비).
+#
+# 2026-09-14 실측 기준으로 응답이 확인된 엔진만, 용도와 지연시간을 보고
+# 배열합니다.
+#   nemotron        1,650ms · 120B — 장문 리포트 품질이 가장 낫습니다
+#   cloudflare_llama   600ms · 70B — 가장 빠른 실용 대안
+#   gpt_oss_20b      1,200ms · 20B — 가볍지만 동작 확인됨
+#   cloudflare_deepseek 2,940ms — 추론형이라 느리고 <think>를 뱉어 마지막
+#
+# 죽은 엔진을 다시 넣지 마세요. get_unavailable_engines()가 근거를 들고
+# 있고, 회귀 테스트가 이 순서에 죽은 엔진이 섞이는 것을 막습니다.
 AUTO_FAILOVER_ORDER = [
     "nvidia_nemotron",
-    "nvidia_gpt_oss_120b",
-    "nvidia_gpt_oss_20b",
-    "cerebras_llama",
-    "cloudflare_deepseek",
     "cloudflare_llama",
+    "nvidia_gpt_oss_20b",
+    "cloudflare_deepseek",
 ]
 
 NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -103,12 +137,101 @@ NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 # max_tokens를 올리세요(모델의 컨텍스트 한도를 넘기면 400이 납니다).
 DEFAULT_MAX_TOKENS = 4096
 
+# 제공자 오류 본문을 몇 글자까지 싣을지.
+#
+# [버그 수정] 200자였습니다. 그런데 NVIDIA의 서비스 종료(410) 응답은
+#
+#   {"type":"about:blank","title":"Gone","status":410,
+#    "detail":"The model 'openai/gpt-oss-120b' has reached its end of life
+#              on 2026-09-03T08:00:00Z and is no longer available. ..."}
+#
+# 형태라, 200자에서 자르면 **대체 모델을 알려주는 바로 그 부분**이 날아갑니다.
+# 실제 점검 결과가 "...end of life on 2026-09-03T08:00:00Z and is" 에서
+# 끊겨 있었습니다. 가장 쓸모 있는 정보를 버린 셈입니다.
+PROVIDER_ERROR_CHARS = 600
 
-def get_ai_engine_options(include_auto: bool = True) -> list[str]:
-    """등록된 모든 AI 분석 엔진 ID 리스트 반환 (번역 전용 모델 제외)"""
+
+def get_engine_availability(engine_id: str) -> tuple[str, str]:
+    """
+    엔진이 현재 쓸 수 있는 상태인지, 아니라면 왜인지 돌려줍니다.
+
+    파라미터:
+        engine_id : AI_MODEL_REGISTRY의 키.
+
+    반환값:
+        (availability, note) 튜플.
+          availability: "ok"(정상) | "eol"(서비스 종료) | "unverified"(응답 없음)
+          note        : 사람이 읽을 설명. "ok"이면 빈 문자열.
+
+    주의사항:
+        - 이 값은 **레지스트리에 적어 둔 실측 결과**입니다. 실시간 조회가
+          아니므로, 제공자가 모델을 되살리거나 새로 종료하면 어긋납니다.
+          최신 상태는 화면의 "엔진 점검"(probe_engine)으로 확인하세요.
+        - "unverified"는 "죽었다"가 아니라 "이 계정에서는 응답하지
+          않았다"는 뜻입니다. 계정 권한 문제일 수 있어 선택 자체를 막지는
+          않습니다.
+    """
+    config = AI_MODEL_REGISTRY.get(engine_id, {})
+    return config.get("availability", "ok"), config.get("availability_note", "")
+
+
+def get_unavailable_engines() -> dict:
+    """
+    쓸 수 없는 것으로 기록된 엔진과 그 사유를 모아 돌려줍니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        {engine_id: {"label", "model", "availability", "note"}} 형태의 dict.
+        전부 정상이면 빈 dict.
+
+    주의사항:
+        화면이 경고를 띄우거나 기본 선택을 피하는 데 씁니다. 회귀 테스트도
+        이 목록을 근거로 AUTO_FAILOVER_ORDER에 죽은 엔진이 섞이지 않았는지
+        검사합니다.
+    """
+    out = {}
+    for engine_id, config in AI_MODEL_REGISTRY.items():
+        availability = config.get("availability", "ok")
+        if availability != "ok":
+            out[engine_id] = {
+                "label": config["label"],
+                "model": config["model"],
+                "availability": availability,
+                "note": config.get("availability_note", ""),
+            }
+    return out
+
+
+def get_ai_engine_options(include_auto: bool = True, only_available: bool = False) -> list[str]:
+    """
+    선택 가능한 AI 분석 엔진 ID 목록 (번역 전용 모델 제외).
+
+    파라미터:
+        include_auto   : "auto"(자동 탐색)를 포함할지 여부.
+        only_available : True면 서비스 종료·응답 없음으로 기록된 엔진을
+                         제외합니다.
+
+    반환값:
+        엔진 ID 문자열 리스트. 화면 selectbox의 options로 그대로 씁니다.
+
+    주의사항:
+        기본값(only_available=False)은 죽은 엔진도 **보여 줍니다.** 목록에서
+        조용히 사라지면 "왜 없어졌지"를 알 수 없기 때문입니다. 대신 레이블에
+        ⛔/⚠️와 종료일이 붙고, 고르면 화면이 경고합니다.
+    """
     engine_ids = list(AI_MODEL_REGISTRY.keys())
+
     if not include_auto and "auto" in engine_ids:
         engine_ids.remove("auto")
+
+    if only_available:
+        engine_ids = [
+            e for e in engine_ids
+            if AI_MODEL_REGISTRY[e].get("availability", "ok") == "ok"
+        ]
+
     return engine_ids
 
 
@@ -531,7 +654,7 @@ def _call_openai_format(
                 "latency_ms": elapsed_ms, "latency": elapsed_sec
             }
         return {
-            "status": False, "response": "", "error": f"HTTP {res.status_code}: {res.text[:200]}",
+            "status": False, "response": "", "error": f"HTTP {res.status_code}: {res.text[:PROVIDER_ERROR_CHARS]}",
             "provider": engine_name, "pipeline_step": f"{engine_name} 실패",
             "latency_ms": elapsed_ms, "latency": elapsed_sec
         }
@@ -598,7 +721,7 @@ def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: s
                 "latency_ms": elapsed_ms, "latency": elapsed_sec
             }
         return {
-            "status": False, "response": "", "error": f"HTTP {res.status_code}: {res.text[:200]}",
+            "status": False, "response": "", "error": f"HTTP {res.status_code}: {res.text[:PROVIDER_ERROR_CHARS]}",
             "provider": f"Cloudflare ({model})", "pipeline_step": "Cloudflare 실패",
             "latency_ms": elapsed_ms, "latency": elapsed_sec
         }
@@ -757,7 +880,9 @@ def probe_engine(engine_id: str) -> dict:
         state는 다음 중 하나입니다.
           "ok"       : 정상 응답
           "no_key"   : 그 제공자의 키가 설정되지 않음
-          "bad_model": 제공자가 모델을 모른다고 답함(404/400 등)
+          "eol"      : 제공자가 서비스를 종료한 모델(410 / end of life)
+          "bad_model": 제공자가 모델을 모른다고 답함(404 등). ID 오타일
+                       수도, 계정 권한이 없는 것일 수도 있습니다
           "error"    : 그 밖의 실패(인증 거절·망 오류·타임아웃)
 
     주의사항:
@@ -795,6 +920,8 @@ def probe_engine(engine_id: str) -> dict:
     if ok:
         state = "ok"
         detail = "정상 응답"
+    elif _looks_like_end_of_life(detail):
+        state = "eol"
     elif _looks_like_unknown_model(detail):
         state = "bad_model"
     else:
@@ -857,6 +984,36 @@ def _probe_call(engine_id: str, config: dict) -> dict:
     }
 
 
+def _looks_like_end_of_life(error_text: str) -> bool:
+    """
+    오류 문자열이 "이 모델은 서비스가 종료됐다"는 뜻인지 판정합니다.
+
+    파라미터:
+        error_text : 제공자가 준 오류 문자열.
+
+    반환값:
+        bool. 서비스 종료로 보이면 True.
+
+    주의사항:
+        - 실측 사례: NVIDIA는 종료된 모델에 **HTTP 410 Gone**과 함께
+          "The model '...' has reached its end of life on <날짜> and is ..."
+          를 돌려줍니다. 2026-09-14 점검에서 openai/gpt-oss-120b와
+          meta/llama-3.3-70b-instruct가 여기 해당했습니다.
+        - "모델을 모른다"(404)와 **조치가 다릅니다.** 404는 ID 오타나 권한
+          문제일 수 있어 확인이 필요하지만, 410은 확정적으로 죽은 것이라
+          대체 모델로 갈아타는 수밖에 없습니다. 그래서 따로 판정합니다.
+    """
+    if not error_text:
+        return False
+
+    lowered = error_text.lower()
+    return (
+        "http 410" in lowered
+        or "end of life" in lowered
+        or "end-of-life" in lowered
+    )
+
+
 def _looks_like_unknown_model(error_text: str) -> bool:
     """
     오류 문자열이 "모델을 모른다"는 뜻인지 추정합니다.
@@ -868,8 +1025,13 @@ def _looks_like_unknown_model(error_text: str) -> bool:
         bool. 모델 ID 문제로 보이면 True.
 
     주의사항:
-        **추정입니다.** 제공자마다 문구가 달라 오판할 수 있습니다.
-        화면에는 이 판정과 함께 원문(detail)을 반드시 같이 보여 주세요.
+        - **추정입니다.** 제공자마다 문구가 달라 오판할 수 있습니다.
+          화면에는 이 판정과 함께 원문(detail)을 반드시 같이 보여 주세요.
+        - 404 본문이 "Model does not exist **or you do not have access to
+          it**"인 경우가 있습니다(Cerebras 실측). 즉 이 판정이 True라고 해서
+          반드시 ID가 틀린 것은 아니고, 계정 권한 문제일 수도 있습니다.
+        - 서비스 종료(410)는 여기가 아니라 _looks_like_end_of_life()가
+          맡습니다. 조치가 다르기 때문입니다.
     """
     if not error_text:
         return False

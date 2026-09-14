@@ -35,8 +35,10 @@ from services.ai_service import (
     format_ai_engine,
     get_ai_engine_options,
     get_configured_providers,
+    get_engine_availability,
     get_report_system_prompt,
     get_report_types,
+    get_unavailable_engines,
 )
 from services.cot_service import cot_history_to_markdown
 from services.dashboard_snapshot_service import (
@@ -53,16 +55,18 @@ _HEALTH_KEY = "ai_report_engine_health"
 
 # 긴 Context를 감당할 수 있다고 보는 엔진들. 짧은 모델에 COT 상세표까지
 # 넣으면 컨텍스트 한도를 넘겨 400이 납니다.
+# 2026-09-14 실측에서 응답이 확인됐고 긴 Context를 감당하는 엔진.
+# nvidia_gpt_oss_120b(410 종료)와 cerebras_llama(404)는 여기서 뺐습니다 —
+# 죽은 엔진을 "권장"으로 남겨 두면 안내가 거짓말이 됩니다.
 LONG_CONTEXT_MODELS = {
     "nvidia_nemotron",
-    "nvidia_gpt_oss_120b",
     "cloudflare_llama",
-    "cerebras_llama",
 }
 
 _STATE_BADGE = {
     "ok": ("✅", "정상"),
     "no_key": ("⚪", "키 없음"),
+    "eol": ("⛔", "서비스 종료"),
     "bad_model": ("🟥", "모델 ID 문제"),
     "error": ("❌", "오류"),
 }
@@ -348,9 +352,22 @@ def _render_engine_health() -> None:
         for col, (name, ready) in zip(cols, providers.items()):
             col.markdown(f"**{name}**  {'🔑 키 있음' if ready else '⚪ 키 없음'}")
 
+        unavailable = get_unavailable_engines()
+        if unavailable:
+            lines = "\n".join(
+                f"- {'⛔' if v['availability'] == 'eol' else '⚠️'} "
+                f"`{v['model']}` — {v['note']}"
+                for v in unavailable.values()
+            )
+            st.markdown(
+                "**마지막 실측에서 쓸 수 없던 엔진**\n\n" + lines
+            )
+
         st.caption(
             "아래 버튼은 등록된 엔진을 짧은 프롬프트로 한 번씩 호출합니다. "
-            "실제 API 호출이므로 비용이 발생할 수 있습니다."
+            "실제 API 호출이므로 비용이 발생할 수 있습니다. "
+            "제공자가 모델을 되살리거나 새로 종료할 수 있으므로, 위 기록과 "
+            "다를 수 있습니다 — 최신 상태는 이 점검이 정답입니다."
         )
 
         if st.button("엔진 상태 점검 실행", key="run_engine_health"):
@@ -369,17 +386,37 @@ def _render_engine_health() -> None:
                 "엔진": item["label"],
                 "모델 ID": item["model"],
                 "지연(ms)": item["latency_ms"] or "",
-                "상세": item["detail"][:160],
+                # 제공자 메시지를 자르지 않습니다. 종료된 모델의 대체 모델
+                # 이름이 문장 뒤쪽에 오는 경우가 많습니다.
+                "상세": item["detail"],
             })
         st.dataframe(rows, width="stretch", hide_index=True)
+
+        dead = [i for i in health if i["state"] == "eol"]
+        if dead:
+            st.error(
+                "다음 엔진은 제공자가 **서비스를 종료**했습니다. 대체 모델로 "
+                "갈아타야 합니다 — "
+                + ", ".join(f"`{i['model']}`" for i in dead)
+                + "\n\n위 표의 '상세'에 제공자가 안내한 대체 모델이 적혀 "
+                "있을 수 있습니다.",
+                icon="⛔",
+            )
 
         broken = [i for i in health if i["state"] == "bad_model"]
         if broken:
             st.warning(
-                "다음 엔진은 제공자가 모델을 모른다고 답했습니다. "
-                "모델 ID가 바뀌었거나 그 계정에서 서비스되지 않습니다 — "
+                "다음 엔진은 제공자가 모델을 모른다고 답했습니다. 모델 ID가 "
+                "바뀌었거나, **그 계정에 권한이 없을** 수 있습니다 — "
                 + ", ".join(f"`{i['model']}`" for i in broken),
                 icon="🟥",
+            )
+
+        healthy = [i["label"] for i in health if i["state"] == "ok"]
+        if healthy:
+            st.success(
+                f"응답이 확인된 엔진 {len(healthy)}개: " + " · ".join(healthy),
+                icon="✅",
             )
 
 
@@ -449,6 +486,21 @@ def render_ai_report_view():
     with c3:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
         generate_btn = st.button("🚀 리포트 생성", type="primary", width="stretch")
+
+    # 고른 엔진이 죽은 것으로 기록돼 있으면 호출하기 전에 알려 줍니다.
+    # (호출 자체를 막지는 않습니다 — 제공자가 되살렸을 수도 있고, 계정
+    #  권한 문제라면 사용자 쪽에서 해결됐을 수도 있습니다.)
+    availability, note = get_engine_availability(ai_engine)
+    if availability == "eol":
+        st.error(
+            f"이 엔진은 제공자가 서비스를 종료했습니다. {note}",
+            icon="⛔",
+        )
+    elif availability == "unverified":
+        st.warning(
+            f"이 엔진은 마지막 점검에서 응답하지 않았습니다. {note}",
+            icon="⚠️",
+        )
 
     if (
         include_recent_cot_history
