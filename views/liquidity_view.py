@@ -35,6 +35,22 @@ def fetch_overlay_index_data(ticker: str, start_date: str) -> pd.DataFrame:
 
 
 def render_liquidity_view():
+    """
+    연준 순유동성 트래커 화면을 그립니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        없음.
+
+    주의사항:
+        순유동성은 WALCL − WTREGEN − RRP로 계산합니다. 구성 시계열의
+        발표 주기가 서로 달라서 최신 구간이 **추정치**로 채워질 수
+        있습니다. 그 경우 저장 상태가 "estimated"로 표시되고 누적
+        이력에는 넣지 않습니다 — 추정치가 확정치를 덮으면 과거가
+        오염되기 때문입니다.
+    """
 
     st.markdown("""
     <div style="padding: 4px 0 12px 0;">

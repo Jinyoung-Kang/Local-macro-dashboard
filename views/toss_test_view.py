@@ -171,6 +171,19 @@ def _render_result_row(label: str, kind: str, result: dict):
 
 
 def render_toss_test_view():
+    """
+    토스증권 API 연결 진단 화면을 그립니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        없음.
+
+    주의사항:
+        진단 전용 화면입니다. 대시보드의 다른 지표는 이 API를 쓰지
+        않으므로, 여기가 실패해도 나머지 화면은 정상 동작합니다.
+    """
     st.title("🔌 토스증권 API 연결 테스트")
     st.caption(
         "OAuth 2.0 토큰 발급과 실제 데이터 호출까지 "

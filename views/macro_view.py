@@ -78,6 +78,27 @@ def get_us_market_status() -> str:
 
 
 def inject_market_status(name: str) -> str:
+    """
+    지표 이름 뒤에 현재 장 상태(정규장/마감 등)를 붙여 돌려줍니다.
+
+    파라미터:
+        name : config.MACRO_CATEGORIES에 적힌 지표 표시명.
+
+    반환값:
+        상태 문구가 덧붙은 표시명 문자열.
+
+    주의사항:
+        - 판정 기준은 **KST 현재 시각**입니다. 서머타임(미국 DST)은
+          고려하지 않으므로, 3월과 11월 전환 주에는 미국장 상태가 한
+          시간 어긋날 수 있습니다.
+        - 야간·글로벌 선물(KOSPI200 야간선물, 닛케이225 선물, 항셍
+          선물)은 일반 현물 지수와 개장 시간이 달라서, **반드시 현물
+          규칙보다 먼저** 판정해야 합니다. 순서를 바꾸면 야간선물이
+          "마감"으로 잘못 표시됩니다.
+        - 여기서 만드는 것은 **표시 문구일 뿐**입니다. 데이터의 신선도와
+          무관하므로, "정규장"이라고 적혀 있어도 값 자체는 오래된
+          저장본일 수 있습니다.
+    """
     now = datetime.now(ZoneInfo('Asia/Seoul'))
     wd = now.weekday()
     hm = now.hour * 100 + now.minute
@@ -428,6 +449,25 @@ def _render_advanced_macro_section() -> None:
 
 
 def render_macro_view(now_str_kst: str, refresh_interval: int):
+    """
+    거시경제 매크로 지표 화면 전체를 그립니다.
+
+    파라미터:
+        now_str_kst      : 헤더에 표시할 현재 시각 문자열(KST).
+                           app.py가 만들어 넘깁니다.
+        refresh_interval : 사이드바에서 고른 자동 새로고침 주기(초).
+                           안내 문구에만 씁니다.
+
+    반환값:
+        없음. Streamlit 위젯을 그리는 것이 전부입니다.
+
+    주의사항:
+        - 데이터 수집에 실패하면 st.error를 띄우고 **곧바로 return**
+          합니다. 그 아래를 계속 그리면 빈 데이터로 KeyError가 납니다.
+        - 화면이 쓰는 값은 저장본일 수 있습니다. 반드시 수집 시각을
+          함께 보여 주세요 — 오래된 값을 최신처럼 보여주는 것이
+          수집/표시 분리 구조의 가장 큰 위험입니다.
+    """
     try:
         collected_data, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev = get_collected_macro_data()
     except Exception as e:

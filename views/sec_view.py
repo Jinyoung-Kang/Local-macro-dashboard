@@ -20,6 +20,24 @@ from services.prompts import SEC_13F_CONSENSUS_PROMPT
 from services.sec_service import classify_qoq_action, fetch_sec_13f_multi_quarters
 
 def render_sec_view():
+    """
+    기관 13F 포트폴리오 분석 화면을 그립니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        없음.
+
+    주의사항:
+        - 13F는 분기 공시이고 제출 기한이 분기 종료 후 45일입니다.
+          최신 화면이라도 실제 포지션과 시차가 큽니다.
+        - 13F는 **롱 포지션만** 보고 대상입니다. 숏·현금·해외 자산은
+          보이지 않으므로, 이 표만으로 기관의 실제 익스포저를 판단하면
+          안 됩니다.
+        - 종목 식별자(cusip)는 앞자리가 0일 수 있는 문자열입니다.
+          숫자로 바꾸면 조회가 깨집니다.
+    """
     st.title("📑 주요 기관들의 포트폴리오 (13F Holdings & QoQ Analysis)")
     st.caption("SEC EDGAR 공식 공시 데이터 기반 미국 주요 기관 투자자 포트폴리오 분석 & 기간별 비중 추적")
 

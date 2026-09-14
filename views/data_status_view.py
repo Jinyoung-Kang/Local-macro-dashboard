@@ -80,6 +80,24 @@ def render_data_freshness_sidebar() -> None:
 # 본 화면
 # ==============================================================================
 def render_data_status_view() -> None:
+    """
+    데이터 저장소(SQLite) 상태 화면을 그립니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        없음.
+
+    주의사항:
+        - 이 화면은 **수집기가 적재한 결과를 읽기만** 합니다. 여기서
+          무엇을 눌러도 수집이 시작되지 않습니다. 갱신은
+          `python collector.py`의 몫입니다.
+        - "누락된 데이터셋"은 store.missing_datasets()가 기대 목록과
+          실제 저장본을 대조해 만듭니다. 기대 목록은 코드에 적혀
+          있으므로, 수집 대상을 바꾸면 그 목록도 함께 고쳐야 합니다.
+          안 그러면 멀쩡한 상태가 "누락"으로 보입니다.
+    """
     st.title("🗄️ 데이터 저장소 상태")
     st.caption(
         "수집기(collector.py)가 SQLite에 적재한 데이터의 현황입니다. "
@@ -451,6 +469,20 @@ def _render_verification_section() -> None:
 # 헬퍼
 # ==============================================================================
 def _parse(text: str | None) -> datetime | None:
+    """
+    저장된 ISO 시각 문자열을 timezone-aware datetime으로 바꿉니다.
+
+    파라미터:
+        text : ISO 8601 문자열. None이나 빈 문자열도 받습니다.
+
+    반환값:
+        UTC 기준 datetime. 비었거나 형식이 틀리면 None.
+
+    주의사항:
+        타임존이 없는 문자열은 **UTC로 간주합니다.** 저장 계층이 항상
+        UTC로 적기 때문입니다. 다른 곳에서 만든 로컬 시각 문자열을
+        넣으면 시간대만큼 어긋납니다.
+    """
     if not text:
         return None
     try:
@@ -461,6 +493,20 @@ def _parse(text: str | None) -> datetime | None:
 
 
 def _to_kst(text: str | None) -> str | None:
+    """
+    저장된 ISO 시각 문자열을 화면용 KST 문자열로 바꿉니다.
+
+    파라미터:
+        text : ISO 8601 문자열(UTC 기준).
+
+    반환값:
+        "YYYY-MM-DD HH:MM:SS" 형식의 KST 문자열. 못 읽으면 None.
+
+    주의사항:
+        반환 문자열에 "KST"라는 표시가 없습니다. 화면에 쓸 때는
+        시간대를 함께 적어 주세요. 시각만 덩그러니 보여 주면
+        사용자가 UTC로 오해할 수 있습니다.
+    """
     dt = _parse(text)
     if dt is None:
         return None

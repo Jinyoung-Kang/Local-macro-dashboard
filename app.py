@@ -113,6 +113,31 @@ st.markdown("""
 # 1. 간이 인증 (비밀번호 잠금) 시스템
 # ==========================================
 def check_password():
+    """
+    비밀번호 잠금 화면을 그리고, 통과했는지 알려줍니다.
+
+    파라미터:
+        없음. 정답은 config.APP_PASSWORD에서 읽습니다
+        ([auth] password → APP_PASSWORD 환경변수 → 기본값 순).
+
+    반환값:
+        bool. 이미 인증됐거나 방금 통과했으면 True.
+        아직이면 로그인 폼을 그리고 False.
+
+    주의사항:
+        - 이 함수가 False를 주면 호출부는 **반드시 st.stop()** 해야 합니다.
+          Streamlit은 스크립트를 위에서 아래로 다시 실행하므로, 멈추지
+          않으면 로그인 폼 아래의 대시보드가 그대로 그려집니다.
+        - 인증 상태는 st.session_state에만 있습니다. 브라우저 탭마다
+          따로이고 서버를 재시작하면 사라집니다.
+        - **이건 편의용 잠금이지 보안 장치가 아닙니다.** 비밀번호가
+          평문으로 비교되고 시도 횟수 제한도 없습니다. 로컬에서 혼자
+          쓰는 대시보드라는 전제입니다. 외부에 노출할 거라면 앞단에
+          제대로 된 인증을 두세요.
+        - st.secrets를 직접 만지지 않고 config.APP_PASSWORD만 씁니다.
+          secrets.toml이 없는 환경에서 st.secrets에 접근하면 .get()조차
+          예외를 던져 로그인 화면 자체가 죽었던 적이 있습니다.
+    """
     # [버그 수정] 기존 코드는 st.secrets.get("auth", {})를 직접 호출했습니다.
     # st.secrets는 접근 시점에 secrets.toml을 파싱하므로, 파일이 없으면
     # .get()조차 StreamlitSecretNotFoundError를 던집니다. 그 결과 secrets.toml

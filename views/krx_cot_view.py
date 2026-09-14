@@ -44,6 +44,22 @@ def _get_next_krx_publish_info(data_date_str: str, now_kst: datetime) -> str:
 
 
 def render_krx_cot_view():
+    """
+    국내 파생(KRX 선물·미결제약정) 및 투자주체별 수급 화면을 그립니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        없음.
+
+    주의사항:
+        - 투자주체별 수급 단위는 **계약수 하나뿐**입니다. 금액(억원)
+          기준은 Daum이 제공하지 않아 제거됐습니다. 다시 넣으려면
+          금액을 주는 다른 소스를 먼저 확보해야 합니다.
+        - KRX 마감 데이터는 장 종료 후에야 확정됩니다. 장중에 보이는
+          값은 가집계일 수 있습니다.
+    """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     now_str = now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
 

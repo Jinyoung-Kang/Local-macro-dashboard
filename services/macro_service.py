@@ -62,12 +62,35 @@ def _clean_macro_label(text: str) -> str:
 # ==============================================================================
 def collect_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
     """
-    yfinance를 통해 티커 시계열 데이터를 수집합니다.
+    yfinance로 티커 시계열을 수집합니다 (항상 네트워크를 씁니다).
 
-    [수정] 분봉(1m/5m) 수집 성공 여부를 df.attrs["is_intraday"]에 기록합니다.
-    ^TNX/^TYX/2YY=F 같은 심볼은 분봉이 없어 일봉으로 폴백되는데, 일봉의
-    타임스탬프는 신뢰할 수 있는 "시:분:초" 정보가 아니므로 이 플래그로
-    구분해서 화면에서 다르게 표시해야 합니다.
+    파라미터:
+        symbol : Yahoo Finance 심볼. 예) "^GSPC", "KRW=X", "CL=F".
+                 빈 값이면 곧바로 None.
+        period : 조회 기간. "1d"/"5d"는 분봉을, 나머지는 일봉을 뜻합니다.
+
+    반환값:
+        OHLCV DataFrame, 또는 수집 실패 시 None.
+        df.attrs에 다음 표시가 실립니다.
+          is_intraday  : 분봉으로 받았으면 True. 일봉 폴백이면 False.
+          is_proxy     : 실제 지표가 아니라 역산한 추정치면 True.
+          is_synthetic : 네트워크까지 실패해 만든 자리표시용이면 True.
+          source_label : 위 표시를 사람이 읽을 문장으로.
+
+    주의사항:
+        - **period="1d"/"5d"는 최대 3번 왕복합니다.** 1분봉 → 5분봉 →
+          일봉 순으로 폴백하기 때문입니다. ^TNX·^TYX처럼 분봉이 아예
+          없는 심볼은 매번 3번을 다 씁니다. 마지막 두 종가만 필요한
+          호출에서는 이게 큰 낭비입니다.
+        - **^MOVE는 실제 지표가 아닙니다.** Yahoo가 ICE BofA MOVE를
+          제공하지 않아 ^TNX 변동성에서 역산한 추정치이고, 실제 MOVE와
+          수치가 다릅니다. is_proxy 표시를 화면과 AI 리포트까지 반드시
+          전달하세요. "MOVE 140 이상 = 채권 발작" 같은 임계치 해석을
+          이 추정치에 그대로 적용하면 잘못된 판단이 됩니다.
+        - 네트워크까지 실패하면 ^MOVE는 **단순 사인파**를 돌려줍니다.
+          값에 아무 정보가 없으므로 is_synthetic을 반드시 확인하세요.
+        - df.attrs는 대부분의 pandas 연산에서 보존되지 않습니다.
+          슬라이싱·병합 후에는 직접 옮겨 주세요(_slice_period 참고).
     """
     if not symbol:
         return None
@@ -550,13 +573,30 @@ def get_previous_close_from_daily(
     current_ts=None,
 ) -> float | None:
     """
-    일봉에서 '현재가가 속한 거래일보다 앞선' 마지막 종가를 반환합니다.
+    일봉에서 "직전 거래일" 종가를 찾아 돌려줍니다.
 
-    current_ts를 주면 그 날짜보다 이전 거래일의 종가만 고릅니다. 주지 않으면
-    일봉의 끝에서 두 번째 값을 씁니다.
+    파라미터:
+        symbol     : Yahoo Finance 심볼.
+        current_ts : 현재 봉의 타임스탬프. 이 날짜보다 **앞선** 거래일의
+                     종가를 찾습니다. None이면 마지막에서 두 번째 종가를
+                     그냥 씁니다.
 
-    반환값은 yfinance 원본 스케일입니다. 표시 배율(엔/원 ×100 등)은
-    호출자가 현재가와 동일하게 적용해야 합니다.
+    반환값:
+        직전 거래일 종가(float). 구할 수 없으면 None.
+
+    주의사항:
+        - **네트워크를 한 번 더 씁니다**(period="1mo" 일봉 조회).
+          순차 루프 안에서 부르지 마세요. collect_macro_data는 필요한
+          티커를 먼저 골라 _prefetch_daily_prev_closes()로 한 번에
+          병렬 수집합니다.
+        - 0 이하의 종가는 버립니다. 일부 심볼이 휴장일에 0을 채워
+          보내는 경우가 있고, 그 값으로 등락률을 계산하면 -100%가
+          나옵니다.
+        - 타임존 비교는 둘 다 tz를 떼고 날짜만 봅니다. 심볼마다 거래소
+          타임존이 달라 그대로 비교하면 하루가 어긋납니다.
+        - None은 "못 구했다"는 뜻입니다. 이걸 0이나 현재가로 대체해
+          "변화 없음(0.00%)"처럼 보이게 만들지 마세요. 0%는 "안
+          움직였다"는 뜻이라 "모른다"와 전혀 다릅니다.
     """
     if not symbol:
         return None
@@ -691,10 +731,37 @@ def collect_macro_data():
     """
     매크로 전 지표를 실제로 수집합니다 (항상 네트워크를 씁니다).
 
-    화면에서 직접 부르지 마세요. 화면은 저장본을 우선 읽는
-    get_collected_macro_data()를 쓰고, 이 함수는 collector.py가 호출합니다.
+    파라미터:
+        없음. 대상 지표는 config.MACRO_CATEGORIES가 정합니다.
 
-    반환: (collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev)
+    반환값:
+        5개짜리 튜플:
+          [0] collected      : {카테고리명: [지표 dict, ...]}
+                               지표 dict의 status는 "ok"(전일 대비 있음) /
+                               "single"(현재가만) / "fail"(수집 실패)입니다.
+                               **실패한 지표도 status="fail"로 들어갑니다.**
+                               개수를 셀 때 전체를 세면 안 됩니다.
+          [1] rate_10y_curr  : 미국채 10년 현재 수익률(%). 없으면 None.
+          [2] rate_10y_prev  : 미국채 10년 전일 수익률(%). 없으면 None.
+          [3] rate_2y_curr   : 미국채 2년 현재 수익률(%). 없으면 None.
+          [4] rate_2y_prev   : 미국채 2년 전일 수익률(%). 없으면 None.
+
+    주의사항:
+        - **화면에서 직접 부르지 마세요.** 화면은 저장본을 우선 읽는
+          get_collected_macro_data()를 쓰고, 이 함수는 collector.py가
+          호출합니다.
+        - 처리는 3단계입니다.
+            1) 티커별 5일 시세를 병렬 수집
+            2) 전일 종가 보완이 필요한 티커를 골라 **한 번에** 병렬 수집
+               (_prefetch_daily_prev_closes — 이 단계를 순차 루프 안으로
+                되돌리면 왕복이 직렬로 쌓여 크게 느려집니다)
+            3) 순차로 카드 형태로 정리
+        - 전일 대비를 구할 수 없을 때 0.00%("보합")로 위장하지 않고
+          delta/pct를 None으로 둡니다. 0%는 "움직이지 않았다"는 뜻이라
+          "모른다"와 전혀 다릅니다.
+        - 미국채 값은 마지막에 TradingView Scanner 값으로 덮어씁니다
+          (_apply_bond_scanner_override). config의 2년물 티커 "ZT=F"가
+          수익률이 아니라 선물 가격이기 때문입니다.
     """
     collected = {}
     rate_10y_curr, rate_10y_prev = None, None

@@ -639,6 +639,29 @@ def fetch_kis_deal_ranking(
 # 3. LS 증권사 API (t1452 및 t1664)
 # ==============================================================================
 def fetch_ls_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
+    """
+    LS증권 OPEN API로 투자주체별 매매상위 종목을 조회합니다.
+
+    파라미터:
+        target_date : "YYYYMMDD" 문자열. 다만 LS는 당일 기준으로만
+                      응답하므로 실질적으로 무시됩니다.
+        market      : "KOSPI" | "KOSDAQ".
+        investor    : "외국인" | "기관" 등.
+        trade_type  : "순매수" | "순매도".
+        top_n       : 가져올 상위 종목 수.
+
+    반환값:
+        수급 랭킹 DataFrame. 실패하거나 결과가 없으면 빈 DataFrame.
+
+    주의사항:
+        - **폴백 체인에서 네 번째**입니다. KIS·Daum·Naver 중 하나라도
+          성공하면 호출되지 않습니다.
+        - 이 함수는 오랫동안 정의만 되어 있고 **어디에서도 호출되지
+          않았습니다.** 그래서 LS 키를 정확히 넣어도 화면 데이터는 전혀
+          달라지지 않았습니다. 지금은 체인에 연결돼 있습니다.
+        - LS 토큰은 443 포트로 발급받습니다. 문서에 적힌 8080은 서버가
+          더 이상 열어 두지 않습니다(즉시 connection refused).
+    """
     mkt_code = "1" if "KOSPI" in market.upper() or "코스피" in market else "2"
     order_code = "1" if trade_type == "순매수" else "2"
 
@@ -1204,6 +1227,30 @@ def fetch_naver_html_ranking(target_date: str, market: str, investor: str, trade
 # 6. PyKrx 엔진 (시장 전체 랭킹, 최종 폴백)
 # ==============================================================================
 def fetch_pykrx_deal_ranking(target_date: str, market: str, investor: str, trade_type: str, top_n: int) -> pd.DataFrame:
+    """
+    PyKrx로 투자주체별 매매상위 종목을 조회합니다.
+
+    파라미터:
+        target_date : "YYYYMMDD" 문자열. **과거 날짜 조회가 가능한
+                      유일한 소스**입니다.
+        market      : "KOSPI" | "KOSDAQ".
+        investor    : "외국인" | "기관" 등.
+        trade_type  : "순매수" | "순매도".
+        top_n       : 가져올 상위 종목 수.
+
+    반환값:
+        수급 랭킹 DataFrame. 실패하거나 결과가 없으면 빈 DataFrame.
+
+    주의사항:
+        - PyKrx는 **KRX 웹을 비공식으로 긁는 라이브러리**입니다. KRX가
+          응답 형식을 바꾸면 통째로 죽고, 실제로 그런 적이 있습니다.
+          이 소스가 조용히 빈 결과만 주고 있다면 라이브러리 버전을
+          먼저 의심하세요.
+        - 그래서 마지막 수단으로 우리가 쌓아 온 누적 이력(observations)이
+          있습니다. Naver·Daum이 과거 조회를 지원하지 않아 과거 데이터는
+          PyKrx 하나에 기대고 있었기 때문입니다.
+        - PYKRX_AVAILABLE이 False면(미설치) 호출 자체를 건너뜁니다.
+    """
     if not PYKRX_AVAILABLE:
         logger.warning("PyKrx 조회 실패: pykrx 패키지가 설치되지 않았습니다.")
         return pd.DataFrame()
@@ -1330,12 +1377,34 @@ def collect_market_radar_scanner(
     interval_type: str = "TODAY",
 ) -> pd.DataFrame:
     """
-    수급 랭킹을 실제로 수집합니다
-    (KIS → Daum → Naver → LS → PyKrx → 누적 이력 폴백 체인).
+    투자주체별 수급 상위 종목을 실제로 수집합니다.
 
-    화면은 get_market_radar_scanner()를 쓰세요. 이 함수는 항상 네트워크를
-    쓰며, 최악의 경우 7영업일을 거슬러 올라가며 여러 소스를 시도합니다
-    (주말은 건너뜁니다 — _previous_business_day 참고).
+    파라미터:
+        target_date_obj : 조회 기준일(date). 여기서부터 과거로 물러납니다.
+        market          : "KOSPI" | "KOSDAQ".
+        investor        : "외국인" | "기관" 등 투자주체.
+        trade_type      : "순매수" | "순매도".
+        top_n           : 가져올 상위 종목 수.
+        interval_type   : "TODAY"(당일) 또는 기간 집계 코드.
+                          TODAY가 아니면 Daum 기간 집계를 먼저 시도하고,
+                          실패하면 당일 경로로 자동 전환합니다.
+
+    반환값:
+        수급 랭킹 DataFrame. 모든 소스가 실패하면 **빈 DataFrame**입니다
+        (None이 아닙니다). 호출부는 .empty로 판정하세요.
+
+    주의사항:
+        - **항상 네트워크를 씁니다.** 화면은 저장본을 우선 읽는
+          get_market_radar_scanner()를 쓰세요.
+        - 소스 우선순위는 KIS → Daum → Naver → LS → PyKrx이고, 전부
+          실패하면 마지막으로 우리가 쌓아 둔 누적 이력(observations)을
+          씁니다. Naver·Daum은 **과거 날짜 조회를 지원하지 않아서**,
+          기준일이 최근 거래일이 아니면 아예 건너뜁니다.
+        - 최악의 경우 영업일 7일 × 소스 5개를 시도하므로 **매우 느릴 수
+          있습니다.** 주말은 건너뛰지만(_previous_business_day) 공휴일은
+          모릅니다.
+        - 성공한 소스를 로그에 남깁니다. 화면 숫자가 이상할 때 어느
+          소스에서 왔는지부터 확인하세요.
     """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     today_str = now_kst.strftime("%Y%m%d")

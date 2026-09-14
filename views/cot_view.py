@@ -55,6 +55,21 @@ def _get_next_cftc_release_notice(cot_date, now_kst: datetime) -> str:
     return ""
 
 def render_cot_view():
+    """
+    글로벌 투기세력(CFTC COT) 화면을 그립니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        없음.
+
+    주의사항:
+        COT 리포트는 **화요일 기준 포지션을 그 주 금요일 15:30 ET에**
+        발표합니다. 즉 가장 최신 데이터도 최소 3일 지난 것입니다.
+        화면에 다음 발표 예정 시각을 함께 표시해, 사용자가 "왜 안
+        바뀌었지"라고 오해하지 않게 하세요.
+    """
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
     now_str = now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
 

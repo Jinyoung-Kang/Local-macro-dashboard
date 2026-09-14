@@ -25,9 +25,25 @@ SNAP_COT_HISTORY = "cot.multi_asset"              # CFTC COT (DataFrame 중첩)
 
 # Daum 선물 투자주체별 매매동향 (조회 조건별)
 def snap_daum_futures_trend(lookback_days: int) -> str:
-    # 예전에는 .CONTRACT / .PRICE 접미사로 기준을 구분했습니다. 금액 기준이
-    # 제거돼 접미사가 무의미해졌지만, 예전 키의 저장본과 섞이지 않도록
-    # .CONTRACT를 그대로 둡니다(이 키가 계약수 기준임을 명시하는 역할).
+    """
+    Daum 선물 투자주체별 매매동향 스냅샷 이름.
+
+    파라미터:
+        lookback_days : 조회한 과거 거래일 수. 조회 조건이 다르면 결과도
+                        다르므로 이름에 포함시킵니다.
+
+    반환값:
+        "krx.daum_futures_trend.d25.CONTRACT" 형태의 문자열.
+
+    주의사항:
+        - 수집기와 화면이 **같은 lookback_days**를 써야 합니다. 다르면
+          수집은 되는데 화면에는 안 보입니다. 현재 양쪽 다 25입니다.
+        - ".CONTRACT" 접미사는 남은 흔적입니다. 예전에는
+          .CONTRACT(계약수) / .PRICE(금액) 두 기준이 있었는데, Daum이
+          금액을 제공하지 않아 금액 기준은 제거됐습니다. 접미사를 지우면
+          예전 키로 저장된 데이터와 섞이므로 그대로 둡니다 —
+          "이 키는 계약수 기준"임을 명시하는 역할도 합니다.
+    """
     return f"krx.daum_futures_trend.d{lookback_days}.CONTRACT"
 
 
@@ -37,21 +53,86 @@ VOLATILITY_STORE_PERIOD = "5y"
 
 
 def snap_ticker_history(symbol: str, period: str) -> str:
+    """
+    티커 시계열 스냅샷 이름.
+
+    파라미터:
+        symbol : Yahoo 심볼. "^VIX", "CL=F", "000001.SS" 등.
+        period : 조회 기간 문자열. "5y", "3mo" 등.
+
+    반환값:
+        "ticker.VIX.5y" 형태의 문자열.
+
+    주의사항:
+        - ^ = . 을 치환해 이름을 평평하게 만듭니다. 그래서 서로 다른
+          심볼이 같은 이름이 될 수 있습니다(예: "A.B"와 "A_B").
+          현재 쓰는 심볼 집합에는 충돌이 없지만, 새 심볼을 추가할 때는
+          한 번 확인하세요.
+        - 변동성 지수(^VIX/^MOVE)는 가장 긴 기간(VOLATILITY_STORE_PERIOD)
+          으로 한 번만 저장하고 짧은 기간은 잘라 씁니다. 기간마다 스냅샷을
+          만들면 저장본이 난립합니다.
+    """
     safe = symbol.replace("^", "").replace("=", "_").replace(".", "_")
     return f"ticker.{safe}.{period}"
 
 
 # CFTC COT는 계약 코드별로 저장합니다 (views/cot_view.py가 자산별로 조회).
 def snap_cot_contract(contract_code: str, limit: int) -> str:
+    """
+    CFTC COT 계약별 스냅샷 이름.
+
+    파라미터:
+        contract_code : CFTC 계약 코드(cot_service.COT_ASSETS의 "code").
+        limit         : 가져온 주(week) 수.
+
+    반환값:
+        "cot.contract.099741.l166" 형태의 문자열.
+
+    주의사항:
+        limit이 이름에 들어가므로, 수집기와 화면이 다른 limit을 쓰면
+        서로 다른 스냅샷을 보게 됩니다. 현재 양쪽 다 3년치(=52*3+10주)를
+        씁니다.
+    """
     return f"cot.contract.{contract_code}.l{limit}"
 
 
 # SEC 13F는 기관(CIK)·분기수 조합마다 결과가 다릅니다.
 def snap_sec_13f(cik: str, max_quarters: int) -> str:
+    """
+    SEC 13F 스냅샷 이름.
+
+    파라미터:
+        cik          : 기관의 SEC CIK 번호(앞자리 0을 포함한 문자열).
+        max_quarters : 가져온 분기 수.
+
+    반환값:
+        "sec.13f.0001067983.q8" 형태의 문자열.
+
+    주의사항:
+        - cik는 **앞자리 0이 있는 문자열**입니다. int로 바꾸면 0이 날아가
+          다른 기관을 가리키게 됩니다.
+        - q1은 q8의 첫 분기와 같은 데이터입니다. 수집기는 q8만 받아
+          q1을 잘라서 저장합니다(수집 24건 → 12건). 이 관계를 깨면
+          수집 시간이 두 배가 됩니다.
+    """
     return f"sec.13f.{cik}.q{max_quarters}"
 
 # FRED 개별 시계열은 series_id별로 스냅샷을 따로 둡니다.
 def snap_fred_series(series_id: str) -> str:
+    """
+    FRED 개별 시계열 스냅샷 이름.
+
+    파라미터:
+        series_id : FRED 시리즈 ID. "DGS10", "NFCI" 등.
+
+    반환값:
+        "fred.series.DGS10" 형태의 문자열.
+
+    주의사항:
+        스냅샷은 "최신 1건"이고, 과거 누적은 timeseries 테이블(TS_FRED)에
+        따로 쌓입니다. 스냅샷이 비어도 누적 이력으로 화면을 복구할 수
+        있습니다(macro_service.fetch_fred_series 참고).
+    """
     return f"fred.series.{series_id}"
 
 
@@ -62,6 +143,24 @@ def snap_radar_scanner(
     trade_type: str,
     interval_type: str,
 ) -> str:
+    """
+    수급 레이더 스냅샷 이름.
+
+    파라미터:
+        market        : "KOSPI" | "KOSDAQ".
+        investor      : "외국인" | "기관" 등.
+        trade_type    : "순매수" | "순매도".
+        interval_type : "TODAY" 등 집계 기간 코드.
+
+    반환값:
+        "radar.scanner.KOSPI.외국인.순매수.TODAY" 형태의 문자열.
+
+    주의사항:
+        조건 조합이 많아서 **수집기는 기본 조합 3개만** 미리 받아
+        둡니다(collector.py의 _task_radar_rankings). 다른 조합을 고르면
+        저장본이 없어 화면이 직접 수집하므로 느립니다. 전부 받으면
+        수집 시간이 과도해지기 때문에 택한 절충입니다.
+    """
     return f"radar.scanner.{market}.{investor}.{trade_type}.{interval_type}"
 
 

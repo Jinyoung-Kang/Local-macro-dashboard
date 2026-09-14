@@ -97,9 +97,25 @@ class Task:
         """
         태스크를 1회 실행하고 결과를 DB(collector_task_runs)에 남깁니다.
 
-        태스크 단위 기록이 없으면 "성공 0 · 실패 3"만 보이고 어떤 작업이 왜
-        실패했는지 알 수 없습니다. 로그는 터미널을 닫으면 사라지므로,
-        --status로 언제든 다시 볼 수 있게 DB에 남깁니다.
+        파라미터:
+            run_id : 이 태스크가 속한 수집 실행의 id. None이면 실행 묶음
+                     없이 단독 기록만 남습니다.
+
+        반환값:
+            (성공 여부, 상세 문자열) 튜플.
+            상세 문자열은 성공하면 태스크가 돌려준 요약("12/12 시리즈"),
+            실패하면 원인("RuntimeError: ...")입니다.
+
+        주의사항:
+            - **예외를 밖으로 내보내지 않습니다.** 한 태스크의 실패가
+              나머지 수집을 막으면 안 되기 때문입니다. 실패는 반환값과
+              DB 기록으로만 전달됩니다.
+            - EmptyResult는 "예외는 없었지만 쓸 데이터가 없음"입니다.
+              이걸 성공으로 세면 "✅ 0/10 수집" 같은 모순된 로그가 남고
+              cron/launchd가 장애를 알아채지 못하므로 실패로 집계합니다.
+            - 실패해도 **기존 저장본은 건드리지 않습니다.** 네트워크가
+              잠깐 끊겼다고 어제 받아 둔 데이터를 빈 값으로 덮으면 안
+              됩니다.
         """
         from services import store
 
@@ -138,6 +154,24 @@ class Task:
 
 # ------------------------------------------------------------------ fast tasks
 def _task_scraper_markets() -> str:
+    """
+    TradingView/Yahoo 참고 시세를 받아 저장합니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        "18/20 소스 수집" 형태의 요약 문자열. 실행 로그에 남습니다.
+
+    주의사항:
+        - 한 건도 못 받으면 EmptyResult를 올려 **기존 저장본을 빈 값으로
+          덮지 않습니다.** 네트워크가 잠깐 끊겼다고 어제 받아 둔 데이터를
+          날리면 안 됩니다.
+        - 이 태스크는 반드시 macro_collected **앞에** 실행돼야 합니다.
+          macro_collected가 여기서 저장한 스냅샷을 재사용해 미국채
+          수익률을 보정하기 때문입니다. 순서가 바뀌면 같은 스크래핑이
+          두 번 일어납니다(요청 20여 건 낭비).
+    """
     from services import datasets, store
     from services.market_scraper_service import collect_scraped_macro_markets
 
@@ -155,6 +189,25 @@ def _task_scraper_markets() -> str:
 
 
 def _task_macro_collected() -> str:
+    """
+    매크로 카드에 쓰는 전 지표를 받아 저장합니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        "16/18 지표 수집" 형태의 요약 문자열.
+
+    주의사항:
+        - **성공 개수를 셀 때 전체를 세면 안 됩니다.** collect_macro_data는
+          수집에 실패한 지표도 status="fail"로 함께 담아 돌려줍니다.
+          그래서 status가 "ok"/"single"인 것만 셉니다. 전체를 세면
+          "21개 지표 수집"처럼 잘못된 성공 보고가 됩니다.
+        - 쓸 수 있는 지표가 하나도 없으면 EmptyResult를 올려 기존
+          저장본을 보존합니다.
+        - scraper_markets 태스크가 먼저 돌아야 미국채 보정이 재수집 없이
+          끝납니다(run_once가 순차인 이유).
+    """
     from services import datasets, store
     from services.macro_service import collect_macro_data
 
@@ -224,6 +277,26 @@ def _task_radar_rankings() -> str:
 
 # ------------------------------------------------------------------ slow tasks
 def _task_fred_series() -> str:
+    """
+    화면이 쓰는 FRED 금리/신용 시계열을 받아 저장하고 누적합니다.
+
+    파라미터:
+        없음. 대상 시리즈 목록은 함수 안에 적혀 있습니다.
+
+    반환값:
+        "12/12 시리즈, 누적 2,340행" 형태의 요약 문자열.
+
+    주의사항:
+        - 시리즈를 **병렬로** 받습니다. 전부 같은 호스트를 향하는 순수
+          I/O 대기라 순차로 받으면 왕복이 그대로 누적됩니다.
+        - 저장은 워커가 아니라 메인 스레드에서 합니다. SQLite는 동시
+          쓰기를 잠금으로 직렬화하므로, 워커마다 쓰면 서로를 기다리며
+          병렬 이득을 깎아먹습니다.
+        - 개별 시리즈의 실패·빈 결과는 **그 시리즈만** 건너뜁니다.
+          해당 저장본은 그대로 남습니다.
+        - 스냅샷(최신)과 timeseries(누적) **양쪽에** 씁니다. 스냅샷이
+          비어도 누적 이력으로 화면을 복구할 수 있게 하기 위해서입니다.
+    """
     from services import datasets, store
     from services.macro_service import collect_fred_series
 
@@ -288,6 +361,23 @@ def _task_fred_series() -> str:
 
 
 def _task_fed_liquidity() -> str:
+    """
+    연준 순유동성(WALCL − WTREGEN − RRP)을 받아 저장합니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        "520행, 누적 2,080행" 형태의 요약 문자열.
+        추정치가 섞였으면 "(⚠️ 추정치 — 누적 제외)"가 붙습니다.
+
+    주의사항:
+        **추정치는 누적 이력에 절대 넣지 않습니다.** 구성 시계열의 발표
+        주기가 서로 달라 최신 구간이 추정으로 채워질 때가 있는데, 그걸
+        timeseries에 쌓으면 나중에 확정치가 와도 이미 오염된 과거가
+        남습니다. 스냅샷에는 status="estimated"로 저장해 화면이 표시할
+        수 있게 합니다.
+    """
     from services import datasets, store
     from services.liquidity_service import collect_fed_liquidity_data
 
@@ -313,6 +403,19 @@ def _task_fed_liquidity() -> str:
 
 
 def _task_krx_futures() -> str:
+    """
+    KOSPI200 선물/미결제약정 시계열을 받아 저장하고 누적합니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        "40행, 누적 120행" 형태의 요약 문자열.
+
+    주의사항:
+        _task_fed_liquidity와 같습니다 — 추정치(is_estimated)가 섞이면
+        스냅샷에만 status="estimated"로 저장하고 누적은 건너뜁니다.
+    """
     from services import datasets, store
     from services.krx_service import collect_krx_futures_history
 
@@ -395,6 +498,23 @@ def _task_volatility_history() -> str:
 
 
 def _task_sector_history() -> str:
+    """
+    섹터·자산군 ETF의 2년치 종가를 받아 저장합니다.
+
+    파라미터:
+        없음. 대상 티커는 config와 sector_service의 목록을 합쳐 만듭니다.
+
+    반환값:
+        "32/34 티커" 형태의 요약 문자열.
+
+    주의사항:
+        - **종가만 저장합니다.** OHLCV 원본 전체는 화면이 쓰지 않는데
+          불필요하게 큽니다.
+        - NaN은 None으로 바꿔 저장합니다. JSON에 NaN을 그대로 쓰면
+          표준이 아닌 출력이 되어 읽을 때 깨집니다.
+        - 티커 목록은 중복 제거 후 정렬합니다. 여러 목록에 같은 ETF가
+          들어 있어 그대로 두면 같은 티커를 두 번 받습니다.
+    """
     from services import datasets, store
     from services.sector_service import (
         ROTATION_ASSET_CLASSES,
@@ -437,6 +557,22 @@ def _task_sector_history() -> str:
 
 
 def _task_cot_history() -> str:
+    """
+    CFTC COT(투기세력 포지션) 3년치를 받아 저장합니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        "8/9 자산 (계약별 8건)" 형태의 요약 문자열.
+
+    주의사항:
+        - **두 벌로 저장합니다.** (a) AI 리포트 경로가 쓰는 통합
+          스냅샷과 (b) COT 화면이 자산별로 조회하는 계약 코드별 스냅샷.
+          (b)를 빠뜨리면 화면이 매번 직접 수집해 느려집니다.
+        - COT는 주 1회(금요일 15:30 ET) 발표입니다. 더 자주 받을 이유가
+          없어 slow 작업군에 있습니다.
+    """
     from services import datasets, store
     from services.cot_service import collect_cot_multi_asset_history
 
@@ -586,6 +722,20 @@ class AlreadyRunning(Exception):
 
 
 def _lock_path() -> Path:
+    """
+    수집기 중복 실행을 막는 락 파일 경로.
+
+    파라미터:
+        없음.
+
+    반환값:
+        DB 파일과 같은 디렉터리의 collector.lock 경로(Path).
+
+    주의사항:
+        DB 옆에 두는 이유는 DASHBOARD_DB로 DB 경로를 바꾸면 락도 함께
+        따라가야 하기 때문입니다. 서로 다른 DB를 쓰는 수집기 둘은
+        동시에 돌아도 문제가 없습니다.
+    """
     from services import store
 
     return store.get_db_path().parent / "collector.lock"
@@ -641,7 +791,31 @@ def run_once(
     only: str | None = None,
     task_name: str | None = None,
 ) -> tuple[int, int]:
-    """선택된 작업을 1회 실행합니다. (성공 수, 실패 수)를 반환합니다."""
+    """
+    선택된 수집 작업들을 1회 실행합니다.
+
+    파라미터:
+        only      : 실행할 작업군. "fast" | "slow" | "weekly" | "all" | None.
+                    None과 "all"은 전부를 뜻합니다.
+        task_name : 특정 태스크 하나만 실행할 때 그 이름. 주면 only는
+                    무시됩니다.
+
+    반환값:
+        (성공한 태스크 수, 실패한 태스크 수) 튜플.
+
+    주의사항:
+        - **태스크를 일부러 순차로 실행합니다.** 병렬로 돌리고 싶어지지만
+          그러면 안 됩니다. macro_collected 태스크가 바로 앞의
+          scraper_markets가 방금 저장해 둔 스냅샷을 재사용하도록
+          되어 있어서(services/macro_service.py의
+          _apply_bond_scanner_override), 동시에 돌리면 그 최적화가 깨지고
+          같은 스크래핑이 두 번 일어납니다.
+          병렬화가 필요하면 태스크 **안에서** 하세요.
+        - 태스크마다 heartbeat를 찍습니다. 13F는 한 태스크가 10분을
+          넘기기 때문에, 이게 없으면 죽은 수집기를 "진행 중"으로
+          오인합니다.
+        - 실행 로그 기록에 실패해도 수집은 계속합니다.
+    """
     from services import store
 
     if task_name:
@@ -705,7 +879,25 @@ def run_loop(
     slow_interval: int,
     weekly_interval: int,
 ) -> None:
-    """상주 모드. 작업군별로 각자의 주기로 실행합니다."""
+    """
+    상주 모드. 작업군별로 각자의 주기로 계속 실행합니다.
+
+    파라미터:
+        fast_interval   : fast 작업군(시세·수급) 주기(초). 권장 300.
+        slow_interval   : slow 작업군(FRED·KRX·COT) 주기(초). 권장 3600.
+        weekly_interval : weekly 작업군(SEC 13F) 주기(초). 권장 43200.
+
+    반환값:
+        없음. Ctrl+C(KeyboardInterrupt)를 받을 때까지 돌아옵니다.
+
+    주의사항:
+        - 기동 직후 세 작업군을 모두 한 번씩 실행합니다(next_run이 0.0).
+        - 처리 순서는 fast → slow → weekly로 **싼 것부터**입니다.
+          13F(weekly)는 10분 이상 걸려서, 먼저 돌리면 가장 자주 보는
+          fast 데이터가 그만큼 늦게 채워집니다.
+        - 한 작업군이 자기 주기보다 오래 걸리면 다음 차례가 곧바로
+          이어집니다(밀린 만큼 건너뛰지 않습니다).
+    """
     logger.info(
         "상주 모드 시작: fast %d초 · slow %d초 · weekly %d초 (Ctrl+C로 종료)",
         fast_interval, slow_interval, weekly_interval,
@@ -932,6 +1124,29 @@ def print_launchd_plist(fast_interval: int) -> None:
 
 
 def main() -> int:
+    """
+    명령줄 진입점. 인자를 해석해 해당 동작을 수행합니다.
+
+    파라미터:
+        없음 (sys.argv를 읽습니다).
+
+    반환값:
+        프로세스 종료 코드.
+          0 : 정상 (또는 조회성 명령 완료)
+          1 : 수집을 시도했으나 전부 실패
+          2 : --task에 알 수 없는 이름 / --verify에 키 없음
+          3 : 다른 수집기가 이미 실행 중 (--force로 무시 가능)
+
+    주의사항:
+        - **종료 코드를 의미 있게 돌려줍니다.** cron/launchd가 장애를
+          알아채려면 이게 필요합니다. 전부 실패했는데 0을 주면 조용히
+          망가진 채로 계속 돕니다.
+        - 조회성 명령(--list/--status/--history 등)은 락을 잡지 않습니다.
+          수집기가 도는 중에도 상태를 볼 수 있어야 하기 때문입니다.
+        - 실제 수집 전에 mark_stale_runs_interrupted()로 'running'에 남은
+          기록을 정리합니다. 비정상 종료한 실행이 영원히 "진행 중"으로
+          보이는 것을 막습니다.
+    """
     parser = argparse.ArgumentParser(
         description="대시보드 데이터 수집기 (Streamlit과 분리 실행)",
         formatter_class=argparse.RawDescriptionHelpFormatter,

@@ -194,7 +194,26 @@ def _parse_iso(text: str | None) -> datetime | None:
 
 def init_db(db_path: Path | None = None) -> Path:
     """
-    스키마를 생성합니다(멱등). 프로세스당 경로별 1회만 실제로 실행합니다.
+    DB 파일과 스키마를 준비합니다 (여러 번 불러도 안전).
+
+    파라미터:
+        db_path : DB 경로. None이면 get_db_path()가 정하는 기본 경로
+                  (프로젝트 루트의 data/dashboard.db).
+
+    반환값:
+        실제로 사용한 DB 경로(Path).
+
+    주의사항:
+        - **프로세스당 경로별로 딱 한 번만** 실제 작업을 합니다. 두 번째
+          부터는 캐시된 경로 집합을 보고 바로 돌아옵니다. connect()가
+          호출마다 이 함수를 부르기 때문에 이 최적화가 필요합니다.
+        - 부모 디렉터리가 없으면 만듭니다.
+        - WAL 모드로 바꿔 수집기(쓰기)와 Streamlit(읽기)이 서로를 막지
+          않게 합니다. WAL은 파일이 3개(.db/.db-wal/.db-shm)가 되므로,
+          DB를 복사·이동할 때 세 개를 함께 옮기세요.
+        - 나중에 추가된 컬럼은 _MIGRATIONS가 ALTER TABLE로 보강합니다.
+          CREATE TABLE IF NOT EXISTS는 이미 있는 테이블에 컬럼을 더해
+          주지 않기 때문입니다.
     """
     path = Path(db_path) if db_path else get_db_path()
     key = str(path)
@@ -226,11 +245,28 @@ def init_db(db_path: Path | None = None) -> Path:
 @contextmanager
 def connect(db_path: Path | None = None, readonly: bool = False):
     """
-    커넥션을 열고 닫습니다.
+    SQLite 커넥션을 열고, 블록이 끝나면 커밋·정리합니다 (with 전용).
 
-    커넥션을 캐시하지 않는 이유: sqlite3 커넥션은 기본적으로 생성 스레드에
-    묶여 있고, Streamlit은 재실행마다 다른 스레드에서 동작할 수 있습니다.
-    로컬 파일은 연결 비용이 사실상 0이므로 매번 여는 편이 안전합니다.
+    파라미터:
+        db_path  : DB 경로 오버라이드. None이면 기본 경로.
+        readonly : True면 PRAGMA query_only로 쓰기를 막고 커밋하지
+                   않습니다. 읽기 전용 조회에는 반드시 True를 주세요.
+
+    반환값:
+        sqlite3.Connection을 내주는 컨텍스트 매니저.
+        row_factory가 sqlite3.Row라서 결과를 r["컬럼명"]으로 읽습니다.
+
+    주의사항:
+        - **커넥션을 캐시하지 않습니다.** sqlite3 커넥션은 생성 스레드에
+          묶여 있고 Streamlit은 rerun마다 다른 스레드에서 돌 수 있습니다.
+          로컬 파일이라 연결 비용이 사실상 0이므로 매번 여는 편이
+          안전합니다. 이 커넥션을 밖으로 들고 나가 다른 스레드에서
+          쓰지 마세요.
+        - 예외가 나면 롤백하고 그대로 다시 올립니다(삼키지 않습니다).
+        - 쓰기가 많은 반복문에서는 이 컨텍스트를 루프 안에 두지 마세요.
+          호출마다 트랜잭션이 따로 생겨 느려집니다. 행을 먼저 모아
+          executemany로 한 번에 쓰세요
+          (put_frame_as_timeseries가 그렇게 합니다).
     """
     path = init_db(db_path)
 
@@ -368,7 +404,30 @@ def put_object(
     error: str | None = None,
     db_path: Path | None = None,
 ) -> None:
-    """DataFrame을 품은 중첩 구조를 타입 보존하며 저장합니다."""
+    """
+    DataFrame을 품은 중첩 dict/list를 타입을 보존하며 저장합니다.
+
+    파라미터:
+        name    : 스냅샷 이름.
+        payload : {"자산": {"data": DataFrame, "error": None}} 처럼
+                  DataFrame이 안쪽에 들어 있는 구조.
+        status  : 품질 표시.
+        error   : 수집 중 오류 메시지(있으면).
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        없음.
+
+    주의사항:
+        - 13F·COT 결과가 정확히 이 모양입니다. put_snapshot()으로 저장하면
+          DataFrame이 레코드 리스트로 납작해져 화면이 깨집니다.
+        - pickle을 쓰지 않는 이유는 역직렬화 시 임의 코드 실행이
+          가능해지기 때문입니다. DB 파일이 공유·이동될 수 있다는 점을
+          생각하면 받아들일 수 없는 위험입니다. 그래서 DataFrame만
+          명시적으로 태깅하는 코덱을 씁니다.
+        - 코덱이 모르는 타입은 str()로 떨어집니다. 되읽을 때 문자열이
+          되어 있다면 여기를 의심하세요.
+    """
     blob = json.dumps(_encode_obj(payload), ensure_ascii=False)
     with connect(db_path) as conn:
         conn.execute(
@@ -394,7 +453,25 @@ def put_snapshot(
     error: str | None = None,
     db_path: Path | None = None,
 ) -> None:
-    """JSON 직렬화 가능한 스냅샷을 upsert 합니다."""
+    """
+    JSON으로 표현 가능한 값을 스냅샷으로 upsert 합니다.
+
+    파라미터:
+        name    : 스냅샷 이름.
+        payload : dict/list/스칼라 등 JSON으로 바꿀 수 있는 값.
+        status  : 품질 표시("ok" | "estimated" 등).
+        error   : 수집 중 오류 메시지(있으면).
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        없음.
+
+    주의사항:
+        **DataFrame이 섞여 있으면 이 함수를 쓰지 마세요.** JSON으로
+        납작해져 레코드 리스트가 되고, 읽을 때 화면이 기대하는 타입이
+        아닙니다. DataFrame 하나면 put_frame(), DataFrame을 품은 중첩
+        구조면 put_object()를 쓰세요.
+    """
     blob = json.dumps(payload, ensure_ascii=False, default=_json_default)
 
     with connect(db_path) as conn:
@@ -461,10 +538,30 @@ def put_frame(
     db_path: Path | None = None,
 ) -> None:
     """
-    DataFrame을 스냅샷으로 저장합니다.
+    DataFrame을 스냅샷으로 저장합니다 (같은 이름이면 덮어씁니다).
 
-    orient="split" + date_format="iso"를 쓰면 인덱스(날짜)와 컬럼 순서가
-    그대로 보존되고, NaN은 null로 직렬화됩니다.
+    파라미터:
+        name    : 스냅샷 이름. services/datasets.py의 규칙을 따르세요.
+        df      : 저장할 DataFrame. None이면 payload가 null로 저장됩니다.
+        status  : "ok" | "estimated" 등 화면에 보여 줄 품질 표시.
+                  추정치를 저장할 때는 반드시 "estimated"를 주세요.
+        error   : 수집 중 발생한 오류 메시지(있으면).
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        없음. 실패하면 예외가 올라갑니다.
+
+    주의사항:
+        - orient="split" + date_format="iso"라서 인덱스(날짜)와 컬럼 순서가
+          보존되고 NaN은 null이 됩니다.
+        - **df.attrs를 따로 싣습니다.** to_json은 attrs를 버리는데, 이
+          프로젝트는 attrs에 is_proxy / is_intraday / source_label 같은
+          "이 값은 실제 지표가 아니다" 표시를 담습니다. 잃어버리면 추정치가
+          공식 데이터처럼 화면과 AI 리포트에 나갑니다.
+        - **dtype도 따로 싣습니다.** orient="split"은 dtype을 저장하지
+          않아서, 읽을 때 pandas가 숫자로만 된 문자열 컬럼("069500",
+          cusip "037833100")을 int로 바꿔 **앞자리 0을 영구히 날립니다.**
+          종목코드가 69500이 되면 Daum/pykrx/yfinance 조회가 전부 실패합니다.
     """
     if df is None:
         payload = None
@@ -509,7 +606,25 @@ def put_frame(
 
 
 def read_snapshot(name: str, db_path: Path | None = None) -> Snapshot | None:
-    """저장된 스냅샷을 읽습니다. 없으면 None."""
+    """
+    저장된 스냅샷 1건을 읽습니다.
+
+    파라미터:
+        name    : 스냅샷 이름.
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        Snapshot 객체. 없거나 읽기에 실패하면 None.
+        payload는 저장할 때 쓴 함수에 따라 타입이 복원됩니다
+        (put_frame → DataFrame, put_object → 중첩 구조, put_snapshot → 원본).
+
+    주의사항:
+        - **None은 "없음"과 "읽기 실패"를 구분하지 않습니다.** DB 오류와
+          역직렬화 실패는 경고 로그만 남기고 None이 됩니다. 화면이
+          조용히 비는 것을 막으려면 호출부에서 로그를 확인하세요.
+        - 반환된 Snapshot의 신선도는 .age_seconds / .is_fresh()로 봅니다.
+          collected_at이 없으면 age_seconds는 무한대입니다.
+    """
     try:
         with connect(db_path, readonly=True) as conn:
             row = conn.execute(
@@ -1045,6 +1160,25 @@ def finish_run(
     detail: str | None = None,
     db_path: Path | None = None,
 ) -> None:
+    """
+    수집 실행 하나를 마감 처리합니다.
+
+    파라미터:
+        run_id     : start_run()이 돌려준 실행 id.
+        status     : "ok" | "partial" | "fail".
+        ok_count   : 성공한 태스크 수.
+        fail_count : 실패한 태스크 수.
+        detail     : 실패 요약 문자열(있으면).
+        db_path    : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        없음.
+
+    주의사항:
+        이 함수가 불리지 않으면 그 실행은 영원히 'running'으로 남습니다.
+        비정상 종료가 그런 기록을 남기므로, 수집기는 시작할 때
+        mark_stale_runs_interrupted()로 먼저 정리합니다.
+    """
     with connect(db_path) as conn:
         conn.execute(
             "UPDATE collector_runs SET finished_at = ?, status = ?, "
@@ -1058,6 +1192,20 @@ def finish_run(
 
 
 def read_last_run(db_path: Path | None = None) -> dict | None:
+    """
+    가장 최근 수집 실행 기록 1건을 읽습니다.
+
+    파라미터:
+        db_path : DB 경로 오버라이드(테스트용).
+
+    반환값:
+        실행 기록 dict. 기록이 없으면 None.
+
+    주의사항:
+        여기 담긴 status는 **DB에 적힌 값 그대로**입니다. 비정상 종료한
+        실행은 'running'으로 남아 있으므로, 화면에 보여 줄 때는
+        resolve_run_status()를 거쳐 'interrupted'를 가려내세요.
+    """
     try:
         with connect(db_path, readonly=True) as conn:
             row = conn.execute(
@@ -1346,24 +1494,52 @@ def cached_or_live(
     """
     저장본이 신선하면 그것을 쓰고, 아니면 live_fn()으로 수집한 뒤 저장합니다.
 
-    읽기 모드(DASHBOARD_READ_MODE)에 따라 동작이 달라집니다.
-      - auto       : 신선하면 저장본, 아니면 수집 + 저장 (기본)
-      - store_only : 저장본만. 오래됐어도 그대로 주고, 없으면 empty_value.
-                     화면이 절대 외부를 기다리지 않습니다.
-      - live_only  : 저장 계층 무시
+    **이 프로젝트에서 가장 중요한 함수입니다.** 화면의 거의 모든 데이터
+    조회가 여기를 지나갑니다. "왜 화면이 느린가" / "왜 새로고침해도
+    안 바뀌는가" / "왜 옛날 값이 보이는가"의 답이 전부 이 함수 안에
+    있습니다.
 
-    request_refresh()가 호출된 뒤에는(화면의 새로고침 버튼) 그보다 먼저
-    수집된 저장본을 신선하지 않은 것으로 보고 다시 수집합니다. store_only
-    모드에서는 외부를 부르지 않는다는 약속이 우선입니다.
+    파라미터:
+        name             : 스냅샷 이름. services/datasets.py가 만드는
+                           규칙적인 문자열을 쓰세요. 이름이 겹치면 서로
+                           덮어씁니다.
+        live_fn          : 인자 없이 호출해 실제 수집을 수행하는 함수.
+                           **네트워크를 타는 무거운 함수**입니다.
+        max_age_seconds  : 저장본을 "신선하다"고 볼 최대 나이(초).
+                           datasets.MAX_AGE_* 상수를 쓰세요.
+        empty_value      : 줄 값이 아무것도 없을 때 돌려줄 기본값.
+                           DataFrame을 기대하는 호출부라면 pd.DataFrame()을
+                           넘기세요. 기본값 None을 그대로 두면 호출부에서
+                           AttributeError가 나기 쉽습니다.
+        as_frame         : 결과를 DataFrame 전용 형식으로 저장할지 여부.
+        as_object        : 결과를 "DataFrame을 품은 중첩 dict/list" 형식으로
+                           저장할지 여부. as_frame과 동시에 켜지 마세요.
+        required_columns : 저장본 DataFrame이 반드시 가져야 할 컬럼들.
 
-    수집이 실패하면 "신선하지 않더라도" 남아 있는 저장본을 내려줍니다.
-    외부 소스 장애 시 화면이 비는 것보다 오래된 값이라도 보여주는 편이
-    낫고, 화면에는 수집 시각이 함께 표시되므로 오해 여지가 없습니다.
+    반환값:
+        수집 결과 또는 저장본. 둘 다 없으면 empty_value.
+        **반환 타입은 live_fn이 돌려주는 것과 같습니다.**
 
-    required_columns를 주면 저장된 DataFrame이 그 컬럼을 모두 갖고 있는지
-    확인합니다. 예전 버전의 코드가 저장해 둔 스냅샷은 컬럼 구성이 달라져
-    있을 수 있고, 그대로 화면에 넘기면 KeyError로 페이지가 죽습니다.
-    스키마가 맞지 않으면 저장본을 버리고 다시 수집합니다.
+    주의사항:
+        - 읽기 모드(DASHBOARD_READ_MODE)에 따라 동작이 크게 달라집니다.
+            auto       : 신선하면 저장본, 아니면 수집 + 저장 (기본)
+            store_only : 저장본만. 오래됐어도 그대로 주고, 없으면
+                         empty_value. 화면이 절대 외부를 기다리지 않습니다.
+            live_only  : 저장 계층 무시. 항상 live_fn을 부릅니다.
+                         collector.py가 이 모드로 돕니다.
+        - **수집이 실패하면 오래된 저장본을 그대로 내려줍니다.** 외부 소스
+          장애 시 화면이 비는 것보다 낫다는 판단입니다. 즉 반환값이
+          "지금 수집한 값"이라는 보장이 없습니다. 화면은 반드시 수집
+          시각을 함께 표시해야 합니다(Snapshot.collected_at_kst_str()).
+        - 저장 실패는 삼킵니다. 저장이 안 됐다고 화면을 막지는 않습니다.
+        - required_columns를 주면 저장본의 컬럼 구성을 검사합니다. 예전
+          버전이 저장해 둔 스냅샷은 컬럼이 달라져 있을 수 있고, 그대로
+          화면에 넘기면 KeyError로 페이지가 죽습니다. 맞지 않으면 저장본을
+          버리고 다시 수집합니다.
+        - request_refresh() 이후에는 그보다 먼저 수집된 저장본을 낡은
+          것으로 봅니다. 단, **새로고침 1회당 이름 하나를 한 번만**
+          다시 시도합니다. 실패하는 소스를 rerun마다 재호출하면 화면이
+          계속 느려지기 때문입니다.
     """
     mode = get_read_mode()
 

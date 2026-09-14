@@ -14,6 +14,20 @@ from services.ai_service import (
 
 
 def render_ai_test_view():
+    """
+    AI API 연결 진단 화면을 그립니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        없음.
+
+    주의사항:
+        진단용 화면입니다. 실제 모델을 호출하므로 호출 비용이 발생할 수
+        있고, 여기서 성공했다고 해서 리포트 생성이 반드시 성공하는 것은
+        아닙니다(리포트는 더 긴 입력을 보냅니다).
+    """
     st.markdown("""
     <div style="padding: 4px 0 12px 0;">
         <h2 style="margin:0; font-weight: 700; color: #F0F6FC;">
