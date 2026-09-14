@@ -416,3 +416,237 @@ def test_lookback_steps_over_weekends():
     for _ in range(7):
         cursor = _previous_business_day(cursor)
     assert cursor == datetime.date(2026, 9, 3), cursor
+
+
+# ==============================================================================
+# 11. AI 리포트 — 빈 화면 대신 원인이 보여야 하고, rerun에도 살아남아야 한다
+# ==============================================================================
+def test_failed_engine_result_surfaces_the_error_not_a_blank_body():
+    """
+    [회귀] 화면이 `res.get("response", res.get("error", ...))` 로 본문을
+    꺼냈다. 그런데 실패한 결과에도 `"response": ""` 키가 **존재**하므로
+    dict.get의 기본값은 절대 쓰이지 않았다. 그래서 파이프라인 표시는
+    "실패"인데 본문만 텅 비어, 사용자는 원인을 전혀 알 수 없었다.
+    """
+    from services.ai_service import extract_report_text
+
+    failed = {
+        "status": False,
+        "response": "",
+        "error": "HTTP 404: model not found",
+        "pipeline_step": "NVIDIA 실패",
+    }
+
+    # 옛 방식이 왜 실패했는지 그대로 고정해 둔다.
+    assert failed.get("response", failed.get("error", "fallback")) == ""
+
+    body, ok = extract_report_text(failed)
+    assert ok is False
+    assert body == "HTTP 404: model not found"
+
+
+def test_extract_report_text_never_returns_empty():
+    """본문도 오류도 비어 있으면 최소한 '원인 정보 없음'이라도 나와야 한다."""
+    from services.ai_service import extract_report_text
+
+    body, ok = extract_report_text({"status": False, "response": "", "error": None})
+    assert ok is False
+    assert body.strip(), "빈 문자열을 돌려주면 화면이 다시 비어 버린다"
+
+    body, ok = extract_report_text({"status": True, "response": "### 결론", "error": None})
+    assert ok is True and body == "### 결론"
+
+
+def test_reasoning_artifacts_are_stripped_but_never_emptied():
+    """
+    DeepSeek-R1 같은 추론형 모델은 <think> 블록에 사고 과정을 싣는다.
+    그대로 뿌리면 리포트가 아니라 혼잣말이 되지만, 걷어낸 뒤 아무것도
+    남지 않으면 원문이라도 보여 줘야 한다.
+    """
+    from services.ai_service import strip_reasoning_artifacts
+
+    assert strip_reasoning_artifacts("<think>음</think>\n### 결론") == "### 결론"
+    assert strip_reasoning_artifacts("<think>잘림") == "잘림"
+
+    only_think = "<think>사고 과정만 있음</think>"
+    assert strip_reasoning_artifacts(only_think) == only_think, (
+        "전부 걷어내면 빈 리포트가 된다. 원문을 남겨야 한다"
+    )
+
+
+def test_each_report_type_has_its_own_system_prompt():
+    """
+    [회귀] 세 가지 리포트 유형이 **완전히 같은** system_prompt를 받았다.
+    선택한 유형은 Context 끝에 한 줄 덧붙는 게 전부라, 어느 것을 골라도
+    사실상 같은 리포트가 나왔다.
+    """
+    from services.ai_service import (
+        DEFAULT_REPORT_TYPE,
+        REPORT_PROFILES,
+        get_report_system_prompt,
+        get_report_types,
+    )
+
+    types = get_report_types()
+    assert len(types) >= 3
+    assert set(types) == set(REPORT_PROFILES), "옵션 목록과 프로파일이 어긋납니다"
+
+    prompts = [get_report_system_prompt(t) for t in types]
+    assert len(set(prompts)) == len(types), "유형별 system prompt가 중복됩니다"
+
+    # 모르는 유형이 와도 죽지 않고 기본값으로 떨어져야 한다.
+    assert get_report_system_prompt("없는 유형") == get_report_system_prompt(
+        DEFAULT_REPORT_TYPE
+    )
+
+
+def test_ai_report_renders_outside_the_generate_button_block():
+    """
+    [회귀] 리포트 전체가 `if generate_btn:` 안에서 그려지고 결과를 아무
+    데도 보관하지 않았다. Streamlit은 위젯 조작·자동 새로고침마다
+    스크립트를 다시 실행하는데 그때 generate_btn은 False라서, 사이드바의
+    자동 새로고침을 켜 두면 주기마다 리포트가 사라졌다.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    render = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "render_ai_report_view"
+    )
+
+    # 생성 버튼 블록 안에서는 리포트를 그리지 않고 세션에 담기만 해야 한다.
+    button_blocks = [
+        n for n in render.body
+        if isinstance(n, ast.If)
+        and any(
+            isinstance(x, ast.Name) and x.id == "generate_btn"
+            for x in ast.walk(n.test)
+        )
+    ]
+    assert button_blocks, "생성 버튼 분기를 찾지 못했습니다"
+
+    for block in button_blocks:
+        drawn = [
+            f"{x.func.value.id}.{x.func.attr}"
+            for x in ast.walk(block)
+            if isinstance(x, ast.Call)
+            and isinstance(x.func, ast.Attribute)
+            and isinstance(x.func.value, ast.Name)
+            and x.func.value.id == "st"
+            and x.func.attr in ("markdown", "dataframe", "code", "metric")
+        ]
+        assert not drawn, (
+            f"생성 버튼 블록 안에서 리포트를 그리고 있습니다: {drawn}. "
+            "rerun이 일어나면 사라집니다"
+        )
+
+    # 결과는 세션에 보관돼야 한다.
+    assert "st.session_state[_RESULT_KEY]" in source
+
+
+def test_ai_views_do_not_use_the_blank_on_failure_get_pattern():
+    """
+    `.get("response", ...)` 로 본문을 꺼내는 자리가 다시 생기면 실패가
+    조용히 빈 화면이 된다. 화면은 extract_report_text()만 써야 한다.
+    """
+    import ast
+    import pathlib
+
+    offenders = []
+    for path in sorted(pathlib.Path("views").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "response"
+                and len(node.args) > 1          # 기본값을 준 경우만 문제
+            ):
+                offenders.append(f"{path.name}:{node.lineno}")
+
+    assert not offenders, (
+        "실패 시 빈 본문이 되는 .get(\"response\", ...) 패턴이 남아 있습니다: "
+        + ", ".join(offenders)
+    )
+
+
+def test_krx_cot_engine_list_comes_from_the_registry():
+    """
+    [회귀] KRX 화면의 엔진 목록이 "NVIDIA NIM Nemotron-3-Super" 같은
+    자유 문자열로 손수 적혀 있었다. 그 문자열은 레지스트리의 어떤 키·
+    레이블과도 일치하지 않아, call_selected_ai_engine()의 부분 문자열
+    추측에 기대어 우연히 동작했고 목록도 레지스트리와 어긋나 있었다.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path("views/krx_cot_view.py").read_text(encoding="utf-8")
+    assert "get_ai_engine_options(" in source
+
+    # 주석은 AST에 없으므로, 실제 **문자열 상수**만 검사합니다.
+    # (설명 주석에 옛 이름을 인용한 것까지 잡으면 안 됩니다.)
+    tree = ast.parse(source)
+    literals = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    handwritten = [s for s in literals if "NVIDIA NIM" in s or "Cerebras Cloud" in s]
+
+    assert not handwritten, (
+        f"손으로 적은 엔진 목록이 다시 들어왔습니다: {handwritten}"
+    )
+
+
+def test_engine_probe_does_not_call_out_when_no_key_is_set():
+    """
+    키가 없으면 네트워크를 타지 않고 즉시 no_key로 판정해야 한다.
+    (없는 키로 호출해 봐야 의미 없는 지연만 생긴다)
+    """
+    import services.ai_service as ai
+
+    result = ai.probe_engine("nvidia_gpt_oss_120b")
+
+    # 이 테스트 환경에는 키가 없다.
+    assert result["state"] == "no_key"
+    assert result["latency_ms"] == 0
+    assert result["ok"] is False
+
+
+@pytest.mark.parametrize(
+    "error_text,expected",
+    [
+        ("HTTP 404: {'detail': 'not found'}", True),
+        ("HTTP 400: model `x` does not exist", True),
+        ("HTTP 401: invalid api key", False),
+        ("Connection timed out", False),
+        ("", False),
+    ],
+)
+def test_unknown_model_detection(error_text, expected):
+    """모델 ID 문제와 인증·망 문제를 구분해야 조치를 안내할 수 있다."""
+    from services.ai_service import _looks_like_unknown_model
+
+    assert _looks_like_unknown_model(error_text) is expected
+
+
+def test_engine_registry_is_internally_consistent():
+    """레지스트리 항목이 화면·점검 코드가 기대하는 키를 모두 갖춰야 한다."""
+    from services.ai_service import AI_MODEL_REGISTRY, AUTO_FAILOVER_ORDER
+
+    for engine_id, config in AI_MODEL_REGISTRY.items():
+        assert {"label", "provider", "model", "description"} <= set(config), engine_id
+        if config["provider"] != "auto":
+            assert config["model"], f"{engine_id}: model이 비어 있습니다"
+
+    for engine_id in AUTO_FAILOVER_ORDER:
+        assert engine_id in AI_MODEL_REGISTRY, (
+            f"Failover 순서에 등록되지 않은 엔진이 있습니다: {engine_id}"
+        )

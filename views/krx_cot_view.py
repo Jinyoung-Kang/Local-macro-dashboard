@@ -18,7 +18,15 @@ import streamlit as st
 
 from views._ui import refresh_button, vertical_spacer
 from config import get_krx_key
-from services.ai_service import ask_krx_cot_agent
+from services.ai_service import (
+    ask_krx_cot_agent,
+    extract_report_text,
+    format_ai_engine,
+    get_ai_engine_options,
+)
+
+# AI 해설 결과를 rerun 너머로 보관하는 세션 키.
+_KRX_AI_KEY = "krx_cot_ai_result"
 from services.krx_service import (
     get_krx_futures_history,
     get_krx_investor_derivatives_summary,
@@ -791,17 +799,22 @@ def render_krx_cot_view():
     if hist_is_estimated or inv_is_placeholder:
         st.info("추정치/placeholder 데이터가 포함된 상태이므로, AI 해설도 참고용으로만 활용하세요.")
 
-    engine_options = [
-        "Failover (자동)",
-        "NVIDIA NIM Nemotron-3-Super",
-        "Cloudflare DeepSeek-R1",
-        "NVIDIA NIM GPT-OSS-20B",
-        "Cerebras Cloud Llama-3.3",
-    ]
+    # [버그 수정] 예전에는 엔진 목록을 여기에 손으로 적어 뒀습니다
+    # ("NVIDIA NIM Nemotron-3-Super" 같은 자유 문자열). 그 문자열은
+    # AI_MODEL_REGISTRY의 어떤 키·레이블과도 일치하지 않아서,
+    # call_selected_ai_engine()의 **부분 문자열 추측**("Nemotron"이
+    # 들어 있나?)에 기대어 우연히 동작하고 있었습니다. 목록도 레지스트리와
+    # 어긋나 GPT-OSS 120B·Cloudflare Llama 등이 빠져 있었습니다.
+    # 레지스트리를 단일 출처로 삼습니다.
     col_ai1, col_ai2 = st.columns([1, 2])
-    ai_res = None
     with col_ai1:
-        selected_engine = st.selectbox("AI 엔진 선택", options=engine_options, index=0)
+        selected_engine = st.selectbox(
+            "AI 엔진 선택",
+            options=get_ai_engine_options(include_auto=True),
+            format_func=format_ai_engine,
+            index=0,
+            key="krx_cot_ai_engine",
+        )
         if st.button("🤖 AI 해설 생성", width="stretch"):
             with st.spinner(f"{selected_engine}로 분석 중..."):
                 prompt = f"""
@@ -822,13 +835,25 @@ the full 4-part structured report with Markdown tables and action playbook.
 If Data Quality is ESTIMATED or PLACEHOLDER, explicitly warn the reader in the
 conclusion section.
 """
-                ai_res = ask_krx_cot_agent(prompt, selected_engine)
+                # [버그 수정] 결과를 지역 변수에만 담으면 rerun(자동
+                # 새로고침·다른 위젯 조작) 때 사라집니다. 세션에 남깁니다.
+                st.session_state[_KRX_AI_KEY] = ask_krx_cot_agent(
+                    prompt, selected_engine,
+                )
 
     with col_ai2:
+        ai_res = st.session_state.get(_KRX_AI_KEY)
         if ai_res:
             st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
             with st.container(border=True):
-                step_info = ai_res.get("pipeline_step", "AI")
-                st.caption(f"파이프라인: {step_info}")
+                st.caption(f"파이프라인: {ai_res.get('pipeline_step', 'AI')}")
                 st.divider()
-                st.markdown(ai_res.get("response", ""))
+
+                # [버그 수정] ai_res.get("response", "")는 실패했을 때
+                # 빈 화면만 남겼습니다. 실패한 결과에도 response 키가 빈
+                # 문자열로 **존재**해서 기본값이 쓰이지 않기 때문입니다.
+                body, ok = extract_report_text(ai_res)
+                if ok:
+                    st.markdown(body)
+                else:
+                    st.error(f"AI 해설을 생성하지 못했습니다.\n\n```\n{body}\n```")
