@@ -7,6 +7,7 @@ tests/test_store.py
 import os
 import sys
 
+import ast
 import pathlib
 import pandas as pd
 import pytest
@@ -1749,11 +1750,73 @@ def test_store_only_never_calls_live_even_when_stale(db, clean_refresh, monkeypa
     assert calls == []
 
 
+def _called_names(path) -> list[str]:
+    """
+    파일 안에서 실제로 **호출되는** 함수 이름을 점 표기로 모두 모읍니다.
+
+    파라미터:
+        path : 프로젝트 루트 기준 경로(str 또는 Path).
+
+    반환값:
+        호출된 이름의 리스트. 예) ["st.cache_data.clear",
+        "store.request_refresh", "refresh_button"]. 같은 호출이 두 번
+        나오면 리스트에도 두 번 들어갑니다(개수 비교에 씁니다).
+
+    주의사항:
+        - 문자열 검색이 아니라 AST를 봅니다. 주석과 독스트링에 적힌 설명
+          문구("st.cache_data.clear()만 부르면 안 됩니다" 같은)를 실제
+          호출로 착각하지 않기 위해서입니다. 예전 버전은 '#' 줄만 걷어내서,
+          독스트링에 적힌 함수명을 그대로 세는 문제가 있었습니다.
+        - 호출된 대상이 이름/속성이 아닌 경우(예: 리스트 인덱싱 결과를
+          바로 호출)는 건너뜁니다. 이 테스트에는 그런 형태가 없습니다.
+    """
+    tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+
+    names = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        parts = []
+        target = node.func
+        while isinstance(target, ast.Attribute):
+            parts.append(target.attr)
+            target = target.value
+        if isinstance(target, ast.Name):
+            parts.append(target.id)
+            names.append(".".join(reversed(parts)))
+
+    return names
+
+
+def test_refresh_helper_pairs_cache_clear_with_store_refresh():
+    """
+    새로고침 처리의 단일 출처(views/_ui.py)가 실제로 저장 계층 갱신을
+    요청하는지 확인합니다.
+
+    [회귀] 원래 버그는 버튼이 st.cache_data.clear()만 부른 것이었습니다.
+    그러면 다음 조회가 cached_or_live로 들어가 아직 신선한 SQLite 저장본을
+    그대로 돌려주기 때문에, 눌러도 화면의 숫자가 하나도 바뀌지 않습니다.
+    두 호출은 반드시 짝이어야 합니다.
+    """
+    calls = _called_names("views/_ui.py")
+
+    assert "store.request_refresh" in calls, (
+        "공용 새로고침 헬퍼가 저장 계층 갱신을 요청하지 않습니다"
+    )
+    assert calls.count("st.cache_data.clear") <= calls.count(
+        "store.request_refresh"
+    ), "헬퍼에 request_refresh 없이 캐시만 비우는 자리가 있습니다"
+
+
 def test_every_refresh_button_requests_store_refresh():
     """
-    새로고침 버튼이 st.cache_data.clear()만 하던 원래 버그가 되살아나지
-    않도록, 버튼이 있는 모든 화면이 store.request_refresh()를 부르는지
-    소스에서 확인합니다.
+    새로고침 버튼이 있는 모든 화면이 공용 헬퍼를 거치는지 소스에서
+    확인합니다.
+
+    예전에는 이 블록이 화면마다 복사돼 있어서, 각 파일이 직접
+    store.request_refresh()를 부르는지 검사했습니다. 지금은 처리 내용이
+    views/_ui.py 한 곳에 있으므로 "헬퍼를 쓰는가"를 대신 확인합니다.
+    지키려는 성질은 같습니다 — **캐시만 비우고 끝나는 자리가 없어야 한다.**
     """
     files = [
         "app.py",
@@ -1762,16 +1825,35 @@ def test_every_refresh_button_requests_store_refresh():
         "views/radar_view.py",
     ]
     for name in files:
-        source = pathlib.Path(name).read_text(encoding="utf-8")
-        # 주석에 적힌 설명 문구는 세지 않습니다. 실제 호출만 봅니다.
-        code = "\n".join(
-            line for line in source.splitlines()
-            if not line.lstrip().startswith("#")
-        )
-        assert "새로고침" in code, name
-        assert "store.request_refresh()" in code, (
+        calls = _called_names(name)
+
+        # 버튼 문구는 헬퍼의 기본값을 쓰는 화면도 있으므로 소스에서 찾지
+        # 않습니다. "새로고침 경로를 타는가"는 아래 호출 검사로 확인합니다.
+        goes_through_helper = "refresh_button" in calls
+        calls_directly = "store.request_refresh" in calls
+        assert goes_through_helper or calls_directly, (
             f"{name}의 새로고침 버튼이 저장 계층 갱신을 요청하지 않습니다"
         )
-        assert code.count("st.cache_data.clear()") <= code.count(
-            "store.request_refresh()"
+
+        # 헬퍼를 쓰지 않고 직접 캐시를 비우는 자리가 남아 있으면 안 됩니다.
+        assert calls.count("st.cache_data.clear") <= calls.count(
+            "store.request_refresh"
         ), f"{name}에 request_refresh 없이 캐시만 비우는 자리가 남아 있습니다"
+
+
+def test_refresh_button_helper_is_the_only_copy():
+    """
+    새로고침 처리가 다시 화면마다 복사되지 않도록 고정합니다.
+
+    같은 로직이 네 벌로 흩어져 있던 탓에, 캐시만 비우던 버그를 고칠 때
+    일부 화면만 고쳐지는 일이 실제로 있었습니다.
+    """
+    copies = [
+        path.name
+        for path in pathlib.Path("views").glob("*.py")
+        if path.name != "_ui.py"
+        and "store.request_refresh" in _called_names(path)
+    ]
+    assert not copies, (
+        f"views/_ui.py 밖에서 새로고침 처리를 다시 구현한 화면이 있습니다: {copies}"
+    )

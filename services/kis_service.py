@@ -2,49 +2,53 @@
 services/kis_service.py
 한국투자증권(KIS) Open API 통신 엔진 및 토큰 관리 모듈
 """
-import os
 import logging
-import requests
 import streamlit as st
+
+# 시크릿 탐색 규칙은 services/secrets.py 한 곳에만 둡니다.
+# 이 모듈에도 같은 35줄짜리 구현이 복사돼 있었습니다.
+# 이름은 그대로 재노출합니다 — collector.py 등이 kis_service.get_secret을
+# 직접 import 해서 쓰고 있습니다.
+from services.secrets import get_secret
+
+# 모듈 레벨 requests.get/post는 호출마다 Session을 새로 만들고 버려서
+# 요청 1건마다 DNS → TCP → TLS 핸드셰이크를 다시 칩니다. 공용 세션은
+# 커넥션을 재사용(keep-alive)하므로 같은 호스트로 가는 두 번째
+# 요청부터 그 비용이 사라집니다. 재시도가 없는 세션을 쓰는 이유는
+# http_client.get_api_session()의 독스트링을 보세요.
+from services.http_client import get_api_session
 
 logger = logging.getLogger(__name__)
 
 
-def get_secret(key_path: str, default: str = "") -> str:
-    """Streamlit Secrets (중첩 섹션, 대소문자, 단일 키 지원) 및 환경변수 안전 로드"""
-    try:
-        if hasattr(st, "secrets") and st.secrets:
-            # 1. dot notation 중첩 탐색 (예: "kis.app_key")
-            keys = key_path.split(".")
-            val = st.secrets
-            found = True
-            for k in keys:
-                if hasattr(val, "get") and val.get(k) is not None:
-                    val = val.get(k)
-                elif hasattr(val, "get") and val.get(k.lower()) is not None:
-                    val = val.get(k.lower())
-                elif hasattr(val, "get") and val.get(k.upper()) is not None:
-                    val = val.get(k.upper())
-                elif hasattr(val, "__getitem__") and k in val:
-                    val = val[k]
-                else:
-                    found = False
-                    break
-            if found and val is not None:
-                return str(val).strip()
 
-            # 2. 단일 키 탐색 (예: "kis_app_key", "KIS_APP_KEY", "app_key")
-            leaf = keys[-1]
-            for candidate in [key_path, key_path.replace(".", "_"), leaf, leaf.lower(), leaf.upper()]:
-                if hasattr(st.secrets, "get") and st.secrets.get(candidate) is not None:
-                    return str(st.secrets.get(candidate)).strip()
-                if hasattr(st.secrets, "__contains__") and candidate in st.secrets:
-                    return str(st.secrets[candidate]).strip()
-    except Exception:
-        pass
-    
-    # 3. 환경변수 탐색
-    return os.environ.get(key_path, os.environ.get(key_path.replace(".", "_").upper(), default))
+def get_kis_credentials() -> tuple[str, str]:
+    """
+    KIS 앱키 한 쌍을 읽어 옵니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        (app_key, app_secret) 튜플. 설정되지 않았으면 각각 빈 문자열입니다.
+        호출부는 `if not app_key or not app_secret:` 한 줄로 미설정을
+        판정할 수 있습니다.
+
+    주의사항:
+        - 탐색 우선순위는 [kis] app_key → KIS_APP_KEY → kis_app_key 입니다.
+          get_secret()의 default 인자를 중첩해 이 순서를 만듭니다.
+        - 값을 캐시하지 않습니다. 사용자가 secrets.toml을 고친 뒤 앱을
+          재시작하지 않아도 다음 호출부터 새 키가 반영돼야 하기 때문입니다.
+        - 반환값을 로그에 찍지 마세요. 자격증명입니다.
+    """
+    app_key = get_secret(
+        "kis.app_key", get_secret("KIS_APP_KEY", get_secret("kis_app_key", "")),
+    )
+    app_secret = get_secret(
+        "kis.app_secret",
+        get_secret("KIS_APP_SECRET", get_secret("kis_app_secret", "")),
+    )
+    return app_key, app_secret
 
 
 KIS_APP_KEY = get_secret("kis.app_key", get_secret("KIS_APP_KEY", get_secret("kis_app_key", "")))
@@ -68,8 +72,7 @@ def get_kis_access_token() -> str:
     그 사이에 secrets.toml의 키를 고쳐도 앱을 재시작하기 전까지 계속
     실패했습니다. 무엇을 고쳐도 안 되는 것처럼 보이는 상태였습니다.
     """
-    app_key = get_secret("kis.app_key", get_secret("KIS_APP_KEY", get_secret("kis_app_key", "")))
-    app_secret = get_secret("kis.app_secret", get_secret("KIS_APP_SECRET", get_secret("kis_app_secret", "")))
+    app_key, app_secret = get_kis_credentials()
 
     if not app_key or not app_secret:
         return ""
@@ -85,8 +88,7 @@ def get_kis_access_token() -> str:
 
 def _request_kis_token() -> str:
     """토큰을 실제로 발급받습니다 (캐시 없음)."""
-    app_key = get_secret("kis.app_key", get_secret("KIS_APP_KEY", get_secret("kis_app_key", "")))
-    app_secret = get_secret("kis.app_secret", get_secret("KIS_APP_SECRET", get_secret("kis_app_secret", "")))
+    app_key, app_secret = get_kis_credentials()
 
     if not app_key or not app_secret:
         return ""
@@ -99,7 +101,7 @@ def _request_kis_token() -> str:
     }
 
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        res = get_api_session().post(url, json=payload, timeout=10)
         if res.status_code == 200:
             data = res.json()
             return data.get("access_token", "")
@@ -112,8 +114,7 @@ def _request_kis_token() -> str:
 
 def call_kis_api(tr_id: str, endpoint: str, params: dict) -> dict:
     """KIS API GET 공통 호출기 (상세 에러 코드 반환 지원)"""
-    app_key = get_secret("kis.app_key", get_secret("KIS_APP_KEY", get_secret("kis_app_key", "")))
-    app_secret = get_secret("kis.app_secret", get_secret("KIS_APP_SECRET", get_secret("kis_app_secret", "")))
+    app_key, app_secret = get_kis_credentials()
 
     if not app_key or not app_secret:
         return {"rt_cd": "-1", "msg1": "Streamlit Secrets에 'kis.app_key' 또는 'kis_app_key'가 등록되지 않았습니다."}
@@ -133,7 +134,7 @@ def call_kis_api(tr_id: str, endpoint: str, params: dict) -> dict:
     }
 
     try:
-        res = requests.get(url, headers=headers, params=params, timeout=10)
+        res = get_api_session().get(url, headers=headers, params=params, timeout=10)
         if res.status_code == 200:
             return res.json()
         

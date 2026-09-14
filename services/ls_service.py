@@ -2,45 +2,47 @@
 services/ls_service.py
 LS증권 OPEN API 통신 엔진 및 토큰 관리 모듈
 """
-import os
 import logging
-import requests
 import streamlit as st
+
+# 시크릿 탐색 규칙은 services/secrets.py 한 곳에만 둡니다.
+# 이름은 그대로 재노출합니다 (외부에서 ls_service.get_secret을 씁니다).
+from services.secrets import get_secret
+
+# 모듈 레벨 requests.get/post는 호출마다 Session을 새로 만들고 버려서
+# 요청 1건마다 DNS → TCP → TLS 핸드셰이크를 다시 칩니다. 공용 세션은
+# 커넥션을 재사용(keep-alive)하므로 같은 호스트로 가는 두 번째
+# 요청부터 그 비용이 사라집니다. 재시도가 없는 세션을 쓰는 이유는
+# http_client.get_api_session()의 독스트링을 보세요.
+from services.http_client import get_api_session
 
 logger = logging.getLogger(__name__)
 
 
-def get_secret(key_path: str, default: str = "") -> str:
-    """Streamlit Secrets (중첩 섹션 및 단일 키 지원) 및 환경변수 안전 로드"""
-    try:
-        if hasattr(st, "secrets") and st.secrets:
-            keys = key_path.split(".")
-            val = st.secrets
-            found = True
-            for k in keys:
-                if hasattr(val, "get") and val.get(k) is not None:
-                    val = val.get(k)
-                elif hasattr(val, "get") and val.get(k.lower()) is not None:
-                    val = val.get(k.lower())
-                elif hasattr(val, "get") and val.get(k.upper()) is not None:
-                    val = val.get(k.upper())
-                elif hasattr(val, "__getitem__") and k in val:
-                    val = val[k]
-                else:
-                    found = False
-                    break
-            if found and val is not None:
-                return str(val).strip()
 
-            leaf = keys[-1]
-            for candidate in [key_path, key_path.replace(".", "_"), leaf, leaf.lower(), leaf.upper()]:
-                if hasattr(st.secrets, "get") and st.secrets.get(candidate) is not None:
-                    return str(st.secrets.get(candidate)).strip()
-                if hasattr(st.secrets, "__contains__") and candidate in st.secrets:
-                    return str(st.secrets[candidate]).strip()
-    except Exception:
-        pass
-    return os.environ.get(key_path, os.environ.get(key_path.replace(".", "_").upper(), default))
+def get_ls_credentials() -> tuple[str, str]:
+    """
+    LS증권 앱키 한 쌍을 읽어 옵니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        (app_key, app_secret) 튜플. 설정되지 않았으면 각각 빈 문자열.
+
+    주의사항:
+        - 탐색 우선순위는 [ls] app_key → LS_APP_KEY → ls_app_key 입니다.
+        - 캐시하지 않습니다(키를 고친 뒤 재시작 없이 반영되도록).
+        - 반환값을 로그에 찍지 마세요. 자격증명입니다.
+    """
+    app_key = get_secret(
+        "ls.app_key", get_secret("LS_APP_KEY", get_secret("ls_app_key", "")),
+    )
+    app_secret = get_secret(
+        "ls.app_secret",
+        get_secret("LS_APP_SECRET", get_secret("ls_app_secret", "")),
+    )
+    return app_key, app_secret
 
 
 LS_APP_KEY = get_secret("ls.app_key", get_secret("LS_APP_KEY", get_secret("ls_app_key", "")))
@@ -106,8 +108,7 @@ def request_ls_token() -> tuple[str, str, str]:
     """
     global _resolved_base_url
 
-    app_key = get_secret("ls.app_key", get_secret("LS_APP_KEY", get_secret("ls_app_key", "")))
-    app_secret = get_secret("ls.app_secret", get_secret("LS_APP_SECRET", get_secret("ls_app_secret", "")))
+    app_key, app_secret = get_ls_credentials()
 
     if not app_key or not app_secret:
         return "", "secrets.toml에 [ls] app_key / app_secret이 없습니다.", FAIL_NO_KEYS
@@ -125,7 +126,7 @@ def request_ls_token() -> tuple[str, str, str]:
     for base in get_ls_base_urls():
         url = f"{base}/oauth2/token"
         try:
-            res = requests.post(url, headers=headers, data=payload, timeout=10)
+            res = get_api_session().post(url, headers=headers, data=payload, timeout=10)
         except Exception as e:                               # noqa: BLE001
             logger.warning("LS 토큰 발급 통신 실패 (%s): %s", base, e)
             network_errors.append(f"{base} → {type(e).__name__}")
@@ -168,8 +169,7 @@ def get_ls_access_token() -> str:
     전까지 계속 실패해서, 무엇을 고쳐도 안 되는 것처럼 보였습니다.
     실패는 캐시에 남기지 않습니다.
     """
-    app_key = get_secret("ls.app_key", get_secret("LS_APP_KEY", get_secret("ls_app_key", "")))
-    app_secret = get_secret("ls.app_secret", get_secret("LS_APP_SECRET", get_secret("ls_app_secret", "")))
+    app_key, app_secret = get_ls_credentials()
 
     if not app_key or not app_secret:
         return ""
@@ -185,8 +185,7 @@ def get_ls_access_token() -> str:
 
 def call_ls_api(tr_cd: str, tr_url: str, body_params: dict) -> dict:
     """LS증권 TR 실행 공통 함수"""
-    app_key = get_secret("ls.app_key", get_secret("LS_APP_KEY", get_secret("ls_app_key", "")))
-    app_secret = get_secret("ls.app_secret", get_secret("LS_APP_SECRET", get_secret("ls_app_secret", "")))
+    app_key, app_secret = get_ls_credentials()
 
     if not app_key or not app_secret:
         return {"rsp_msg": "Streamlit Secrets에 'ls.app_key' 또는 'ls_app_key'가 등록되지 않았습니다."}
@@ -209,7 +208,7 @@ def call_ls_api(tr_cd: str, tr_url: str, body_params: dict) -> dict:
     }
 
     try:
-        res = requests.post(url, headers=headers, json=body_params, timeout=10)
+        res = get_api_session().post(url, headers=headers, json=body_params, timeout=10)
         if res.status_code == 200:
             return res.json()
         

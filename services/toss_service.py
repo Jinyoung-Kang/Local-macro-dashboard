@@ -10,7 +10,15 @@ import logging
 
 import requests
 
+
 from config import get_toss_credentials
+
+# 모듈 레벨 requests.get/post는 호출마다 Session을 새로 만들고 버려서
+# 요청 1건마다 DNS → TCP → TLS 핸드셰이크를 다시 칩니다. 공용 세션은
+# 커넥션을 재사용(keep-alive)하므로 같은 호스트로 가는 두 번째
+# 요청부터 그 비용이 사라집니다. 재시도가 없는 세션을 쓰는 이유는
+# http_client.get_api_session()의 독스트링을 보세요.
+from services.http_client import get_api_session
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +48,7 @@ def _issue_access_token() -> tuple[str | None, str | None]:
         )
 
     try:
-        response = requests.post(
+        response = get_api_session().post(
             TOSS_AUTH_URL,
             data={
                 "grant_type": "client_credentials",
@@ -102,7 +110,7 @@ def test_toss_connection() -> tuple[bool, str]:
         return False, f"토큰 발급 실패: {error}"
 
     try:
-        response = requests.get(
+        response = get_api_session().get(
             f"{TOSS_API_BASE_URL}/api/v1/exchange-rate",
             headers={"Authorization": f"Bearer {token}"},
             params={
@@ -161,7 +169,7 @@ def get_exchange_rate(
         return {"error": error}
 
     try:
-        response = requests.get(
+        response = get_api_session().get(
             f"{TOSS_API_BASE_URL}/api/v1/exchange-rate",
             headers={"Authorization": f"Bearer {token}"},
             params={
@@ -198,7 +206,7 @@ def get_market_indicator_prices(symbols: list[str]) -> dict:
         return {"error": error}
 
     try:
-        response = requests.get(
+        response = get_api_session().get(
             f"{TOSS_API_BASE_URL}/api/v1/market-indicators/prices",
             headers={"Authorization": f"Bearer {token}"},
             params={"symbols": ",".join(symbols)},
@@ -235,7 +243,7 @@ def get_stock_prices(symbols: list[str]) -> dict:
         return {"error": error}
 
     try:
-        response = requests.get(
+        response = get_api_session().get(
             f"{TOSS_API_BASE_URL}/api/v1/prices",
             headers={"Authorization": f"Bearer {token}"},
             params={"symbols": ",".join(symbols)},

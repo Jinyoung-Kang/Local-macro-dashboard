@@ -17,11 +17,17 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests
 import streamlit as st
 import websocket
 
 from services.kis_service import KIS_APP_KEY, KIS_APP_SECRET, KIS_BASE_URL
+
+# 모듈 레벨 requests.get/post는 호출마다 Session을 새로 만들고 버려서
+# 요청 1건마다 DNS → TCP → TLS 핸드셰이크를 다시 칩니다. 공용 세션은
+# 커넥션을 재사용(keep-alive)하므로 같은 호스트로 가는 두 번째
+# 요청부터 그 비용이 사라집니다. 재시도가 없는 세션을 쓰는 이유는
+# http_client.get_api_session()의 독스트링을 보세요.
+from services.http_client import get_api_session
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +71,7 @@ def _get_ws_approval_key() -> str:
     }
 
     try:
-        res = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+        res = get_api_session().post(url, headers=headers, data=json.dumps(body), timeout=10)
         if res.status_code == 200:
             return res.json().get("approval_key", "")
         logger.warning(f"KIS 웹소켓 approval_key 발급 실패: HTTP {res.status_code} - {res.text[:300]}")

@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from services import store
+from views._ui import refresh_button
 from services.radar_service import (
     get_market_radar_scanner,
     get_stock_cumulative_flow_from_base,
@@ -204,19 +204,7 @@ def render_radar_view():
             f"{INTERVAL_LABELS.get(interval_sel, interval_sel)}"
         )
     with refresh_col:
-        if st.button("새로고침", width="stretch"):
-            # [버그 수정] st.cache_data.clear()만으로는 아직 신선한 SQLite
-            # 저장본이 그대로 반환돼 화면이 전혀 바뀌지 않았습니다.
-            # request_refresh()가 저장본을 낡은 것으로 만들어 실제로 다시
-            # 수집하게 합니다.
-            store.request_refresh()
-            st.cache_data.clear()
-            if store.get_read_mode() == store.READ_MODE_STORE_ONLY:
-                st.toast(
-                    "store_only 모드입니다. 저장본만 다시 읽었습니다.",
-                    icon="ℹ️",
-                )
-            st.rerun()
+        refresh_button("새로고침")
 
     st.markdown("---")
 

@@ -5,69 +5,19 @@ config.py
 import os
 import streamlit as st
 
+# 시크릿 탐색 규칙은 services/secrets.py 한 곳에만 둡니다.
+# 예전에는 같은 구현이 config.py · kis_service.py · ls_service.py 세 곳에
+# 복사돼 있어서, 한 곳을 고쳐도 나머지 두 곳이 옛 규칙으로 남았습니다.
+from services.secrets import export_scalar_secrets_to_env, get_secret
 
-def _export_secrets_to_env() -> None:
-    """
-    Streamlit Secrets의 "단일 스칼라 키"만 환경변수로 승격합니다.
-
-    - secrets.toml이 아예 없는 환경(새로 clone한 로컬, CI)에서 st.secrets를
-      순회하면 StreamlitSecretNotFoundError가 발생해 앱 전체가 import 단계에서
-      죽습니다. 반드시 예외를 흡수해야 합니다.
-    - [section] 형태의 중첩 테이블을 str()로 변환하면 "{'password': '...'}"
-      같은 문자열이 환경변수에 그대로 박혀 쓸모가 없을 뿐 아니라, 하위
-      프로세스에 자격증명이 노출됩니다. 스칼라 값만 승격합니다.
-    """
-    try:
-        items = list(st.secrets.items())
-    except Exception:
-        # secrets.toml 미존재/파싱 실패: 환경변수만으로 동작하도록 조용히 통과
-        return
-
-    for key, value in items:
-        if isinstance(value, (str, int, float, bool)):
-            os.environ.setdefault(str(key), str(value))
-
+# 하위 호환: 이 이름으로 직접 부르던 코드/테스트가 있습니다.
+_export_secrets_to_env = export_scalar_secrets_to_env
 
 _export_secrets_to_env()
 
 # ==============================================================================
 # 0. Secret & 환경 변수 로드 헬퍼 및 API 설정
 # ==============================================================================
-def get_secret(key_path: str, default: str = "") -> str:
-    """Streamlit Secrets (중첩 섹션 및 단일 키 지원) 및 환경변수 안전 로드"""
-    try:
-        if hasattr(st, "secrets") and st.secrets:
-            # 1. 'section.key' 형태 탐색
-            keys = key_path.split(".")
-            val = st.secrets
-            found = True
-            for k in keys:
-                if hasattr(val, "get") and val.get(k) is not None:
-                    val = val.get(k)
-                elif hasattr(val, "get") and val.get(k.lower()) is not None:
-                    val = val.get(k.lower())
-                elif hasattr(val, "get") and val.get(k.upper()) is not None:
-                    val = val.get(k.upper())
-                elif hasattr(val, "__getitem__") and k in val:
-                    val = val[k]
-                else:
-                    found = False
-                    break
-            if found and val is not None:
-                return str(val).strip()
-
-            # 2. 단일 키 탐색
-            leaf = keys[-1]
-            for candidate in [key_path, key_path.replace(".", "_"), leaf, leaf.lower(), leaf.upper()]:
-                if hasattr(st.secrets, "get") and st.secrets.get(candidate) is not None:
-                    return str(st.secrets.get(candidate)).strip()
-                if hasattr(st.secrets, "__contains__") and candidate in st.secrets:
-                    return str(st.secrets[candidate]).strip()
-    except Exception:
-        pass
-    return os.environ.get(key_path, os.environ.get(key_path.replace(".", "_").upper(), default))
-
-
 def get_krx_key() -> str:
     """
     Streamlit Secrets의 [krx] api_key 또는 auth_key / KRX_AUTH_KEY 등 다양한 포맷 자동 탐색

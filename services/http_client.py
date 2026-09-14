@@ -134,6 +134,40 @@ def get_fred_session() -> requests.Session:
     )
 
 
+@st.cache_resource(show_spinner=False)
+def get_api_session() -> requests.Session:
+    """
+    인증이 필요한 증권사/LLM API 전용 세션 (재시도 없음).
+
+    파라미터:
+        없음.
+
+    반환값:
+        프로세스당 하나만 만들어지는 requests.Session.
+        커넥션 풀(keep-alive)을 제공하므로, 같은 호스트로 가는 두 번째
+        요청부터 DNS → TCP → TLS 핸드셰이크 비용이 사라집니다.
+
+    주의사항:
+        - **재시도를 일부러 끕니다(total=0).** get_session()과의 유일한
+          차이입니다. 이 세션을 쓰는 곳(KIS·LS·토스·AI)은 호출부가
+          상태코드와 예외를 직접 해석해서 사용자에게 다른 안내를 내보냅니다.
+          특히 LS는 "즉시 connection refused"인지 "타임아웃"인지로 포트가
+          닫힌 것과 방화벽 드롭을 구분합니다. 어댑터가 뒤에서 조용히
+          재시도하면 그 판단 근거가 사라지고, 실패가 몇 배 느려집니다.
+        - 토큰 발급처럼 비용이 있는 호출도 이 세션을 탑니다. 중복 발급을
+          막는 것은 각 서비스의 캐시(@st.cache_data) 몫입니다.
+        - 세션 헤더를 요청 중에 바꾸지 마세요. 여러 스레드가 같은 세션을
+          공유하므로 경쟁 상태가 됩니다. 반드시 per-request `headers=`를
+          쓰세요.
+    """
+    return _build_session(
+        user_agent=DEFAULT_USER_AGENT,
+        total_retries=0,
+        backoff_factor=0.0,
+        status_forcelist=(),
+    )
+
+
 def fetch_text(
     url: str,
     *,

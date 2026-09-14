@@ -21,6 +21,34 @@ from services import verification_service as vs   # noqa: E402
 KST = ZoneInfo("Asia/Seoul")
 
 
+
+def _patch_post(monkeypatch, module, fake_post):
+    """
+    모듈이 HTTP POST에 쓰는 공용 세션을 가짜로 바꿔치웁니다.
+
+    파라미터:
+        monkeypatch : pytest의 monkeypatch 픽스처.
+        module      : 대상 모듈(services.ls_service 등).
+        fake_post   : `fake_post(url, **kwargs)` 형태의 대역 함수.
+
+    반환값:
+        없음. monkeypatch가 테스트 종료 시 자동으로 되돌립니다.
+
+    주의사항:
+        예전에는 `monkeypatch.setattr(module.requests, "post", ...)`로
+        requests 모듈 자체를 건드렸습니다. 그 방식은 requests를 전역으로
+        오염시켜, 같은 프로세스의 다른 테스트에도 영향을 줄 수 있었습니다.
+        지금은 서비스가 공용 세션(http_client.get_api_session)을 쓰므로,
+        그 세션 공급자만 대역으로 바꿉니다. 부작용이 이 테스트 안에
+        갇힙니다.
+    """
+    class _FakeSession:
+        post = staticmethod(fake_post)
+        get = staticmethod(fake_post)
+
+    monkeypatch.setattr(module, "get_api_session", lambda: _FakeSession())
+
+
 def _r(source, ok=True, value=None, detail=""):
     return vs.SourceReading(source=source, ok=ok, value=value, detail=detail)
 
@@ -862,7 +890,7 @@ def test_ls_token_prefers_443_and_falls_back_to_8080(monkeypatch):
         tried.append(url)
         return _Resp()
 
-    monkeypatch.setattr(ls.requests, "post", fake_post)
+    _patch_post(monkeypatch, ls, fake_post)
 
     token, reason, kind = ls.request_ls_token()
 
@@ -883,7 +911,7 @@ def test_ls_token_prefers_443_and_falls_back_to_8080(monkeypatch):
             raise ConnectionError("443 down")
         return _Resp()
 
-    monkeypatch.setattr(ls.requests, "post", only_8080)
+    _patch_post(monkeypatch, ls, only_8080)
     token2, _, _ = ls.request_ls_token()
     assert token2 == "tok-from-443"
     assert len(tried) == 2 and ":8080" in tried[1], tried
@@ -901,7 +929,7 @@ def test_ls_reports_network_kind_when_every_address_fails(monkeypatch):
     def always_fail(url, **kw):
         raise ConnectionError("unreachable")
 
-    monkeypatch.setattr(ls.requests, "post", always_fail)
+    _patch_post(monkeypatch, ls, always_fail)
 
     token, reason, kind = ls.request_ls_token()
     assert token == ""
@@ -944,7 +972,7 @@ def test_ls_tr_call_uses_the_address_that_worked(monkeypatch):
         seen["url"] = url
         return _Resp()
 
-    monkeypatch.setattr(ls.requests, "post", fake_post)
+    _patch_post(monkeypatch, ls, fake_post)
     ls.call_ls_api("t1452", "/stock/market-sum", {})
 
     assert seen["url"].startswith("https://openapi.ls-sec.co.kr/"), seen

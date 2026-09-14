@@ -196,3 +196,69 @@ def test_radar_uses_shared_browser_pool():
     from services.browser_pool import fetch_rendered_html
 
     assert r._fetch_rendered_html is fetch_rendered_html
+
+
+# ==============================================================================
+# 8. 외부 호출은 모두 공용 세션을 타야 한다 (핸드셰이크 재사용)
+# ==============================================================================
+def test_no_service_calls_module_level_requests():
+    """
+    [회귀] services/http_client.py는 커넥션 재사용을 위해 만들어졌는데,
+    kis/ls/toss/ai/websocket 서비스는 계속 모듈 레벨 requests.get/post를
+    불렀다. 그 함수들은 호출마다 Session을 새로 만들고 버리므로, 요청
+    1건마다 DNS → TCP → TLS 핸드셰이크를 처음부터 다시 친다.
+
+    `requests` 임포트 자체는 금지하지 않는다. 예외 타입
+    (requests.exceptions.Timeout 등)을 잡으려면 필요하다.
+    금지하는 것은 **호출**뿐이다.
+    """
+    import ast
+    import pathlib
+
+    offenders = []
+    for path in sorted(pathlib.Path("services").glob("*.py")):
+        if path.name == "http_client.py":      # 세션을 만드는 당사자
+            continue
+
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("get", "post", "put", "delete")
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "requests"
+            ):
+                offenders.append(f"{path.name}:{node.lineno}")
+
+    assert not offenders, (
+        "공용 세션을 거치지 않고 requests를 직접 호출하는 자리가 있습니다: "
+        + ", ".join(offenders)
+    )
+
+
+def test_api_session_does_not_retry():
+    """
+    KIS/LS/토스/AI 호출부는 상태코드와 예외를 직접 해석해 사용자에게 서로
+    다른 안내를 낸다. 특히 LS는 "즉시 connection refused"인지로 포트가
+    닫힌 것과 방화벽 드롭을 구분한다. 어댑터가 뒤에서 조용히 재시도하면
+    그 판단 근거가 사라지고 실패가 몇 배 느려진다.
+    """
+    from services.http_client import get_api_session
+
+    adapter = get_api_session().get_adapter("https://example.invalid/")
+    assert adapter.max_retries.total == 0
+
+
+def test_secret_lookup_has_a_single_implementation():
+    """
+    [회귀] 같은 35줄짜리 get_secret()이 config.py · kis_service.py ·
+    ls_service.py 세 곳에 복사돼 있었다. 시크릿 탐색 규칙이 여러 벌이면
+    "키를 분명히 넣었는데 앱은 없다고 한다"는 버그가 반복된다.
+    """
+    import config
+    from services import kis_service, ls_service, secrets
+
+    assert config.get_secret is secrets.get_secret
+    assert kis_service.get_secret is secrets.get_secret
+    assert ls_service.get_secret is secrets.get_secret

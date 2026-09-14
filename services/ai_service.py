@@ -7,8 +7,14 @@ AI 모델 레지스트리 기반 엔진 (NVIDIA, Cloudflare, Cerebras 및 자동
 import logging
 import re
 import time
-import requests
 from config import get_secret
+
+# 모듈 레벨 requests.get/post는 호출마다 Session을 새로 만들고 버려서
+# 요청 1건마다 DNS → TCP → TLS 핸드셰이크를 다시 칩니다. 공용 세션은
+# 커넥션을 재사용(keep-alive)하므로 같은 호스트로 가는 두 번째
+# 요청부터 그 비용이 사라집니다. 재시도가 없는 세션을 쓰는 이유는
+# http_client.get_api_session()의 독스트링을 보세요.
+from services.http_client import get_api_session
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +240,7 @@ def _call_openai_format(engine_name: str, endpoint: str, api_key: str, model: st
 
     start_time = time.time()
     try:
-        res = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+        res = get_api_session().post(endpoint, headers=headers, json=payload, timeout=timeout)
         elapsed_sec = round(time.time() - start_time, 2)
         elapsed_ms = int(elapsed_sec * 1000)
         
@@ -305,7 +311,7 @@ def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: s
 
     start_time = time.time()
     try:
-        res = requests.post(url, headers=headers, json={"messages": messages}, timeout=60)
+        res = get_api_session().post(url, headers=headers, json={"messages": messages}, timeout=60)
         elapsed_sec = round(time.time() - start_time, 2)
         elapsed_ms = int(elapsed_sec * 1000)
         
