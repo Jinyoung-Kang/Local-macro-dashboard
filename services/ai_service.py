@@ -137,6 +137,13 @@ NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 # max_tokens를 올리세요(모델의 컨텍스트 한도를 넘기면 400이 납니다).
 DEFAULT_MAX_TOKENS = 4096
 
+# 기본 샘플링 온도.
+#
+# 이 대시보드의 AI는 **주어진 수치를 해석**하는 일을 합니다. 창작이 아닙니다.
+# 온도를 올리면 표현은 다양해지지만 없는 값을 그럴듯하게 채워 넣을 위험이
+# 커집니다. 리포트 유형별로 0.2~0.25를 쓰고, 여기를 올리지 마세요.
+DEFAULT_TEMPERATURE = 0.25
+
 # 제공자 오류 본문을 몇 글자까지 싣을지.
 #
 # [버그 수정] 200자였습니다. 그런데 NVIDIA의 서비스 종료(410) 응답은
@@ -245,114 +252,23 @@ def format_ai_engine(engine_id: str) -> str:
 
 
 # ==============================================================================
-# 0-2. 리포트 유형별 분석 지시 (리포트 유형 선택이 실제로 분석을 바꾸는 지점)
+# 0-2. 리포트 프로파일 (프롬프트 본문은 services/prompts.py에 있습니다)
 # ==============================================================================
-# [버그 수정] 예전에는 세 가지 리포트 유형이 **완전히 같은 system_prompt**를
-# 받았습니다. 선택한 유형은 Context 끝에 한 줄로 덧붙기만 했으므로, 어느
-# 것을 골라도 사실상 같은 리포트가 나왔습니다. 유형별로 관점·구성·강조점을
-# 다르게 지시합니다.
-_COMMON_OUTPUT_RULES = """
-[출력 규칙]
-1. 반드시 한국어로 작성하십시오.
-2. Markdown 제목(###), 표(| --- |), 불릿을 사용해 구조화하십시오.
-3. 인사말·메타 발언("분석해 드리겠습니다" 등)을 쓰지 마십시오.
-4. 제공된 데이터에 없는 수치를 지어내지 마십시오. 데이터가 없으면
-   "데이터 없음"이라고 명시하십시오.
-5. 값이 추정치(proxy/estimated)로 표시된 지표는 **추정치임을 밝히고**
-   공식 지표와 같은 임계치로 해석하지 마십시오.
-"""
-
-REPORT_PROFILES = {
-    "종합 거시경제 & 수급 전략": {
-        "label": "종합 거시경제 & 수급 전략",
-        "description": "전 영역을 훑어 시장 국면과 주간 대응 전략까지",
-        "system_prompt": (
-            "당신은 글로벌 헤지펀드의 최고투자책임자(CIO) 관점에서 시장을 "
-            "분석하는 수석 매크로 전략가입니다. 제공된 모든 영역의 데이터를 "
-            "기반으로 시장 국면, 수급 불균형, 핵심 리스크, 주간 포트폴리오 "
-            "대응 전략을 제시하십시오."
-            + _COMMON_OUTPUT_RULES +
-            """
-[필수 구성]
-### 1. 한줄 결론
-- **국면 판단**: [위험선호 / 중립 / 위험회피] 중 택1 (신뢰도: 높음/보통/낮음)
-- **핵심 요약**: 2문장 이내
-
-### 2. 거시 국면 진단
-금리·유동성·신용·변동성을 묶어 현재 국면을 규정하십시오.
-
-### 3. 수급 진단
-외국인·기관 수급과 글로벌 스마트머니(COT) 포지션의 정합/괴리를 보십시오.
-
-### 4. 핵심 리스크 3가지
-| 리스크 | 발생 조건 | 확인 지표 |
-
-### 5. 주간 대응 전략
-자산군별 비중 방향과 트리거를 불릿으로.
-"""
-        ),
-    },
-    "외국인/기관 수급 집중 분석": {
-        "label": "외국인/기관 수급 집중 분석",
-        "description": "국내 수급 주체의 행동에 집중",
-        "system_prompt": (
-            "당신은 한국 주식시장의 수급 분석에 특화된 퀀트 전략가입니다. "
-            "거시 지표는 **배경으로만** 쓰고, 분석의 중심은 외국인·기관의 "
-            "실제 매매 행동과 KRX 파생 포지션에 두십시오."
-            + _COMMON_OUTPUT_RULES +
-            """
-[필수 구성]
-### 1. 한줄 결론
-- **수급 판단**: [외국인 주도 매수 / 기관 주도 매수 / 혼조 / 동반 매도] 중 택1
-- **핵심 요약**: 2문장 이내
-
-### 2. 주체별 행동 해부
-| 주체 | 방향 | 강도 | 집중 업종·종목 | 해석 |
-
-### 3. 현물 vs 파생 정합성
-KOSPI200 선물 미결제약정·베이시스가 현물 수급과 같은 이야기를 하는지,
-어긋난다면 그 의미는 무엇인지.
-
-### 4. 글로벌 스마트머니와의 대조
-CFTC COT 포지션이 국내 수급과 같은 방향인지.
-
-### 5. 추적할 트리거
-향후 1~3거래일 내 확인해야 할 신호를 불릿으로.
-"""
-        ),
-    },
-    "금리 및 유동성 리스크 점검": {
-        "label": "금리 및 유동성 리스크 점검",
-        "description": "금리·유동성·신용 리스크에 집중",
-        "system_prompt": (
-            "당신은 채권·크레딧 리스크를 전담하는 매크로 리스크 매니저입니다. "
-            "주식 수급은 **참고로만** 쓰고, 금리 구조·연준 유동성·신용 "
-            "스프레드·변동성의 상호작용에 집중하십시오."
-            + _COMMON_OUTPUT_RULES +
-            """
-[필수 구성]
-### 1. 한줄 결론
-- **리스크 수준**: [낮음 / 보통 / 높음 / 경계] 중 택1
-- **핵심 요약**: 2문장 이내
-
-### 2. 금리 구조
-장단기 금리차, 실질금리, 기대인플레를 묶어 곡선이 말하는 바를 규정하십시오.
-
-### 3. 유동성
-연준 순유동성(WALCL − TGA − RRP)의 방향과 그 속도가 위험자산에 주는 압력.
-
-### 4. 신용 스트레스
-| 지표 | 현재 | 임계치 | 판정 |
-하이일드 OAS, IG 스프레드, 금융스트레스지수, NFCI를 표로.
-
-### 5. 경보 조건
-"이 선을 넘으면 국면이 바뀐다"는 수치를 명시하십시오.
-"""
-        ),
-    },
-}
-
-DEFAULT_REPORT_TYPE = "종합 거시경제 & 수급 전략"
+# [구조 개선] 예전에는 리포트 유형별 system prompt가 이 파일 안에 긴
+# 문자열로 박혀 있었습니다. 그 결과
+#   - services/prompts.py에는 아무도 쓰지 않는 COMPREHENSIVE_REPORT_PROMPT가
+#     따로 남아 프롬프트가 두 벌로 갈라졌고,
+#   - "데이터를 지어내지 마라" 같은 공통 규칙을 유형마다 복사해야 했습니다.
+#
+# 지금은 prompts.py가 블록(역할·데이터 취급·신뢰도 기준·서식)을 조립해
+# 프로파일을 만들고, 이 모듈은 그것을 **가져다 쓰기만** 합니다.
+from services.prompts import (                                  # noqa: E402
+    CONFIDENCE_LEVELS,
+    DEFAULT_REPORT_TYPE,
+    REPORT_PROFILES,
+    VERDICT_FIELDS,
+    VERDICT_SECTION,
+)
 
 
 def get_report_types() -> list[str]:
@@ -366,8 +282,9 @@ def get_report_types() -> list[str]:
         리포트 유형 이름의 리스트. 화면 selectbox의 options로 그대로 씁니다.
 
     주의사항:
-        이 목록과 REPORT_PROFILES의 키는 항상 같아야 합니다. 화면에 옵션을
-        추가하면서 프로파일을 빠뜨리면 기본 프로파일로 조용히 대체됩니다.
+        목록의 출처는 services/prompts.REPORT_PROFILES 하나뿐입니다.
+        화면에 옵션을 손으로 추가하지 마세요 — 프로파일이 없는 유형은
+        조용히 기본 유형으로 떨어집니다.
     """
     return list(REPORT_PROFILES.keys())
 
@@ -390,6 +307,33 @@ def get_report_system_prompt(report_type: str) -> str:
     """
     profile = REPORT_PROFILES.get(report_type) or REPORT_PROFILES[DEFAULT_REPORT_TYPE]
     return profile["system_prompt"]
+
+
+def get_report_generation_params(report_type: str) -> dict:
+    """
+    리포트 유형에 맞는 생성 파라미터를 돌려줍니다.
+
+    파라미터:
+        report_type : REPORT_PROFILES의 키.
+
+    반환값:
+        {"temperature": float, "max_tokens": int} dict.
+
+    주의사항:
+        - 리포트 유형마다 필요한 길이가 다릅니다. 종합 리포트는 섹션이
+          다섯이라 상한이 모자라면 마지막 섹션(반증 조건)이 통째로
+          잘립니다. 화면에서 리포트가 문장 중간에 끊겨 있다면 이 값을
+          먼저 의심하세요.
+        - temperature를 올리면 문장은 다양해지지만 **수치를 지어낼
+          위험이 커집니다.** 이 용도에서는 0.2~0.3을 벗어나지 마세요.
+        - 모델의 컨텍스트 한도를 넘기면 400이 납니다. 상한을 올릴 때는
+          엔진 점검으로 실제 동작을 확인하세요.
+    """
+    profile = REPORT_PROFILES.get(report_type) or REPORT_PROFILES[DEFAULT_REPORT_TYPE]
+    return {
+        "temperature": profile.get("temperature", 0.3),
+        "max_tokens": profile.get("max_tokens", DEFAULT_MAX_TOKENS),
+    }
 
 
 # ==============================================================================
@@ -457,6 +401,118 @@ def extract_report_text(result: dict) -> tuple[str, bool]:
         error = "엔진이 빈 응답을 돌려주었습니다 (원인 정보 없음)."
 
     return error, False
+
+
+
+# ==============================================================================
+# 0-4. 리포트 구조 파서 (프롬프트와 화면 사이의 계약)
+# ==============================================================================
+# 프롬프트가 "### 제목" 형태로 정해진 섹션을 내도록 지시하고, 여기서 그
+# 구조를 되읽습니다. 화면은 이 결과로 총평 배너·섹션 카드를 그립니다.
+#
+# **파싱은 실패해도 됩니다.** 모델이 형식을 어기는 일은 늘 있습니다.
+# 그때는 sections를 비우고 원문을 그대로 넘겨, 화면이 일반 마크다운으로
+# 떨어지게 합니다. 내용을 잃는 것이 가장 나쁩니다.
+_HEADING = re.compile(r"^#{2,4}\s*(?:\d+\.\s*)?(.+?)\s*$", re.MULTILINE)
+
+# "- **판단**: 위험선호" 형태에서 값만 뽑습니다.
+# 굵게 표시(**)가 없거나 콜론이 전각(：)인 경우까지 받아 줍니다 —
+# 모델이 이 정도는 흔히 어깁니다.
+def _field_pattern(label: str) -> "re.Pattern":
+    return re.compile(
+        rf"^\s*[-*]?\s*\**\s*{re.escape(label)}\s*\**\s*[:：]\s*(.+?)\s*$",
+        re.MULTILINE,
+    )
+
+
+def parse_report_sections(text: str) -> dict:
+    """
+    리포트 본문을 총평과 섹션들로 갈라 냅니다.
+
+    파라미터:
+        text : 모델이 돌려준 리포트 마크다운 본문.
+
+    반환값:
+        {
+          "verdict": {"판단": str|None, "신뢰도": str|None, "핵심 근거": str|None},
+          "sections": [{"title": str, "body": str}, ...],   # 총평 제외
+          "preamble": str,      # 첫 제목 앞에 붙은 내용(대개 빈 문자열)
+          "structured": bool,   # 계약대로 파싱됐는지
+        }
+
+    주의사항:
+        - **structured가 False면 sections를 쓰지 마세요.** 모델이 형식을
+          어긴 것이므로 화면은 원문을 그대로 마크다운으로 그려야 합니다.
+          섹션이 하나도 없는데 억지로 나누면 내용이 사라집니다.
+        - 제목 인식은 `##`~`####`를 받고 "1." 같은 번호를 떼어 냅니다.
+          프롬프트는 `###`만 지시하지만 모델이 깊이를 바꾸는 일이 흔합니다.
+        - verdict의 값은 **모델이 쓴 문자열 그대로**입니다. 허용 집합에
+          없는 값이 올 수 있으므로, 화면에서 색을 고를 때는 정확히 일치할
+          때만 색을 주고 아니면 중립으로 두세요.
+        - 원문을 수정하지 않습니다. 이 함수는 읽기만 합니다.
+    """
+    empty_verdict = {label: None for label in VERDICT_FIELDS.values()}
+
+    if not text or not text.strip():
+        return {
+            "verdict": empty_verdict, "sections": [],
+            "preamble": "", "structured": False,
+        }
+
+    matches = list(_HEADING.finditer(text))
+    if not matches:
+        return {
+            "verdict": empty_verdict, "sections": [],
+            "preamble": text.strip(), "structured": False,
+        }
+
+    preamble = text[: matches[0].start()].strip()
+
+    blocks = []
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        blocks.append({
+            "title": match.group(1).strip().lstrip("#").strip(),
+            "body": text[match.end():end].strip(),
+        })
+
+    verdict = dict(empty_verdict)
+    sections = []
+    for block in blocks:
+        if VERDICT_SECTION in block["title"]:
+            for label in VERDICT_FIELDS.values():
+                found = _field_pattern(label).search(block["body"])
+                if found:
+                    verdict[label] = found.group(1).strip().strip("*").strip()
+            continue
+        sections.append(block)
+
+    # 총평의 판단 하나라도 읽혔고 섹션이 남아 있으면 계약대로 본 것으로 봅니다.
+    structured = bool(sections) and any(v for v in verdict.values())
+
+    return {
+        "verdict": verdict,
+        "sections": sections,
+        "preamble": preamble,
+        "structured": structured,
+    }
+
+
+def get_confidence_levels() -> tuple:
+    """
+    신뢰도 어휘 집합.
+
+    파라미터:
+        없음.
+
+    반환값:
+        ("높음", "보통", "낮음") 튜플.
+
+    주의사항:
+        프롬프트가 지시하는 값과 같아야 합니다. 출처는
+        services/prompts.CONFIDENCE_LEVELS 하나입니다.
+    """
+    return CONFIDENCE_LEVELS
 
 
 # ==============================================================================
@@ -570,6 +626,7 @@ def _call_openai_format(
     system_prompt: str = None,
     timeout: int = 120,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
 ) -> dict:
     """
     OpenAI 호환 /chat/completions 엔드포인트를 호출합니다 (NVIDIA·Cerebras 공용).
@@ -583,6 +640,9 @@ def _call_openai_format(
         system_prompt: 시스템 메시지. None이면 넣지 않습니다.
         timeout      : 초 단위 제한 시간.
         max_tokens   : 생성 상한. 긴 리포트는 이 값에서 잘립니다.
+        temperature  : 샘플링 온도. 이 용도(수치 분석)에서는 낮게 두십시오.
+                       올리면 문장은 다양해지지만 **수치를 지어낼 위험이
+                       커집니다.**
 
     반환값:
         표준 결과 dict. 성공/실패와 무관하게 아래 키가 **항상** 있습니다.
@@ -622,7 +682,7 @@ def _call_openai_format(
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.3,
+        "temperature": temperature,
         "max_tokens": max_tokens,
     }
 
@@ -668,21 +728,37 @@ def _call_openai_format(
         }
 
 
-def call_nvidia_model(engine_id: str, api_key: str, prompt: str, system_prompt: str = None) -> dict:
+def call_nvidia_model(
+    engine_id: str,
+    api_key: str,
+    prompt: str,
+    system_prompt: str = None,
+    generation: dict | None = None,
+) -> dict:
     config = AI_MODEL_REGISTRY.get(engine_id)
     if not config:
         return {
             "status": False, "response": "", "error": f"존재하지 않는 엔진 ID: {engine_id}",
             "provider": "NVIDIA", "pipeline_step": "설정 에러", "latency_ms": 0, "latency": 0.0
         }
+    gen = generation or {}
     return _call_openai_format(
         engine_name=config["label"], endpoint=NVIDIA_CHAT_URL, api_key=api_key,
         model=config["model"], prompt=prompt, system_prompt=system_prompt,
-        timeout=120, max_tokens=config.get("max_tokens", DEFAULT_MAX_TOKENS),
+        timeout=120,
+        max_tokens=gen.get("max_tokens", config.get("max_tokens", DEFAULT_MAX_TOKENS)),
+        temperature=gen.get("temperature", DEFAULT_TEMPERATURE),
     )
 
 
-def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: str, system_prompt: str = None) -> dict:
+def call_cloudflare_model(
+    model: str,
+    account_id: str,
+    api_token: str,
+    prompt: str,
+    system_prompt: str = None,
+    generation: dict | None = None,
+) -> dict:
     if not account_id or not api_token:
         return {
             "status": False, "response": "", "error": "Cloudflare 인증 정보 누락",
@@ -700,7 +776,16 @@ def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: s
 
     start_time = time.time()
     try:
-        res = get_api_session().post(url, headers=headers, json={"messages": messages}, timeout=60)
+        # [개선] 예전에는 messages만 보냈습니다. 그러면 Cloudflare의 기본
+        # 생성 상한(모델마다 다르고 대체로 짧습니다)이 적용돼, 긴 리포트가
+        # 문장 중간에서 잘렸습니다. 다른 제공자와 같은 파라미터를 보냅니다.
+        gen = generation or {}
+        payload = {
+            "messages": messages,
+            "max_tokens": gen.get("max_tokens", DEFAULT_MAX_TOKENS),
+            "temperature": gen.get("temperature", DEFAULT_TEMPERATURE),
+        }
+        res = get_api_session().post(url, headers=headers, json=payload, timeout=90)
         elapsed_sec = round(time.time() - start_time, 2)
         elapsed_ms = int(elapsed_sec * 1000)
         
@@ -735,24 +820,85 @@ def call_cloudflare_model(model: str, account_id: str, api_token: str, prompt: s
         }
 
 
-def call_cerebras_model(model: str, api_key: str, prompt: str, system_prompt: str = None) -> dict:
+def call_cerebras_model(
+    model: str,
+    api_key: str,
+    prompt: str,
+    system_prompt: str = None,
+    generation: dict | None = None,
+) -> dict:
+    """
+    Cerebras의 OpenAI 호환 엔드포인트를 호출합니다.
+
+    파라미터:
+        model        : Cerebras가 아는 모델 ID.
+        api_key      : Cerebras API 키.
+        prompt       : 사용자 메시지.
+        system_prompt: 시스템 메시지.
+        generation   : {"temperature", "max_tokens"} 생성 파라미터.
+                       None이면 기본값.
+
+    반환값:
+        표준 결과 dict (_call_openai_format과 동일).
+
+    주의사항:
+        2026-09-14 점검에서 이 계정의 llama-3.3-70b는 404였습니다.
+        모델 ID가 다르거나 계정 권한이 없을 수 있습니다.
+    """
+    gen = generation or {}
     return _call_openai_format(
-        engine_name=f"Cerebras ({model})", endpoint="https://api.cerebras.ai/v1/chat/completions",
-        api_key=api_key, model=model, prompt=prompt, system_prompt=system_prompt, timeout=60
+        engine_name=f"Cerebras ({model})",
+        endpoint="https://api.cerebras.ai/v1/chat/completions",
+        api_key=api_key, model=model, prompt=prompt, system_prompt=system_prompt,
+        timeout=60,
+        max_tokens=gen.get("max_tokens", DEFAULT_MAX_TOKENS),
+        temperature=gen.get("temperature", DEFAULT_TEMPERATURE),
     )
 
 
 # ==============================================================================
 # 3. 통합 라우터 및 자동 Failover 브리핑 엔진
 # ==============================================================================
-def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = None) -> dict:
+def call_selected_ai_engine(
+    engine_name: str,
+    prompt: str,
+    system_prompt: str = None,
+    generation: dict | None = None,
+) -> dict:
+    """
+    엔진 이름을 해석해 해당 제공자를 호출합니다 (통합 라우터).
+
+    파라미터:
+        engine_name  : AI_MODEL_REGISTRY의 키, 또는 레이블/모델명.
+                       "auto"면 자동 탐색(Failover)으로 넘깁니다.
+        prompt       : 사용자 메시지(대개 대시보드 Context).
+        system_prompt: 시스템 메시지(리포트 유형별 지시).
+        generation   : {"temperature", "max_tokens"}. None이면 엔진 기본값.
+
+    반환값:
+        표준 결과 dict. status/response/error/provider/pipeline_step/
+        latency_ms/latency 키가 항상 있습니다.
+
+    주의사항:
+        - **본문을 꺼낼 때는 extract_report_text()를 쓰세요.** 실패한
+          결과에도 response 키가 빈 문자열로 존재해서, dict.get의 기본값에
+          기대면 빈 화면이 됩니다.
+        - engine_name이 레지스트리 키가 아니면 레이블·모델명으로 찾고,
+          그래도 없으면 부분 문자열로 추측합니다. 이 추측 경로는 옛
+          호출부(자유 문자열로 엔진을 넘기던 코드)를 위한 것이므로
+          새 코드는 반드시 레지스트리 **키**를 넘기세요.
+        - 응답이 한국어가 아니면 번역기를 한 번 더 호출합니다. 그만큼
+          느려지므로, 프롬프트에서 한국어를 지시하는 편이 낫습니다.
+    """
     nvidia_key = get_secret("ai.nvidia_api_key", get_secret("NVIDIA_API_KEY", ""))
     cloudflare_account_id = get_secret("ai.cloudflare_account_id", get_secret("CLOUDFLARE_ACCOUNT_ID", ""))
     cloudflare_token = get_secret("ai.cloudflare_api_token", get_secret("CLOUDFLARE_API_TOKEN", ""))
     cerebras_key = get_secret("ai.cerebras_api_key", get_secret("CEREBRAS_API_KEY", ""))
 
     if engine_name == "auto" or "자동" in engine_name:
-        return generate_ai_briefing_with_failover(prompt=prompt, system_prompt=system_prompt)
+        return generate_ai_briefing_with_failover(
+            prompt=prompt, system_prompt=system_prompt, generation=generation,
+        )
 
     config = AI_MODEL_REGISTRY.get(engine_name)
     engine_id = engine_name
@@ -800,7 +946,10 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
                 "provider": "NVIDIA", "pipeline_step": "NVIDIA 인증 오류",
                 "latency_ms": 0, "latency": 0.0
             }
-        result = call_nvidia_model(engine_id=engine_id, api_key=nvidia_key, prompt=prompt, system_prompt=system_prompt)
+        result = call_nvidia_model(
+            engine_id=engine_id, api_key=nvidia_key, prompt=prompt,
+            system_prompt=system_prompt, generation=generation,
+        )
         if result.get("response"):
             result = translate_response_if_needed(result, "nvidia", nvidia_key, cloudflare_account_id, cloudflare_token)
         return result
@@ -808,7 +957,8 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
     if provider == "cloudflare":
         result = call_cloudflare_model(
             model=config["model"], account_id=cloudflare_account_id,
-            api_token=cloudflare_token, prompt=prompt, system_prompt=system_prompt
+            api_token=cloudflare_token, prompt=prompt,
+            system_prompt=system_prompt, generation=generation,
         )
         if result.get("response"):
             result = translate_response_if_needed(result, "cloudflare", nvidia_key, cloudflare_account_id, cloudflare_token)
@@ -817,7 +967,7 @@ def call_selected_ai_engine(engine_name: str, prompt: str, system_prompt: str = 
     if provider == "cerebras":
         result = call_cerebras_model(
             model=config["model"], api_key=cerebras_key,
-            prompt=prompt, system_prompt=system_prompt
+            prompt=prompt, system_prompt=system_prompt, generation=generation,
         )
         if result.get("response"):
             result = translate_response_if_needed(result, "cerebras", nvidia_key, cloudflare_account_id, cloudflare_token)
@@ -1100,12 +1250,37 @@ def _probe_engine_safe(engine_id: str) -> dict:
         }
 
 
-def generate_ai_briefing_with_failover(prompt: str, system_prompt: str = None) -> dict:
-    """순차 Failover 파이프라인"""
+def generate_ai_briefing_with_failover(
+    prompt: str,
+    system_prompt: str = None,
+    generation: dict | None = None,
+) -> dict:
+    """
+    AUTO_FAILOVER_ORDER를 따라 성공할 때까지 순차 시도합니다.
+
+    파라미터:
+        prompt       : 사용자 메시지.
+        system_prompt: 시스템 메시지.
+        generation   : {"temperature", "max_tokens"}.
+
+    반환값:
+        첫 성공 엔진의 결과 dict. 전부 실패하면 status=False이고 error에
+        엔진별 실패 사유가 이어 붙습니다.
+
+    주의사항:
+        - 순차입니다. 앞 엔진이 타임아웃이면 그 시간을 그대로 기다린 뒤
+          다음으로 넘어갑니다. 그래서 AUTO_FAILOVER_ORDER에 죽은 엔진이
+          섞이면 안 됩니다(회귀 테스트가 막습니다).
+        - 병렬로 던져 가장 빠른 응답을 쓰는 방법도 있지만, 그러면 쓰지도
+          않을 호출에 비용을 냅니다. 순차가 의도된 선택입니다.
+    """
     errors = []
     start_time = time.time()
     for engine_id in AUTO_FAILOVER_ORDER:
-        res = call_selected_ai_engine(engine_name=engine_id, prompt=prompt, system_prompt=system_prompt)
+        res = call_selected_ai_engine(
+            engine_name=engine_id, prompt=prompt,
+            system_prompt=system_prompt, generation=generation,
+        )
         if res.get("status") and res.get("response"):
             res["pipeline_step"] = f"자동 탐색 성공: {AI_MODEL_REGISTRY[engine_id]['label']}"
             return res

@@ -802,3 +802,200 @@ def test_probe_reports_eol_state_for_a_410(monkeypatch):
     assert result["state"] == "eol", result
     assert result["ok"] is False
     assert "end of life" in result["detail"]
+
+
+# ==============================================================================
+# 13. 프롬프트 ↔ 화면 계약
+# ==============================================================================
+# 프롬프트가 지시하는 섹션 제목과 화면이 파싱하는 제목이 어긋나면, 리포트는
+# 생성되는데 화면이 구조를 못 읽어 한 덩어리 마크다운으로 떨어진다.
+# 조용히 나빠지는 종류의 고장이라 테스트로 묶어 둔다.
+def test_prompt_library_has_a_single_home():
+    """
+    [회귀] prompts.py에는 아무도 import하지 않는 COMPREHENSIVE_REPORT_PROMPT가
+    있고, 실제로 쓰이는 프롬프트는 ai_service 안에 인라인으로 박혀 있었다.
+    프롬프트가 두 벌로 갈라져 어느 쪽을 고쳐야 하는지 알 수 없었다.
+    """
+    import ast
+    import pathlib
+
+    from services import ai_service, prompts
+
+    # 프로파일의 출처는 prompts.py 하나여야 한다.
+    assert ai_service.REPORT_PROFILES is prompts.REPORT_PROFILES
+
+    # ai_service 안에서 프로파일을 다시 정의하면 안 된다.
+    tree = ast.parse(pathlib.Path("services/ai_service.py").read_text(encoding="utf-8"))
+    assigned = {
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert "REPORT_PROFILES" not in assigned, (
+        "ai_service가 프로파일을 다시 정의하고 있습니다"
+    )
+
+    # 죽은 상수가 되살아나지 않았는지.
+    assert not hasattr(prompts, "COMPREHENSIVE_REPORT_PROMPT"), (
+        "아무도 쓰지 않는 옛 프롬프트가 남아 있습니다"
+    )
+
+
+def test_every_prompt_names_the_sections_the_parser_looks_for():
+    """
+    프롬프트가 지시한 섹션 제목을, 파서가 그대로 찾아낼 수 있어야 한다.
+    제목을 한쪽만 바꾸면 화면이 구조를 못 읽는다.
+    """
+    from services.ai_service import parse_report_sections
+    from services.prompts import REPORT_PROFILES, VERDICT_SECTION
+
+    for report_type, profile in REPORT_PROFILES.items():
+        prompt = profile["system_prompt"]
+
+        # 프롬프트의 [출력 구조] 이후가 곧 출력 뼈대다.
+        skeleton = prompt[prompt.index("[출력 구조]"):]
+        parsed = parse_report_sections(skeleton)
+
+        titles = [s["title"] for s in parsed["sections"]]
+        assert titles, f"{report_type}: 파서가 섹션을 하나도 찾지 못했습니다"
+
+        # 총평은 파서가 따로 떼어 내므로 sections에 남으면 안 된다.
+        assert VERDICT_SECTION not in titles, (
+            f"{report_type}: 총평이 일반 섹션으로 섞였습니다"
+        )
+
+
+def test_verdict_field_labels_match_between_prompt_and_parser():
+    """
+    총평의 항목 이름(판단/신뢰도/핵심 근거)이 프롬프트와 파서에서 같아야
+    화면이 배너를 그릴 수 있다.
+    """
+    from services.ai_service import parse_report_sections
+    from services.prompts import REPORT_PROFILES, VERDICT_FIELDS
+
+    for report_type, profile in REPORT_PROFILES.items():
+        prompt = profile["system_prompt"]
+        for label in VERDICT_FIELDS.values():
+            assert label in prompt, f"{report_type}: 프롬프트에 '{label}'이 없습니다"
+
+    # 프롬프트가 보여 준 예시 형식을 파서가 실제로 읽는지.
+    sample = (
+        "### 총평\n"
+        "- **판단**: 위험선호\n"
+        "- **신뢰도**: 보통\n"
+        "- **핵심 근거**: 예시입니다.\n\n"
+        "### 거시 국면\n본문\n"
+    )
+    verdict = parse_report_sections(sample)["verdict"]
+    assert verdict["판단"] == "위험선호"
+    assert verdict["신뢰도"] == "보통"
+    assert verdict["핵심 근거"] == "예시입니다."
+
+
+def test_ui_has_a_colour_for_every_judgement_the_prompts_allow():
+    """
+    프롬프트가 허용하는 판단 값은 화면의 색조 표에 모두 있어야 한다.
+    새 리포트 유형을 추가하면서 색을 빠뜨리면 판단이 전부 회색(중립)으로
+    보여, 위험회피인지 위험선호인지 구분이 안 된다.
+    """
+    import views.ai_report_view as view
+    from services.prompts import REPORT_PROFILES
+
+    missing = []
+    for report_type, profile in REPORT_PROFILES.items():
+        for judgement in (j.strip() for j in profile["judgements"].split("|")):
+            if judgement not in view._JUDGEMENT_TONE:
+                missing.append(f"{report_type}: {judgement}")
+
+    assert not missing, f"색조가 지정되지 않은 판단 값: {missing}"
+
+
+def test_parser_degrades_to_raw_markdown_instead_of_losing_content():
+    """
+    모델이 형식을 어기는 일은 늘 있다. 그때 구조를 억지로 만들다 내용을
+    잃는 것이 가장 나쁘다. structured=False로 알리고 원문을 보존해야 한다.
+    """
+    from services.ai_service import parse_report_sections
+
+    plain = "제목 없이 줄글로만 쓴 분석입니다."
+    parsed = parse_report_sections(plain)
+    assert parsed["structured"] is False
+    assert parsed["preamble"] == plain, "원문이 보존되지 않았습니다"
+
+    # 총평만 있고 섹션이 없으면 구조화로 보지 않는다.
+    assert parse_report_sections("### 총평\n- **판단**: 중립\n")["structured"] is False
+
+    # 빈 입력에도 죽지 않는다.
+    for empty in ("", "   ", None):
+        result = parse_report_sections(empty)
+        assert result["structured"] is False
+        assert result["sections"] == []
+
+
+def test_parser_tolerates_formatting_the_model_gets_wrong():
+    """
+    번호 붙은 제목, 다른 깊이(##/####), 전각 콜론, 굵게 표시 누락은
+    모델이 흔히 저지른다. 이 정도는 읽어 줘야 한다.
+    """
+    from services.ai_service import parse_report_sections
+
+    loose = (
+        "## 1. 총평\n"
+        "판단： 위험회피\n"
+        "신뢰도: 낮음\n"
+        "핵심 근거: 데이터 결측\n\n"
+        "#### 2. 수급 진단\n외국인 순매도\n"
+    )
+    parsed = parse_report_sections(loose)
+
+    assert parsed["verdict"]["판단"] == "위험회피"
+    assert parsed["verdict"]["신뢰도"] == "낮음"
+    assert [s["title"] for s in parsed["sections"]] == ["수급 진단"]
+
+
+def test_parser_never_alters_section_bodies():
+    """표가 들어 있는 섹션 본문이 변형되면 화면에서 표가 깨진다."""
+    from services.ai_service import parse_report_sections
+
+    body = (
+        "### 총평\n- **판단**: 중립\n\n"
+        "### 핵심 리스크\n"
+        "| 리스크 | 조건 |\n| :--- | :--- |\n| 유동성 | RRP 급증 |\n"
+    )
+    for section in parse_report_sections(body)["sections"]:
+        assert section["body"] in body, "본문이 원문의 부분 문자열이 아닙니다"
+
+
+def test_generation_params_stay_in_the_low_temperature_range():
+    """
+    이 AI는 주어진 수치를 해석하는 일을 한다. 온도를 올리면 표현은
+    다양해지지만 없는 값을 그럴듯하게 채워 넣을 위험이 커진다.
+    """
+    from services.ai_service import get_report_generation_params
+    from services.prompts import REPORT_PROFILES
+
+    for report_type in REPORT_PROFILES:
+        params = get_report_generation_params(report_type)
+        assert 0.0 <= params["temperature"] <= 0.4, (
+            f"{report_type}: 온도가 너무 높습니다 ({params['temperature']})"
+        )
+        assert params["max_tokens"] >= 4096, (
+            f"{report_type}: 생성 상한이 낮아 리포트가 잘릴 수 있습니다"
+        )
+
+
+def test_data_integrity_rules_are_in_every_report_prompt():
+    """
+    "없는 수치를 지어내지 마라"와 "추정치를 밝혀라"는 이 대시보드에서
+    타협할 수 없는 규칙이다. 유형이 늘어도 빠지면 안 된다.
+    """
+    from services.prompts import REPORT_PROFILES
+
+    for report_type, profile in REPORT_PROFILES.items():
+        prompt = profile["system_prompt"]
+        assert "데이터에 없는 수치를 쓰지" in prompt, report_type
+        assert "추정치" in prompt, report_type
+        assert "데이터 없음" in prompt, report_type
+        assert "한국어" in prompt, report_type

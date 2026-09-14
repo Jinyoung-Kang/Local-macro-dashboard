@@ -36,9 +36,11 @@ from services.ai_service import (
     get_ai_engine_options,
     get_configured_providers,
     get_engine_availability,
+    get_report_generation_params,
     get_report_system_prompt,
     get_report_types,
     get_unavailable_engines,
+    parse_report_sections,
 )
 from services.cot_service import cot_history_to_markdown
 from services.dashboard_snapshot_service import (
@@ -188,6 +190,9 @@ def _generate_report(
         engine_name=ai_engine,
         prompt=context,
         system_prompt=get_report_system_prompt(report_type),
+        # 리포트 유형마다 필요한 길이와 온도가 다릅니다. 종합 리포트는
+        # 섹션이 다섯이라 상한이 모자라면 마지막 섹션이 통째로 잘립니다.
+        generation=get_report_generation_params(report_type),
     )
 
     body, ok = extract_report_text(res)
@@ -204,6 +209,214 @@ def _generate_report(
         "original_response": res.get("original_response"),
         "latency": res.get("latency"),
     }
+
+
+
+# ==============================================================================
+# 리포트 본문 렌더링 (프롬프트가 지시한 구조를 시각화)
+# ==============================================================================
+# 판단 값 → 색조. 리포트 유형마다 어휘가 달라 전부 적어 둡니다.
+# 여기 없는 값이 오면 중립으로 떨어집니다(모델이 임의의 문구를 쓸 수 있으므로
+# 정확히 일치할 때만 색을 줍니다).
+_TONE_POSITIVE = "positive"
+_TONE_NEUTRAL = "neutral"
+_TONE_NEGATIVE = "negative"
+
+_JUDGEMENT_TONE = {
+    # 종합 거시경제 & 수급 전략
+    "위험선호": _TONE_POSITIVE,
+    "중립": _TONE_NEUTRAL,
+    "위험회피": _TONE_NEGATIVE,
+    # 외국인/기관 수급 집중 분석
+    "외국인 주도 매수": _TONE_POSITIVE,
+    "기관 주도 매수": _TONE_POSITIVE,
+    "혼조": _TONE_NEUTRAL,
+    "동반 매도": _TONE_NEGATIVE,
+    # 금리 및 유동성 리스크 점검 (리스크가 낮을수록 좋음 → 색이 반대)
+    "낮음": _TONE_POSITIVE,
+    "보통": _TONE_NEUTRAL,
+    "높음": _TONE_NEGATIVE,
+    "경계": _TONE_NEGATIVE,
+}
+
+_TONE_STYLE = {
+    _TONE_POSITIVE: {"bg": "#0D2818", "border": "#2EA043", "fg": "#3FB950", "icon": "▲"},
+    _TONE_NEUTRAL: {"bg": "#26210D", "border": "#9E6A03", "fg": "#D29922", "icon": "■"},
+    _TONE_NEGATIVE: {"bg": "#2A1215", "border": "#DA3633", "fg": "#F85149", "icon": "▼"},
+}
+
+# 신뢰도 → 표시. 낮은 신뢰도를 눈에 띄게 해서 과신을 막습니다.
+_CONFIDENCE_ICON = {"높음": "●●●", "보통": "●●○", "낮음": "●○○"}
+
+# 섹션 제목 → 아이콘. 없으면 기본값.
+_SECTION_ICON = {
+    "거시 국면": "🌍",
+    "수급 진단": "🔄",
+    "핵심 리스크": "⚠️",
+    "대응 전략": "🎯",
+    "반증 조건": "🔍",
+    "주체별 행동": "👥",
+    "현물 vs 파생 정합성": "⚖️",
+    "글로벌 대조": "🌐",
+    "추적 트리거": "📍",
+    "금리 구조": "📈",
+    "유동성": "💧",
+    "신용 스트레스": "🩸",
+    "경보 조건": "🚨",
+}
+
+
+def _judgement_tone(judgement: str | None) -> str:
+    """
+    판단 문구에 맞는 색조를 고릅니다.
+
+    파라미터:
+        judgement : 모델이 쓴 판단 문자열. None일 수 있습니다.
+
+    반환값:
+        "positive" | "neutral" | "negative" 중 하나.
+
+    주의사항:
+        - **정확히 일치할 때만** 색을 줍니다. 모델이 "다소 위험선호적" 처럼
+          변형해 쓰면 중립으로 떨어집니다. 억지로 부분 일치시키면
+          "위험회피"에 "위험선호"가 들어 있는 식의 오판이 납니다.
+        - 금리 리포트의 "낮음"은 **리스크가 낮다**는 뜻이라 긍정입니다.
+          같은 단어가 신뢰도에도 쓰이지만 그쪽은 별도 필드라 섞이지 않습니다.
+    """
+    if not judgement:
+        return _TONE_NEUTRAL
+    return _JUDGEMENT_TONE.get(judgement.strip(), _TONE_NEUTRAL)
+
+
+def _render_verdict_banner(verdict: dict, report_type: str) -> None:
+    """
+    총평을 색조 배너로 그립니다.
+
+    파라미터:
+        verdict     : parse_report_sections()가 돌려준 verdict dict.
+        report_type : 리포트 유형(배너 라벨에 씁니다).
+
+    반환값:
+        없음.
+
+    주의사항:
+        - 판단이 없으면 배너를 그리지 않습니다. 빈 배너는 "판단이 중립"
+          이라는 잘못된 인상을 줍니다.
+        - 신뢰도가 "낮음"이면 경고 문구를 함께 띄웁니다. 낮은 신뢰도
+          리포트를 확신처럼 읽는 것이 이 화면의 가장 큰 위험입니다.
+    """
+    judgement = verdict.get("판단")
+    if not judgement:
+        return
+
+    confidence = verdict.get("신뢰도") or "—"
+    rationale = verdict.get("핵심 근거") or ""
+    style = _TONE_STYLE[_judgement_tone(judgement)]
+
+    st.markdown(
+        f"""
+        <div style="
+            background:{style['bg']};
+            border:1px solid {style['border']};
+            border-left:4px solid {style['border']};
+            border-radius:10px;
+            padding:18px 22px;
+            margin:8px 0 18px 0;">
+          <div style="color:#8B949E;font-size:0.78rem;letter-spacing:0.04em;
+                      text-transform:uppercase;margin-bottom:6px;">
+            {report_type}
+          </div>
+          <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;">
+            <span style="color:{style['fg']};font-size:1.6rem;font-weight:700;">
+              {style['icon']} {judgement}
+            </span>
+            <span style="color:#8B949E;font-size:0.9rem;">
+              신뢰도 <b style="color:#C9D1D9;">{confidence}</b>
+              <span style="letter-spacing:2px;">
+                {_CONFIDENCE_ICON.get(confidence, '')}
+              </span>
+            </span>
+          </div>
+          <div style="color:#C9D1D9;font-size:0.97rem;margin-top:10px;
+                      line-height:1.6;">
+            {rationale}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if (verdict.get("신뢰도") or "").strip() == "낮음":
+        st.warning(
+            "신뢰도가 **낮음**입니다. 지표가 서로 상충하거나 핵심 데이터가 "
+            "결측이라는 뜻이므로, 이 리포트를 근거로 큰 포지션을 움직이지 "
+            "마세요.",
+            icon="⚠️",
+        )
+
+
+def _render_sections(sections: list) -> None:
+    """
+    분석 섹션들을 목차와 함께 그립니다.
+
+    파라미터:
+        sections : [{"title": str, "body": str}, ...]
+
+    반환값:
+        없음.
+
+    주의사항:
+        - 본문은 **그대로** st.markdown에 넘깁니다. 모델이 만든 표를
+          직접 파싱해 st.dataframe으로 바꾸고 싶어지지만, 표가 조금만
+          어긋나도 내용이 사라집니다. 마크다운 렌더러가 알아서 그리게
+          두는 편이 안전합니다.
+        - 섹션이 많아도 접지 않습니다. 리포트는 위에서 아래로 읽는
+          문서이고, 접어 두면 읽지 않게 됩니다.
+    """
+    if not sections:
+        return
+
+    titles = [s["title"] for s in sections]
+    st.caption("목차 · " + "  ·  ".join(f"{_SECTION_ICON.get(t, '▸')} {t}" for t in titles))
+
+    for section in sections:
+        icon = _SECTION_ICON.get(section["title"], "▸")
+        with st.container(border=True):
+            st.markdown(f"##### {icon} {section['title']}")
+            st.markdown(section["body"])
+
+
+def _render_report_body(result: dict) -> None:
+    """
+    리포트 본문을 구조화해 그립니다 (실패하면 원문 마크다운).
+
+    파라미터:
+        result : _generate_report()가 세션에 남긴 dict.
+
+    반환값:
+        없음.
+
+    주의사항:
+        - 파싱이 계약대로 되지 않으면(structured=False) **원문을 통째로**
+          마크다운으로 그립니다. 구조를 억지로 만들다 내용을 잃는 것이
+          가장 나쁩니다.
+        - 원문은 항상 펼침 상자와 다운로드 버튼으로 접근할 수 있습니다.
+          화면 렌더링이 뭔가를 빠뜨렸는지 확인할 수 있어야 합니다.
+    """
+    body = result["body"]
+    parsed = parse_report_sections(body)
+
+    if not parsed["structured"]:
+        # 모델이 형식을 어겼습니다. 내용은 그대로 보여 줍니다.
+        st.markdown(body)
+        return
+
+    _render_verdict_banner(parsed["verdict"], result["report_type"])
+
+    if parsed["preamble"]:
+        st.markdown(parsed["preamble"])
+
+    _render_sections(parsed["sections"])
 
 
 def _render_failure_help(result: dict) -> None:
@@ -299,9 +512,28 @@ def _render_report(result: dict) -> None:
     st.caption(meta)
 
     if result["ok"]:
-        st.markdown(result["body"])
+        _render_report_body(result)
     else:
         _render_failure_help(result)
+
+    if result["ok"]:
+        d1, d2 = st.columns([1, 3])
+        with d1:
+            st.download_button(
+                "📥 리포트 저장 (.md)",
+                data=_report_as_markdown(result),
+                file_name=(
+                    f"macro_report_"
+                    f"{result['created_at'][:10].replace('-', '')}.md"
+                ),
+                mime="text/markdown",
+                width="stretch",
+                key="download_ai_report",
+            )
+        with d2:
+            with st.expander("📝 리포트 원문(Markdown) 보기", expanded=False):
+                # 화면 렌더링이 뭔가를 빠뜨렸는지 확인할 수 있어야 합니다.
+                st.code(result["body"], language="markdown")
 
     st.markdown("---")
     st.markdown("#### 🔍 AI 리포트 작성에 수집·활용된 통합 데이터 구조")
@@ -326,6 +558,38 @@ def _render_report(result: dict) -> None:
             expanded=False,
         ):
             st.code(result["context"], language="markdown")
+
+
+
+def _report_as_markdown(result: dict) -> str:
+    """
+    리포트를 저장용 마크다운 문서로 만듭니다.
+
+    파라미터:
+        result : _generate_report()가 세션에 남긴 dict.
+
+    반환값:
+        머리말(유형·엔진·생성 시각)이 붙은 마크다운 문자열.
+
+    주의사항:
+        - 본문은 **손대지 않고** 그대로 싣습니다. 나중에 원문과 대조할 수
+          있어야 하기 때문입니다.
+        - Context(프롬프트에 넣은 원본 데이터)는 넣지 않습니다. 분량이
+          크고, 저장물의 목적은 결론을 남기는 것입니다.
+        - 문서 끝에 면책 문구를 답니다. AI 생성물이 그대로 돌아다니다
+          투자 판단의 근거처럼 보이는 것을 막습니다.
+    """
+    return (
+        f"# {result['report_type']} 분석 리포트\n\n"
+        f"- 생성 시각: {result['created_at']}\n"
+        f"- 분석 엔진: {format_ai_engine(result['engine'])}\n"
+        f"- 실행 경로: {result['pipeline_step']}\n\n"
+        "---\n\n"
+        f"{result['body']}\n\n"
+        "---\n\n"
+        "> 이 문서는 대시보드가 수집한 데이터를 바탕으로 AI가 생성한 "
+        "분석입니다. 투자 판단의 최종 책임은 이용자에게 있습니다.\n"
+    )
 
 
 def _render_engine_health() -> None:
