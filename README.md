@@ -22,7 +22,7 @@ pip install -r requirements.txt
 playwright install chromium
 
 # 수정 후 pull(다운로드)
-git pull origin claude/eager-euler-2hpyfe
+git pull origin claude/cool-ptolemy-n9b7vs
 ```
 
 ---
@@ -122,12 +122,88 @@ cloudflare_api_token  = "..."
 ## 5. 수집/표시 분리 구조
 
 예전에는 사용자가 화면을 열 때 수집이 시작돼, 캐시가 만료된 순간 접속한
-사람이 전체 수집 시간을 그대로 기다렸습니다. 지금은 이렇게 분리돼 있습니다.
+사람이 전체 수집 시간을 그대로 기다렸습니다. 지금은 **쓰는 쪽과 읽는 쪽이
+프로세스 단위로 분리**돼 있습니다.
 
 ```
-[collector.py · 주기 실행]  →  [data/dashboard.db]  →  [Streamlit · 읽기만]
-     느린 외부 수집                 SQLite 파일 1개        체감 ~0.1초
+   프로세스 ①  느린 쪽                프로세스 ②  빠른 쪽
+ ┌───────────────────────────┐     ┌───────────────────────────┐
+ │       collector.py        │     │    streamlit run app.py   │
+ │   (터미널 1 · 주기 실행)   │     │      (터미널 2 · 화면)     │
+ └─────────────┬─────────────┘     └─────────────▲─────────────┘
+               │ 쓰기                            │ 읽기 (~0.1초)
+               │                                 │
+               ▼                                 │
+        ┌──────────────────────────────────────────────┐
+        │            data/dashboard.db  (SQLite · WAL) │
+        │  snapshots · timeseries · observations       │
+        │  collector_runs · collector_task_runs        │
+        └──────────────────────────────────────────────┘
 ```
+
+WAL 모드라서 ①의 쓰기와 ②의 읽기가 서로를 막지 않습니다. ②를 껐다 켜도
+데이터는 남고, ①을 꾸준히 돌리는 것이 곧 백업입니다(→ "누적되는 이력").
+
+**계층 구조** — 위에서 아래로만 의존합니다. 화살표를 거스르는 import가
+생기면 순환 참조이거나 계층이 무너진 것입니다.
+
+```
+ app.py ─────── 라우팅 · 인증
+   │
+   ▼
+ views/*.py ─── 화면. 계산하지 않고 그리기만 합니다
+   │            views/_ui.py = 화면 공용 조각(새로고침 버튼)
+   ▼
+ services/*_service.py ─── 지표별 수집·가공
+   │            collect_*()  = 항상 네트워크   ← collector.py가 부름
+   │            fetch_/get_*() = 저장본 우선    ← 화면이 부름
+   ▼
+ services/store.py ─── 저장 계층 (cached_or_live)
+   │
+   ├── datasets.py     데이터셋 이름·신선도 기준
+   ├── http_client.py  공용 HTTP 세션
+   ├── browser_pool.py 공용 헤드리스 Chromium
+   └── secrets.py      시크릿 조회  ◀── config.py도 여기에 의존합니다
+                                        (config.py는 지표 매핑·해석
+                                         테이블이라 어느 계층에서나
+                                         읽어 갑니다 · 13곳에서 import)
+```
+
+**한 번의 조회가 지나가는 길** — 화면의 모든 데이터 조회는
+`store.cached_or_live()` 한 곳을 지납니다. "왜 느린가 / 왜 새로고침해도
+안 바뀌는가 / 왜 옛날 값이 보이는가"의 답이 전부 여기 있습니다.
+
+```
+ 화면이 fetch_*() 호출
+        │
+        ▼
+ cached_or_live(name, live_fn, max_age_seconds)
+        │
+        ├─ live_only 모드? ───────────────────────▶ 무조건 수집
+        │
+        ├─ 저장본을 읽는다
+        │        │
+        │        ├─ store_only 모드? ────────────▶ 오래됐어도 그대로 반환
+        │        │                                 (없으면 빈 값. 외부 호출 없음)
+        │        │
+        │        └─ 신선한가?  ── 예 ────────────▶ 저장본 반환  ← 평상시 여기
+        │                        │
+        │                    아니오 / 새로고침 요청됨
+        │                        │
+        │                        ▼
+        │                   live_fn() 실행 (느림)
+        │                        │
+        │                 ┌──────┴──────┐
+        │              성공            실패
+        │                 │              │
+        │                 ▼              ▼
+        └──────── 저장 후 반환    오래된 저장본 반환
+                                  (화면이 비지 않게. 없으면 빈 값)
+```
+
+> **그래서 반환값이 "지금 수집한 값"이라는 보장이 없습니다.** 화면은 반드시
+> 수집 시각을 함께 표시해야 합니다. 오래된 값을 최신처럼 보여주는 것이 이
+> 구조의 가장 큰 위험입니다.
 
 ### 측정 결과 (메뉴 렌더링 시간)
 
@@ -427,18 +503,25 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-- `tests/test_regressions.py` — 과거에 실제로 앱을 망가뜨렸던 버그들을 고정
-- `tests/test_store.py` — 저장 계층, 직렬화 왕복, 읽기 모드, 스키마 검증,
-  수집기 진단, 지표명 정제, 전일 종가 일봉 폴백, 수동 새로고침
-- `tests/test_verification.py` — 교차 검증 판정 규칙, 장중/마감 시간 게이트,
-  "확인 못 함"을 "일치"로 위장하지 않는지, 등락률 결측이 국면 판정을
-  강세로 뒤집지 않는지, 외부 소스 전멸 시 누적 이력 대체,
-  연결 진단이 화면과 같은 데이터 경로를 보는지, LS 인증 단계 구분과
-  실패 토큰 비캐싱, 망 오류를 키 문제로 오인하지 않는지
-- `tests/test_browser_pool.py` — 헤드리스 브라우저가 스레드 교체를 견디는지
-  (로컬 HTTP 서버만 사용, Chromium 없으면 자동 skip)
+| 파일 | 건수 | 내용 |
+|---|---:|---|
+| `tests/test_store.py` | 98 | 저장 계층, 직렬화 왕복, 읽기 모드, 스키마 검증, 수집기 진단, 지표명 정제, 전일 종가 일봉 폴백, 수동 새로고침 |
+| `tests/test_verification.py` | 52 | 교차 검증 판정 규칙, 장중/마감 시간 게이트, "확인 못 함"을 "일치"로 위장하지 않는지, 등락률 결측이 국면 판정을 뒤집지 않는지, 외부 소스 전멸 시 누적 이력 대체, LS 인증 단계 구분과 실패 토큰 비캐싱 |
+| `tests/test_regressions.py` | 24 | 과거에 실제로 앱을 망가뜨렸던 버그들을 고정 |
+| `tests/test_browser_pool.py` | 3 (skip) | 헤드리스 브라우저가 스레드 교체를 견디는지 (로컬 HTTP 서버만 사용, Chromium 없으면 자동 skip) |
 
-모두 외부 네트워크를 쓰지 않으므로 언제든 돌 수 있습니다 (현재 167건).
+모두 외부 네트워크를 쓰지 않으므로 언제든 돌 수 있습니다
+(**현재 174 passed · 3 skipped**. skip 3건은 Chromium 미설치 환경 기준입니다).
+
+`test_regressions.py`는 **구조가 되돌아가는 것**도 막습니다. 아래 성질이
+깨지면 테스트가 실패합니다.
+
+- `services/` 안에서 `requests.get/post`를 직접 부르는 곳이 없을 것
+  (커넥션 재사용을 우회하는 자리를 막습니다)
+- `get_secret()` 구현이 `services/secrets.py` 하나뿐일 것
+- 새로고침 처리가 `views/_ui.py` 밖에서 다시 구현되지 않을 것
+- 일봉 전일 종가 보완이 순차 루프가 아니라 병렬 프리페치로 이뤄질 것
+- 수급 폴백이 주말을 건너뛸 것
 
 ---
 
@@ -447,30 +530,49 @@ python -m pytest tests/ -v
 ```
 app.py                  라우팅 · 인증 · 공통 CSS
 collector.py            수집기 (Streamlit과 분리된 독립 프로세스)
-config.py               지표 매핑 · 시크릿 로더 · 해석 테이블
+config.py               지표 매핑 · 해석 테이블 · 키 헬퍼(get_krx_key 등)
 data/dashboard.db       수집 결과 저장소 (gitignore, 백업 권장)
 data/collector.lock     수집기 중복 실행 방지 락
+
 services/
+  ── 기반 계층 ──────────────────────────────────────────────
   store.py              SQLite 저장 계층 (저장본 우선 읽기)
   datasets.py           데이터셋 이름·신선도 기준의 단일 출처
-  http_client.py        공용 HTTP 세션 (커넥션 풀 + 재시도)
-  browser_pool.py       공용 헤드리스 Chromium (재사용)
+  secrets.py            Streamlit Secrets·환경변수 조회의 단일 출처
+  http_client.py        공용 HTTP 세션 2종 (스크래핑용 / API용)
+  browser_pool.py       공용 헤드리스 Chromium (전용 워커 스레드 소유)
+
+  ── 지표 수집 ──────────────────────────────────────────────
   macro_service.py      매크로 지표 · FRED
-  advanced_macro_service.py  심화 지표 5종 + 해석 임계치
-  market_scraper_service.py  TradingView/Yahoo 참고 시세
+  advanced_macro_service.py      심화 지표 5종 + 해석 임계치
+  market_scraper_service.py      TradingView/Yahoo 참고 시세
+  night_futures_scraper_service.py    KOSPI200 야간선물
+  foreign_index_futures_scraper_service.py  닛케이·항셍 선물
   liquidity_service.py  연준 순유동성
   sector_service.py     섹터·자산군 로테이션
   krx_service.py        KRX 파생 · 한국판 COT
-  kis_service.py        한국투자증권 Open API (토큰 · 지수 · 선물 시세)
-  verification_service.py  KRX·KIS 교차 검증 (판정: 일치/불일치/실패/확인못함)
   radar_service.py      국내 수급 레이더 (다단 폴백)
   sec_service.py        SEC 13F
   cot_service.py        CFTC COT
+  consensus_service.py  13F 교집합 산출
+
+  ── 증권사 API ─────────────────────────────────────────────
+  kis_service.py        한국투자증권 Open API (토큰 · 지수 · 선물 시세)
+  kis_websocket_service.py       KIS 실시간 웹소켓
+  ls_service.py         LS증권 OPEN API (수급 폴백 4단계)
+  toss_service.py       토스증권 Open API (연결 진단 전용)
+
+  ── 검증 · AI ──────────────────────────────────────────────
+  verification_service.py  KRX·KIS 교차 검증 (판정: 일치/불일치/실패/확인못함)
   ai_service.py         AI 엔진 라우팅 (NVIDIA / Cloudflare / Cerebras)
+  prompts.py            AI 프롬프트 템플릿
   dashboard_snapshot_service.py  전체 원본 데이터 텍스트 생성
-views/                  메뉴별 화면
+
+views/                  메뉴별 화면 (12개)
+  _ui.py                화면 공용 조각 (새로고침 버튼 등)
   data_status_view.py   저장소 상태 · 신선도 · 누적 이력 · 교차 검증 패널
-tests/                  회귀 테스트 + 저장 계층 + 교차 검증 테스트
+
+tests/                  회귀 + 저장 계층 + 교차 검증 + 브라우저 풀 테스트
 ```
 
 **코드 작성 규칙**
@@ -479,8 +581,26 @@ tests/                  회귀 테스트 + 저장 계층 + 교차 검증 테스�
   짝을 이룹니다. **화면은 항상 후자**, `collector.py`는 전자를 씁니다.
 - 데이터셋 이름은 `services/datasets.py`에서만 정의합니다. 양쪽이 문자열을
   각자 타이핑하면 "수집은 되는데 화면에 안 보이는" 버그가 생깁니다.
-- 새 HTTP 호출은 `requests.get()` 대신 `services/http_client.get_session()`.
-  요청마다 TCP/TLS 핸드셰이크를 반복하지 않기 위함입니다.
+- 새 HTTP 호출은 `requests.get()` 대신 **공용 세션**을 쓰세요. 요청마다
+  DNS → TCP → TLS 핸드셰이크를 반복하지 않기 위함입니다.
+  용도에 따라 둘 중 하나입니다.
+
+  | 함수 | 재시도 | 쓰는 곳 |
+  |---|---|---|
+  | `http_client.get_session()` | 5xx·429에 2회 | 공개 웹 스크래핑, 공개 API |
+  | `http_client.get_api_session()` | **없음** | 증권사·AI API (KIS·LS·토스·AI) |
+
+  인증 API에서 재시도를 끈 이유는 호출부가 상태코드와 예외를 직접 해석해
+  서로 다른 안내를 내보내기 때문입니다. 특히 LS는 "즉시 connection
+  refused냐 타임아웃이냐"로 포트 폐쇄와 방화벽 드롭을 구분하는데, 어댑터가
+  뒤에서 조용히 재시도하면 그 판단 근거가 사라지고 실패가 몇 배 느려집니다.
+- 시크릿은 `services/secrets.get_secret()` 하나만 씁니다. 예전에는 같은
+  구현이 세 곳에 복사돼 있어서, 한 곳을 고쳐도 나머지가 옛 규칙으로
+  남았습니다("키를 분명히 넣었는데 앱은 없다고 한다"는 버그의 원인).
+- 화면에 새로고침 버튼을 놓을 때는 `views/_ui.refresh_button()`을 쓰세요.
+  `st.cache_data.clear()`만 부르면 **아직 신선한 저장본이 그대로 반환돼
+  화면이 전혀 바뀌지 않습니다.** `store.request_refresh()`와 짝이어야
+  실제로 다시 수집합니다.
 - JS 렌더링이 필요하면 `services/browser_pool.fetch_rendered_html()`.
   `sync_playwright()`를 직접 부르면 Chromium이 매번 새로 기동됩니다.
 - 수집 실패 시 **그럴듯한 가짜 숫자를 만들지 마세요.** 빈 결과를 반환하거나,
@@ -539,3 +659,104 @@ git push -u origin <브랜치명>
 | 수급 레이더가 `외부 데이터 소스가 모두 실패` 경고 | 수집기가 저장해 둔 이력을 보여주는 중입니다. 출처에 적힌 **날짜**를 확인하세요 — 지금 시점의 수급이 아닙니다 |
 | `cannot switch to a different thread` | 헤드리스 브라우저 스레드 문제로, 해결됐습니다. 그래도 보이면 `git pull` 후 앱을 재시작하세요 |
 | KRX 선물 카드가 `전일 대비 미제공` | KRX가 등락률 필드를 주지 않고 직전 거래일 종가도 없는 경우입니다. 0.00%로 위장하지 않습니다 |
+
+---
+
+## 12. 기여 가이드
+
+혼자 쓰는 로컬 대시보드지만, 6개월 뒤의 자신도 "남"입니다. 아래는 그때의
+자신을 위한 절차입니다.
+
+### 작업 전
+
+```bash
+source venv/bin/activate
+python -m pytest tests/ -q          # 손대기 전에 초록인지 확인 (기준선)
+```
+
+기준선이 빨간 상태에서 시작하면, 나중에 실패가 내 변경 탓인지 원래
+그랬는지 구분할 수 없습니다.
+
+### 작업 중 — 이 저장소의 원칙 4가지
+
+1. **가짜 숫자를 만들지 마세요.** 수집에 실패하면 빈 결과를 반환합니다.
+   전일 대비를 모를 때 `0.00%`로 두면 "보합"이라는 **틀린 정보**가 됩니다.
+   "모른다"는 `None`/`N/A`로 남기세요.
+2. **불가피한 추정치는 반드시 표시합니다.** `df.attrs["is_proxy"]`
+   (또는 `is_estimated`)를 심어 화면과 AI 리포트가 경고를 띄우게 하세요.
+   `^MOVE`는 실제 ICE BofA 지수가 아니라 `^TNX` 변동성 역산값입니다.
+   표시가 빠지면 "MOVE 140 이상 = 채권 발작" 같은 임계치 해석이 추정치에
+   그대로 적용됩니다.
+3. **추정치를 누적 테이블에 넣지 마세요.** 한 번 섞이면 확정치와 구분할
+   수 없습니다. 스냅샷에는 `status="estimated"`로 저장하되 `timeseries`는
+   건드리지 않습니다.
+4. **순차 루프 안에서 네트워크를 타지 마세요.** 왕복이 그대로 직렬로
+   쌓입니다. 필요한 대상을 먼저 모아 한 번에 병렬로 받으세요
+   (`macro_service._prefetch_daily_prev_closes`가 그 패턴입니다).
+
+### 새 지표를 추가할 때
+
+1. `services/datasets.py`에 이름과 신선도 기준을 **먼저** 정의합니다.
+   수집기와 화면이 문자열을 각자 타이핑하면 "수집은 되는데 화면에는 안
+   보이는" 버그가 납니다.
+2. `services/<도메인>_service.py`에 `collect_*()`(항상 네트워크)와
+   `fetch_*()`/`get_*()`(저장본 우선, `store.cached_or_live` 경유) 한 쌍을
+   만듭니다.
+3. `collector.py`에 `_task_*()`를 만들고 `ALL_TASKS`에 등록합니다.
+   **빈 결과면 `EmptyResult`를 올리세요** — 기존 저장본을 빈 값으로
+   덮지 않기 위해서입니다.
+4. `store.missing_datasets()`의 기대 목록에 추가합니다. 빠뜨리면
+   `--status`가 누락을 알려주지 못합니다.
+5. 화면은 `fetch_*()`만 부릅니다. 화면에서 `collect_*()`를 부르면 수집/표시
+   분리가 깨집니다.
+
+### 작업 후
+
+```bash
+python -m pytest tests/ -q          # 초록 확인
+python collector.py --task <이름>    # 새 태스크를 실제로 한 번 돌려 봅니다
+python collector.py --status        # 저장됐는지, 누락으로 안 잡히는지
+```
+
+고친 버그가 **다시 생기지 않도록** `tests/test_regressions.py`에 한 건
+추가하세요. 이 파일은 "과거에 실제로 앱을 망가뜨렸던 것"만 모읍니다.
+네트워크를 쓰는 테스트는 넣지 마세요 — 장중/휴장·레이트리밋에 따라 흔들려
+신뢰할 수 없게 됩니다.
+
+### 커밋
+
+```bash
+git add -A
+git commit -m "무엇을 왜 바꿨는지"
+git push -u origin <브랜치>
+```
+
+커밋 메시지는 **왜**를 적습니다. 무엇을 바꿨는지는 diff가 이미 말해 줍니다.
+
+---
+
+## 13. 라이선스
+
+**현재 이 저장소에는 라이선스가 지정돼 있지 않습니다.** `LICENSE` 파일이
+없고 소스 어디에도 라이선스 고지가 없습니다.
+
+저작권법상 라이선스를 명시하지 않으면 **저작자가 모든 권리를 보유**하며,
+제3자에게는 사용·복제·수정·배포 권한이 주어지지 않습니다. 개인적으로 혼자
+쓰는 데에는 아무 문제가 없습니다.
+
+공개하거나 남에게 넘길 계획이라면 `LICENSE` 파일을 추가하세요
+(선택 도움말: <https://choosealicense.com>). 라이선스 선택은 법적 효과가
+있는 결정이므로 저장소 소유자가 직접 정해야 합니다.
+
+### 서드파티 고지
+
+이 프로젝트는 아래를 사용하며, 각각의 라이선스를 따릅니다:
+Streamlit · pandas · NumPy · Plotly · yfinance · pykrx · requests ·
+BeautifulSoup4 · lxml · Playwright · websocket-client
+(전체 목록은 `requirements.txt`).
+
+**데이터 출처의 이용 약관은 별개입니다.** 이 대시보드는 Yahoo Finance,
+TradingView, Naver, Daum 등을 스크래핑합니다. 비공식 경로이며 각 서비스의
+이용 약관이 적용됩니다. **개인적인 조회 용도로만 쓰세요.** 재배포하거나
+상업적으로 이용하기 전에는 각 출처의 약관을 확인해야 합니다. 공식 API
+(FRED · KRX · KIS · LS · 토스 · SEC · CFTC)는 각자의 이용 조건을 따릅니다.
