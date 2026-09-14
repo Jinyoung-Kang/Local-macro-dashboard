@@ -34,6 +34,8 @@ from services.ai_service import (
     extract_report_text,
     format_ai_engine,
     get_ai_engine_options,
+    LARGE_CONTEXT_TOKENS,
+    estimate_prompt_tokens,
     get_configured_providers,
     get_engine_availability,
     get_report_generation_params,
@@ -200,6 +202,8 @@ def _generate_report(
     return {
         "ok": ok,
         "body": body,
+        "context_tokens": estimate_prompt_tokens(context),
+        "warning": res.get("warning"),
         "engine": ai_engine,
         "report_type": report_type,
         "pipeline_step": res.get("pipeline_step") or "단일 호출 완료",
@@ -459,6 +463,16 @@ def _render_failure_help(result: dict) -> None:
             "권한이 없습니다.",
             icon="🔒",
         )
+    elif "제한 시간" in result["body"] or "timeout" in lowered:
+        tokens = result.get("context_tokens") or 0
+        st.info(
+            f"입력이 약 {tokens:,} 토큰으로 컸습니다. 입력이 길수록 첫 "
+            "응답까지 오래 걸립니다.\n\n"
+            "· **CFTC COT 상세 데이터 포함**을 끄면 입력이 크게 줄어듭니다\n"
+            "· 더 큰 모델(Nemotron 120B)이 긴 입력을 더 빨리 처리합니다\n"
+            "· `⚡ 자동 탐색`은 한 엔진이 막히면 다음 엔진으로 넘어갑니다",
+            icon="⏱️",
+        )
     elif "400" in lowered:
         st.info(
             "요청이 거절됐습니다. Context가 모델의 컨텍스트 한도를 넘었을 "
@@ -495,6 +509,9 @@ def _render_report(result: dict) -> None:
     icon = "✅" if result["ok"] else "⚠️"
     st.caption(f"{icon} 실행 엔진 파이프라인: `{result['pipeline_step']}`")
 
+    if result.get("warning"):
+        st.warning(result["warning"], icon="✂️")
+
     if result.get("translation_info"):
         st.caption(f"🌐 {result['translation_info']}")
     if result.get("original_response"):
@@ -509,6 +526,8 @@ def _render_report(result: dict) -> None:
     )
     if result.get("latency"):
         meta += f" | 소요: `{result['latency']}s`"
+    if result.get("context_tokens"):
+        meta += f" | 입력: `~{result['context_tokens']:,} 토큰`"
     st.caption(meta)
 
     if result["ok"]:
@@ -771,10 +790,16 @@ def render_ai_report_view():
         and ai_engine not in LONG_CONTEXT_MODELS
         and ai_engine != "auto"
     ):
-        st.info(
-            "최근 3개월 COT 상세 표가 추가됩니다. "
-            "긴 분석에는 Nemotron, GPT-OSS 120B, "
-            "Cloudflare Llama 3.3 70B 또는 Cerebras를 권장합니다."
+        # 실측: 이 조합(작은 모델 + COT 상세)에서 금리·수급 리포트가
+        # 두 번 다 120초 제한에 걸려 실패했습니다. 기다린 뒤에 알게 되는
+        # 것보다 미리 말해 주는 편이 낫습니다.
+        st.warning(
+            "**작은 모델에 긴 입력을 주는 조합입니다.** COT 상세표가 "
+            "더해지면 첫 응답까지 수 분이 걸릴 수 있습니다.\n\n"
+            "· 이 옵션을 끄거나\n"
+            "· Nemotron 120B / Cloudflare Llama 3.3 70B로 바꾸거나\n"
+            "· `⚡ 자동 탐색`을 쓰세요",
+            icon="⏱️",
         )
 
     _render_engine_health()

@@ -4,6 +4,7 @@ AI 모델 레지스트리 기반 엔진 (NVIDIA, Cloudflare, Cerebras 및 자동
 분석 엔진과 번역 전용 엔진(Gemma 4 26B/31B)의 철저한 분리 및 한국어 판별 자동 번역기 탑재
 (ai_test_view.py 등 레거시 호환성을 위한 래퍼 함수 완벽 복구)
 """
+import json
 import logging
 import re
 import time
@@ -143,6 +144,38 @@ DEFAULT_MAX_TOKENS = 4096
 # 온도를 올리면 표현은 다양해지지만 없는 값을 그럴듯하게 채워 넣을 위험이
 # 커집니다. 리포트 유형별로 0.2~0.25를 쓰고, 여기를 올리지 마세요.
 DEFAULT_TEMPERATURE = 0.25
+
+# ==============================================================================
+# 타임아웃 정책
+# ==============================================================================
+# [버그 수정] 예전에는 timeout=120을 그대로 박아 두고 **비스트리밍**으로
+# 호출했습니다. 그러면 생성이 전부 끝날 때까지 한 번의 read 안에서 기다려야
+# 하므로, 입력이 길어지는 순간(예: COT 3개월 상세표 포함) 구조적으로 실패합니다.
+#
+# 실제 사용자 로그:
+#   성공 — 종합 리포트, COT 상세 없음        20.8s
+#   실패 — 금리 리포트, COT 상세 포함       120.17s  ReadTimeout
+#   실패 — 수급 리포트, COT 상세 포함       120.08s  ReadTimeout
+# 정확히 제한선에서 끊겼습니다. 모델이 느린 게 아니라 **기다릴 수 있는
+# 시간이 모자랐던** 것입니다.
+#
+# 지금은 스트리밍으로 받습니다. 스트리밍에서 read 타임아웃은 "다음 조각이
+# 올 때까지"에 적용되므로, 전체 생성이 5분이 걸려도 토큰이 계속 흐르면
+# 끊기지 않습니다. 아래 값들의 의미가 그래서 달라졌습니다.
+
+# 연결 수립까지 기다리는 시간.
+CONNECT_TIMEOUT = 15.0
+
+# **조각과 조각 사이** 최대 대기. 이 시간 동안 아무것도 안 오면 죽은 것으로 봅니다.
+# 첫 조각까지는 prefill(입력 처리) 때문에 오래 걸릴 수 있어 넉넉히 둡니다.
+STREAM_IDLE_TIMEOUT = 90.0
+
+# 전체 생성의 상한. 스트림이 아주 느리게라도 계속 흐르면 idle 타임아웃에
+# 걸리지 않으므로, 무한정 붙잡지 않도록 별도의 마감 시한을 둡니다.
+OVERALL_DEADLINE = 420.0
+
+# 비스트리밍 경로(엔진 점검처럼 짧은 호출)의 타임아웃.
+SHORT_CALL_TIMEOUT = 30.0
 
 # 제공자 오류 본문을 몇 글자까지 싣을지.
 #
@@ -343,6 +376,35 @@ def get_report_generation_params(report_type: str) -> dict:
 # 보냅니다. 그대로 화면에 뿌리면 리포트가 아니라 혼잣말이 됩니다.
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _ORPHAN_THINK = re.compile(r"</?think>", re.IGNORECASE)
+
+
+
+def estimate_prompt_tokens(text: str) -> int:
+    """
+    프롬프트 길이를 토큰 수로 어림합니다.
+
+    파라미터:
+        text : 모델에 보낼 문자열.
+
+    반환값:
+        어림한 토큰 수(int).
+
+    주의사항:
+        - **정확한 값이 아닙니다.** 실제 토크나이저를 돌리지 않고 글자
+          수로 나눕니다. 한국어는 대략 글자당 1토큰에 가깝고 영어·숫자는
+          글자당 0.3토큰 정도라, 둘이 섞인 이 대시보드의 Context에는
+          "2글자당 1토큰"이 쓸 만한 근사입니다.
+        - 용도는 **경고를 띄울지 판단**하는 것뿐입니다. 이 값으로
+          max_tokens를 계산하거나 자르지 마세요.
+    """
+    if not text:
+        return 0
+    return len(text) // 2
+
+
+# 이 크기를 넘는 Context는 작은 모델에서 첫 응답까지 오래 걸립니다.
+# 사용자가 2분을 기다린 뒤에야 타임아웃을 보는 일을 막기 위한 기준입니다.
+LARGE_CONTEXT_TOKENS = 12000
 
 
 def strip_reasoning_artifacts(text: str) -> str:
@@ -617,6 +679,116 @@ def translate_response_if_needed(
 # ==============================================================================
 # 2. API 호출 공통 래퍼 (OpenAI / Cloudflare / Cerebras)
 # ==============================================================================
+
+def _consume_openai_stream(response, deadline: float) -> tuple[str, str, str | None]:
+    """
+    OpenAI 호환 SSE 스트림을 끝까지 읽어 본문을 모읍니다.
+
+    파라미터:
+        response : stream=True로 연 requests Response 객체.
+        deadline : 이 시각(time.time() 기준)을 넘기면 중단합니다.
+
+    반환값:
+        (본문, 사고과정, 오류) 세 값의 튜플.
+        오류가 None이면 정상입니다. 마감 시한을 넘겨 중단한 경우에도
+        **그때까지 모은 본문은 그대로 돌려줍니다** — 잘린 리포트가
+        빈 리포트보다 낫습니다.
+
+    주의사항:
+        - SSE 한 줄은 `data: {...}` 형태이고 마지막은 `data: [DONE]`입니다.
+          JSON으로 파싱되지 않는 줄(주석·하트비트)은 조용히 건너뜁니다.
+          제공자마다 하트비트 형식이 달라 엄격하게 굴면 깨집니다.
+        - reasoning 계열 모델은 delta에 content 대신 reasoning_content를
+          싣습니다. 둘 다 모으고, 본문이 비었을 때만 사고과정을 씁니다.
+        - 마감 시한을 넘기면 루프를 빠져나오지만 **예외를 던지지 않습니다.**
+          호출부가 부분 결과를 살릴 수 있어야 하기 때문입니다.
+    """
+    parts: list[str] = []
+    reasoning_parts: list[str] = []
+    truncated = False
+
+    for line in response.iter_lines(decode_unicode=True):
+        if time.time() > deadline:
+            truncated = True
+            break
+
+        if not line:
+            continue
+        if not line.startswith("data:"):
+            continue
+
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            break
+
+        try:
+            chunk = json.loads(payload)
+        except ValueError:
+            # 하트비트나 제공자 고유의 비-JSON 줄. 무시합니다.
+            continue
+
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+
+        delta = choices[0].get("delta") or {}
+        if delta.get("content"):
+            parts.append(delta["content"])
+        if delta.get("reasoning_content"):
+            reasoning_parts.append(delta["reasoning_content"])
+
+    error = None
+    if truncated:
+        error = (
+            f"생성이 전체 제한 시간({OVERALL_DEADLINE:.0f}초)을 넘겨 "
+            "중단했습니다. 받은 부분까지만 표시합니다."
+        )
+
+    return "".join(parts), "".join(reasoning_parts), error
+
+
+def _post_openai_stream(
+    endpoint: str,
+    headers: dict,
+    payload: dict,
+) -> tuple[str, str, str | None]:
+    """
+    OpenAI 호환 엔드포인트에 스트리밍으로 요청하고 본문을 모읍니다.
+
+    파라미터:
+        endpoint : 전체 URL.
+        headers  : 인증 헤더.
+        payload  : 요청 본문. 이 함수가 stream=True를 넣어 보냅니다.
+
+    반환값:
+        (본문, 사고과정, 오류) 튜플. 오류가 None이면 정상입니다.
+
+    주의사항:
+        - **타임아웃이 (연결, 조각 간 대기) 두 값입니다.** 비스트리밍의
+          "전체 응답까지"와 의미가 완전히 다릅니다. 전체 생성이 오래
+          걸려도 토큰이 계속 흐르면 끊기지 않습니다.
+        - HTTP 오류는 본문을 읽어 그대로 실어 보냅니다. 스트리밍 요청이라도
+          오류 응답은 일반 본문으로 옵니다.
+        - with 문으로 응답을 닫습니다. 스트리밍 응답을 닫지 않으면 커넥션이
+          풀로 돌아가지 않아 다음 호출이 새 핸드셰이크를 칩니다.
+    """
+    body = {**payload, "stream": True}
+    deadline = time.time() + OVERALL_DEADLINE
+
+    with get_api_session().post(
+        endpoint,
+        headers=headers,
+        json=body,
+        timeout=(CONNECT_TIMEOUT, STREAM_IDLE_TIMEOUT),
+        stream=True,
+    ) as response:
+        if response.status_code != 200:
+            detail = response.text[:PROVIDER_ERROR_CHARS]
+            return "", "", f"HTTP {response.status_code}: {detail}"
+
+        return _consume_openai_stream(response, deadline)
+
+
 def _call_openai_format(
     engine_name: str,
     endpoint: str,
@@ -624,9 +796,10 @@ def _call_openai_format(
     model: str,
     prompt: str,
     system_prompt: str = None,
-    timeout: int = 120,
+    timeout: float = SHORT_CALL_TIMEOUT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = DEFAULT_TEMPERATURE,
+    stream: bool = True,
 ) -> dict:
     """
     OpenAI 호환 /chat/completions 엔드포인트를 호출합니다 (NVIDIA·Cerebras 공용).
@@ -638,11 +811,17 @@ def _call_openai_format(
         model        : 제공자가 아는 모델 ID.
         prompt       : 사용자 메시지.
         system_prompt: 시스템 메시지. None이면 넣지 않습니다.
-        timeout      : 초 단위 제한 시간.
+        timeout      : **비스트리밍일 때만** 쓰는 전체 제한 시간(초).
+                       스트리밍에서는 CONNECT_TIMEOUT / STREAM_IDLE_TIMEOUT /
+                       OVERALL_DEADLINE이 대신 적용됩니다.
         max_tokens   : 생성 상한. 긴 리포트는 이 값에서 잘립니다.
         temperature  : 샘플링 온도. 이 용도(수치 분석)에서는 낮게 두십시오.
                        올리면 문장은 다양해지지만 **수치를 지어낼 위험이
                        커집니다.**
+        stream       : SSE 스트리밍으로 받을지 여부. 기본 True.
+                       **긴 리포트는 반드시 True여야 합니다** — False면
+                       생성이 전부 끝날 때까지 한 번의 read 안에서
+                       기다려야 해서 타임아웃으로 통째로 실패합니다.
 
     반환값:
         표준 결과 dict. 성공/실패와 무관하게 아래 키가 **항상** 있습니다.
@@ -687,45 +866,126 @@ def _call_openai_format(
     }
 
     start_time = time.time()
+
+    def _elapsed():
+        secs = round(time.time() - start_time, 2)
+        return secs, int(secs * 1000)
+
+    def _fail(error: str, step: str = "실패") -> dict:
+        secs, ms = _elapsed()
+        return {
+            "status": False, "response": "", "error": error,
+            "provider": engine_name, "pipeline_step": f"{engine_name} {step}",
+            "latency_ms": ms, "latency": secs,
+        }
+
     try:
-        res = get_api_session().post(endpoint, headers=headers, json=payload, timeout=timeout)
-        elapsed_sec = round(time.time() - start_time, 2)
-        elapsed_ms = int(elapsed_sec * 1000)
-        
-        if res.status_code == 200:
-            data = res.json()
-            if "choices" in data and len(data["choices"]) > 0:
-                message = data["choices"][0].get("message", {})
-                response_text = message.get("content", "") or ""
-                reasoning_text = message.get("reasoning_content", "") or ""
+        if stream:
+            text, reasoning, error = _post_openai_stream(endpoint, headers, payload)
+        else:
+            text, reasoning, error = _post_openai_once(
+                endpoint, headers, payload, timeout,
+            )
+    except Exception as e:                                   # noqa: BLE001
+        return _fail(_describe_transport_error(e), step="에러")
 
-                if not response_text and reasoning_text:
-                    response_text = reasoning_text
+    body = (text or "").strip() or (reasoning or "").strip()
 
-                if response_text.strip():
-                    return {
-                        "status": True, "response": response_text.strip(), "error": None,
-                        "provider": engine_name, "pipeline_step": f"{engine_name} 성공",
-                        "latency_ms": elapsed_ms, "latency": elapsed_sec, "model": model
-                    }
-            return {
-                "status": False, "response": "", "error": "응답 텍스트 추출 실패",
-                "provider": engine_name, "pipeline_step": f"{engine_name} 실패",
-                "latency_ms": elapsed_ms, "latency": elapsed_sec
-            }
-        return {
-            "status": False, "response": "", "error": f"HTTP {res.status_code}: {res.text[:PROVIDER_ERROR_CHARS]}",
-            "provider": engine_name, "pipeline_step": f"{engine_name} 실패",
-            "latency_ms": elapsed_ms, "latency": elapsed_sec
+    if body:
+        secs, ms = _elapsed()
+        result = {
+            "status": True, "response": body, "error": None,
+            "provider": engine_name, "pipeline_step": f"{engine_name} 성공",
+            "latency_ms": ms, "latency": secs, "model": model,
         }
-    except Exception as e:
-        elapsed_sec = round(time.time() - start_time, 2)
-        elapsed_ms = int(elapsed_sec * 1000)
-        return {
-            "status": False, "response": "", "error": str(e),
-            "provider": engine_name, "pipeline_step": f"{engine_name} 에러",
-            "latency_ms": elapsed_ms, "latency": elapsed_sec
-        }
+        if error:
+            # 마감 시한에 걸려 잘렸지만 받은 만큼은 살립니다.
+            result["truncated"] = True
+            result["pipeline_step"] = f"{engine_name} 부분 성공"
+            result["warning"] = error
+        return result
+
+    return _fail(error or "응답 텍스트 추출 실패")
+
+
+def _post_openai_once(
+    endpoint: str,
+    headers: dict,
+    payload: dict,
+    timeout: float,
+) -> tuple[str, str, str | None]:
+    """
+    OpenAI 호환 엔드포인트에 **비스트리밍**으로 한 번 요청합니다.
+
+    파라미터:
+        endpoint : 전체 URL.
+        headers  : 인증 헤더.
+        payload  : 요청 본문.
+        timeout  : 전체 응답까지의 제한 시간(초).
+
+    반환값:
+        (본문, 사고과정, 오류) 튜플. _post_openai_stream과 같은 모양입니다.
+
+    주의사항:
+        **긴 리포트에 이 경로를 쓰지 마세요.** 생성이 전부 끝날 때까지
+        한 번의 read 안에서 기다려야 해서, 입력이 커지면 타임아웃으로
+        통째로 실패합니다. 엔진 점검처럼 짧고 빠른 호출 전용입니다.
+    """
+    response = get_api_session().post(
+        endpoint, headers=headers, json=payload, timeout=timeout,
+    )
+
+    if response.status_code != 200:
+        return "", "", f"HTTP {response.status_code}: {response.text[:PROVIDER_ERROR_CHARS]}"
+
+    data = response.json()
+    choices = data.get("choices") or []
+    if not choices:
+        return "", "", "응답에 choices가 없습니다"
+
+    message = choices[0].get("message") or {}
+    return (
+        message.get("content") or "",
+        message.get("reasoning_content") or "",
+        None,
+    )
+
+
+def _describe_transport_error(exc: Exception) -> str:
+    """
+    통신 예외를 사용자가 조치할 수 있는 문장으로 바꿉니다.
+
+    파라미터:
+        exc : 발생한 예외.
+
+    반환값:
+        원인과 다음 조치를 담은 한국어 문자열. 원래 예외 문구도 뒤에
+        붙여, 진짜 원인을 숨기지 않습니다.
+
+    주의사항:
+        타임아웃과 연결 실패는 조치가 전혀 다릅니다. 예전에는 둘 다
+        raw 예외 문자열로만 보여 줘서, 사용자는
+        "HTTPSConnectionPool(...) Max retries exceeded ... ReadTimeoutError"
+        라는 문장을 받고 무엇을 해야 할지 알 수 없었습니다.
+    """
+    name = type(exc).__name__
+    text = str(exc)
+    lowered = f"{name} {text}".lower()
+
+    if "readtimeout" in lowered or "read timed out" in lowered:
+        return (
+            "모델이 제한 시간 안에 응답을 마치지 못했습니다. "
+            "입력이 길수록 첫 응답까지 오래 걸립니다 — "
+            "'CFTC COT 상세 데이터 포함'을 끄거나, 더 빠른 엔진으로 "
+            f"바꿔 보세요. (원인: {name}: {text[:200]})"
+        )
+    if "connecttimeout" in lowered or "connection" in lowered:
+        return (
+            "제공자 서버에 연결하지 못했습니다. 네트워크 또는 제공자 "
+            f"장애일 수 있습니다. (원인: {name}: {text[:200]})"
+        )
+
+    return f"{name}: {text[:PROVIDER_ERROR_CHARS]}"
 
 
 def call_nvidia_model(
@@ -745,9 +1005,9 @@ def call_nvidia_model(
     return _call_openai_format(
         engine_name=config["label"], endpoint=NVIDIA_CHAT_URL, api_key=api_key,
         model=config["model"], prompt=prompt, system_prompt=system_prompt,
-        timeout=120,
         max_tokens=gen.get("max_tokens", config.get("max_tokens", DEFAULT_MAX_TOKENS)),
         temperature=gen.get("temperature", DEFAULT_TEMPERATURE),
+        stream=True,
     )
 
 
@@ -785,7 +1045,12 @@ def call_cloudflare_model(
             "max_tokens": gen.get("max_tokens", DEFAULT_MAX_TOKENS),
             "temperature": gen.get("temperature", DEFAULT_TEMPERATURE),
         }
-        res = get_api_session().post(url, headers=headers, json=payload, timeout=90)
+        # Cloudflare는 SSE 형식이 OpenAI 호환과 달라 비스트리밍으로 둡니다.
+        # 대신 긴 생성을 감당하도록 제한 시간을 넉넉히 줍니다.
+        res = get_api_session().post(
+            url, headers=headers, json=payload,
+            timeout=(CONNECT_TIMEOUT, OVERALL_DEADLINE),
+        )
         elapsed_sec = round(time.time() - start_time, 2)
         elapsed_ms = int(elapsed_sec * 1000)
         
@@ -814,7 +1079,7 @@ def call_cloudflare_model(
         elapsed_sec = round(time.time() - start_time, 2)
         elapsed_ms = int(elapsed_sec * 1000)
         return {
-            "status": False, "response": "", "error": str(e),
+            "status": False, "response": "", "error": _describe_transport_error(e),
             "provider": f"Cloudflare ({model})", "pipeline_step": "Cloudflare 에러",
             "latency_ms": elapsed_ms, "latency": elapsed_sec
         }
@@ -850,9 +1115,9 @@ def call_cerebras_model(
         engine_name=f"Cerebras ({model})",
         endpoint="https://api.cerebras.ai/v1/chat/completions",
         api_key=api_key, model=model, prompt=prompt, system_prompt=system_prompt,
-        timeout=60,
         max_tokens=gen.get("max_tokens", DEFAULT_MAX_TOKENS),
         temperature=gen.get("temperature", DEFAULT_TEMPERATURE),
+        stream=True,
     )
 
 
@@ -1108,7 +1373,8 @@ def _probe_call(engine_id: str, config: dict) -> dict:
             engine_name=config["label"], endpoint=NVIDIA_CHAT_URL,
             api_key=get_secret("ai.nvidia_api_key", get_secret("NVIDIA_API_KEY", "")),
             model=config["model"], prompt=_PROBE_PROMPT,
-            timeout=30, max_tokens=_PROBE_MAX_TOKENS,
+            timeout=SHORT_CALL_TIMEOUT, max_tokens=_PROBE_MAX_TOKENS,
+            stream=False,
         )
 
     if provider == "cerebras":
@@ -1117,7 +1383,8 @@ def _probe_call(engine_id: str, config: dict) -> dict:
             endpoint="https://api.cerebras.ai/v1/chat/completions",
             api_key=get_secret("ai.cerebras_api_key", get_secret("CEREBRAS_API_KEY", "")),
             model=config["model"], prompt=_PROBE_PROMPT,
-            timeout=30, max_tokens=_PROBE_MAX_TOKENS,
+            timeout=SHORT_CALL_TIMEOUT, max_tokens=_PROBE_MAX_TOKENS,
+            stream=False,
         )
 
     if provider == "cloudflare":

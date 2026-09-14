@@ -11,6 +11,7 @@ tests/test_regressions.py
 """
 import os
 import sys
+import time
 
 import pandas as pd
 import pytest
@@ -999,3 +1000,153 @@ def test_data_integrity_rules_are_in_every_report_prompt():
         assert "추정치" in prompt, report_type
         assert "데이터 없음" in prompt, report_type
         assert "한국어" in prompt, report_type
+
+
+# ==============================================================================
+# 14. 긴 생성이 read 타임아웃으로 통째로 죽지 않아야 한다
+# ==============================================================================
+# 실측(2026-09-15, NVIDIA GPT-OSS 20B):
+#   성공 — 종합 리포트, COT 상세 없음        20.8s
+#   실패 — 금리 리포트, COT 상세 포함       120.17s  ReadTimeout
+#   실패 — 수급 리포트, COT 상세 포함       120.08s  ReadTimeout
+# 정확히 제한선에서 끊겼다. 모델이 느린 게 아니라 비스트리밍 구조라
+# 생성이 전부 끝날 때까지 한 번의 read 안에서 기다려야 했던 것이다.
+def test_report_calls_are_streamed():
+    """
+    [회귀] 리포트 생성이 비스트리밍이라, 입력이 커지면 첫 토큰까지의
+    prefill 시간 때문에 전체가 타임아웃으로 실패했다. 스트리밍에서는
+    read 타임아웃이 **조각과 조각 사이**에 적용되므로 전체 생성이
+    오래 걸려도 토큰이 흐르는 한 끊기지 않는다.
+    """
+    import inspect
+
+    import services.ai_service as ai
+
+    # 본 호출 경로는 스트리밍이어야 한다.
+    for fn in (ai.call_nvidia_model, ai.call_cerebras_model):
+        source = inspect.getsource(fn)
+        assert "stream=True" in source, f"{fn.__name__}이 스트리밍이 아닙니다"
+
+    # 점검(16토큰)은 비스트리밍이어도 된다 — 오히려 그편이 단순하다.
+    probe_source = inspect.getsource(ai._probe_call)
+    assert "stream=False" in probe_source
+
+
+def test_stream_timeouts_are_per_chunk_not_per_response():
+    """
+    타임아웃 상수의 **의미**가 바뀌었다. 이 값들을 '전체 응답까지'로
+    되돌리면 원래 버그가 그대로 재현된다.
+    """
+    import services.ai_service as ai
+
+    # 조각 사이 대기와 전체 마감이 분리돼 있어야 한다.
+    assert ai.STREAM_IDLE_TIMEOUT >= 60, "첫 조각까지의 prefill을 못 기다립니다"
+    assert ai.OVERALL_DEADLINE >= 300, "긴 리포트를 끝까지 받지 못합니다"
+    assert ai.OVERALL_DEADLINE > ai.STREAM_IDLE_TIMEOUT
+    assert ai.CONNECT_TIMEOUT <= 30
+
+
+def test_sse_stream_is_parsed_and_survives_noise():
+    """
+    제공자는 하트비트·빈 choices·비-JSON 줄을 섞어 보낸다. 거기에
+    걸려 본문을 잃으면 안 된다.
+    """
+    import services.ai_service as ai
+
+    class _FakeResponse:
+        def __init__(self, lines):
+            self._lines = lines
+
+        def iter_lines(self, decode_unicode=False):
+            return iter(self._lines)
+
+    lines = [
+        ": heartbeat",
+        "",
+        'data: {"choices":[{"delta":{"content":"### 총평"}}]}',
+        "data: {깨진 JSON",
+        'data: {"choices":[]}',
+        'data: {"choices":[{"delta":{"content":"\\n- **판단**: 중립"}}]}',
+        "data: [DONE]",
+        'data: {"choices":[{"delta":{"content":"이건 무시"}}]}',
+    ]
+    body, reasoning, error = ai._consume_openai_stream(
+        _FakeResponse(lines), deadline=time.time() + 30,
+    )
+
+    assert error is None
+    assert body == "### 총평\n- **판단**: 중립"
+    assert "이건 무시" not in body, "[DONE] 뒤의 내용까지 읽었습니다"
+
+
+def test_stream_keeps_partial_output_when_the_deadline_hits():
+    """
+    마감 시한에 걸려도 그때까지 받은 본문은 살려야 한다.
+    잘린 리포트가 빈 리포트보다 낫다.
+    """
+    import services.ai_service as ai
+
+    class _EndlessResponse:
+        def iter_lines(self, decode_unicode=False):
+            yield 'data: {"choices":[{"delta":{"content":"앞부분"}}]}'
+            while True:
+                yield 'data: {"choices":[{"delta":{"content":"."}}]}'
+
+    body, _, error = ai._consume_openai_stream(
+        _EndlessResponse(), deadline=time.time() - 1,  # 이미 지난 시한
+    )
+
+    assert error is not None, "중단 사실을 알려야 합니다"
+    assert "제한 시간" in error
+
+
+def test_reasoning_only_stream_still_produces_a_body():
+    """content 없이 reasoning_content만 오는 모델에서도 본문이 나와야 한다."""
+    import services.ai_service as ai
+
+    class _R:
+        def iter_lines(self, decode_unicode=False):
+            return iter([
+                'data: {"choices":[{"delta":{"reasoning_content":"속으로"}}]}',
+                "data: [DONE]",
+            ])
+
+    body, reasoning, error = ai._consume_openai_stream(_R(), time.time() + 30)
+    assert body == "" and reasoning == "속으로" and error is None
+
+
+def test_transport_errors_tell_the_user_what_to_do():
+    """
+    [회귀] 타임아웃이 raw 예외 문자열로만 표시됐다. 사용자는
+    "HTTPSConnectionPool(...) Max retries exceeded ... ReadTimeoutError"
+    를 받고 무엇을 해야 할지 알 수 없었다. 타임아웃과 연결 실패는
+    조치가 전혀 다르므로 구분해서 안내해야 한다.
+    """
+    import requests
+
+    from services.ai_service import _describe_transport_error
+
+    timeout_msg = _describe_transport_error(
+        requests.exceptions.ReadTimeout("Read timed out. (read timeout=120)")
+    )
+    assert "제한 시간" in timeout_msg
+    assert "COT 상세" in timeout_msg, "무엇을 끄면 되는지 알려 줘야 합니다"
+
+    conn_msg = _describe_transport_error(
+        requests.exceptions.ConnectionError("Max retries exceeded")
+    )
+    assert "연결하지 못했습니다" in conn_msg
+    assert "제한 시간" not in conn_msg, "타임아웃과 섞이면 안 됩니다"
+
+
+def test_context_size_is_estimated_for_the_warning():
+    """
+    사용자가 2분을 기다린 뒤에야 타임아웃을 보는 일을 막으려면, 입력이
+    얼마나 큰지 미리 알려야 한다.
+    """
+    from services.ai_service import LARGE_CONTEXT_TOKENS, estimate_prompt_tokens
+
+    assert estimate_prompt_tokens("") == 0
+    assert estimate_prompt_tokens(None) == 0
+    assert estimate_prompt_tokens("가" * 1000) == 500
+    assert LARGE_CONTEXT_TOKENS > 0
