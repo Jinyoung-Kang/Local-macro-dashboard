@@ -135,6 +135,9 @@ def test_kis_connection():
         "FID_ETC_CLS_CODE": "0",
     }
 
+    empty_responses: list[str] = []
+    rejections: list[str] = []
+
     for market_division in ["V", "J"]:
         params = {
             **base_params,
@@ -157,24 +160,48 @@ def test_kis_connection():
                         f"조회 종목 수: {len(output)}개)",
                     )
 
+                # 인증·경로는 정상인데 돌려줄 행이 없는 경우입니다.
+                empty_responses.append(market_division)
+                continue
+
             if res:
-                logger.warning(
-                    "KIS 연결 점검 실패 (%s): %s",
-                    market_division,
-                    res.get("msg1", str(res)),
+                rejections.append(
+                    f"{market_division}: rt_cd={res.get('rt_cd')} "
+                    f"{res.get('msg1', '')}".strip()
                 )
 
         except Exception as e:
-            logger.warning(
-                "KIS 연결 점검 예외 (%s): %s",
-                market_division,
-                e,
-            )
+            rejections.append(f"{market_division}: {type(e).__name__}: {e}")
 
-    return False, (
-        "KIS FHPTJ04400000 가집계 데이터가 비어있거나 API 호출에 실패했습니다. "
-        "장 마감 후에는 이 TR이 원래 빈 데이터를 반환하는 것이 정상입니다."
-    )
+    # [진단 수정] 예전에는 두 경우를 뭉뚱그려 "비어있거나 호출에 실패"라고만
+    # 적고, 원인과 무관하게 "장 마감 후에는 정상"이라고 안내했습니다.
+    # 장중에 빈 응답이 와도 같은 문구가 나와서, 진짜 문제를 정상으로
+    # 오해하게 만들었습니다. 무엇이 일어났는지 그대로 말합니다.
+    if rejections:
+        return False, (
+            "KIS가 요청을 거절했습니다 — " + " / ".join(rejections) + ". "
+            "앱키·시크릿과 실전/모의 서버 설정을 확인하세요."
+        )
+
+    if empty_responses:
+        now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+        in_session = (
+            now_kst.weekday() < 5
+            and time(9, 0) <= now_kst.time() < time(15, 30)
+        )
+        when = (
+            "**지금은 정규장 시간입니다.** 인증은 통과했으므로 TR 파라미터나 "
+            "계정 권한(시세 이용 신청) 쪽을 확인하세요."
+            if in_session else
+            "지금은 장 시간이 아닙니다. 이 TR은 장 마감 후 빈 값을 주는 것이 "
+            "정상입니다."
+        )
+        return False, (
+            "KIS 인증과 통신은 성공했지만 가집계 데이터가 비어 있습니다 "
+            f"(구분 {', '.join(empty_responses)}). {when}"
+        )
+
+    return False, "KIS API에서 아무 응답도 받지 못했습니다. 네트워크를 확인하세요."
 
 
 # LS 조회에 쓰는 TR 정의 (진단과 수집이 같은 목록을 봅니다).
@@ -541,19 +568,34 @@ def fetch_kis_deal_ranking(
                 params=params,
             )
 
-            if res and res.get("rt_cd") == "0":
+            if not res:
+                continue
+
+            if res.get("rt_cd") == "0":
                 candidate = res.get("output", [])
 
                 if isinstance(candidate, list) and candidate:
                     output = candidate
                     break
 
-            if res:
-                logger.warning(
-                    "KIS 가집계 API 실패 (%s): %s",
+                # [로그 수정] 예전에는 이 경우도 "실패"로 적고 msg1을 그대로
+                # 붙여서 "KIS 가집계 API 실패: 정상처리 되었습니다"라는
+                # 앞뒤가 안 맞는 줄이 남았습니다. 호출은 성공했고 돌려줄
+                # 행이 없었을 뿐이라, 조치가 전혀 다릅니다.
+                logger.info(
+                    "KIS 가집계 응답 비어 있음 (%s): 호출은 성공했으나 "
+                    "해당 조건의 행이 없습니다. 장 시작 직후나 마감 후에는 "
+                    "정상입니다.",
                     market_division,
-                    res.get("msg1", str(res)),
                 )
+                continue
+
+            logger.warning(
+                "KIS 가집계 API 거절 (%s): rt_cd=%s %s",
+                market_division,
+                res.get("rt_cd"),
+                res.get("msg1", ""),
+            )
 
         except Exception as e:
             logger.warning(

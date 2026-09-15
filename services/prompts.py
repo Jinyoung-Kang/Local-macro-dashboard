@@ -159,6 +159,12 @@ _CALIBRATION = """\
 총평의 신뢰도와 본문을 다시 대조하십시오. 본문이 상충을 말하는데
 신뢰도가 '높음'이면 **신뢰도를 내리십시오.** 본문을 고치지 말고
 신뢰도를 고치십시오 — 상충은 사실이고, 틀린 것은 신뢰도입니다.
+
+[분량 배분 — 중요]
+생각은 **짧게** 하고 출력에 예산을 쓰십시오. 사고 과정을 길게 늘어놓다
+지정된 섹션을 다 쓰지 못하고 끝나는 것이 가장 나쁜 결과입니다.
+총평은 네 줄로 끝내고, **나머지 모든 섹션을 반드시 채운 뒤** 멈추십시오.
+각 섹션은 3~6줄이면 충분합니다.
 """
 
 _STYLE = """\
@@ -259,7 +265,7 @@ REPORT_PROFILES = {
         "description": "전 영역을 훑어 시장 국면과 주간 대응까지",
         "judgements": f"{JUDGEMENT_RISK_ON} | {JUDGEMENT_NEUTRAL} | {JUDGEMENT_RISK_OFF}",
         "temperature": 0.25,
-        "max_tokens": 6144,
+        "max_tokens": 12288,
         "system_prompt": build_report_prompt(
             role=(
                 "당신은 글로벌 매크로 헤지펀드의 수석 전략가입니다. "
@@ -315,7 +321,7 @@ REPORT_PROFILES = {
         "description": "국내 수급 주체의 행동에 집중",
         "judgements": "외국인 주도 매수 | 기관 주도 매수 | 혼조 | 동반 매도",
         "temperature": 0.25,
-        "max_tokens": 5120,
+        "max_tokens": 10240,
         "system_prompt": build_report_prompt(
             role=(
                 "당신은 한국 주식시장의 수급 흐름을 추적하는 퀀트 전략가입니다."
@@ -362,7 +368,7 @@ REPORT_PROFILES = {
         "description": "금리·유동성·신용 리스크에 집중",
         "judgements": "낮음 | 보통 | 높음 | 경계",
         "temperature": 0.2,
-        "max_tokens": 5120,
+        "max_tokens": 10240,
         "system_prompt": build_report_prompt(
             role=(
                 "당신은 채권·크레딧 리스크를 전담하는 매크로 리스크 매니저입니다."

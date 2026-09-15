@@ -1172,13 +1172,13 @@ def test_sse_stream_is_parsed_and_survives_noise():
         "data: [DONE]",
         'data: {"choices":[{"delta":{"content":"이건 무시"}}]}',
     ]
-    body, reasoning, error = ai._consume_openai_stream(
+    out = ai._consume_openai_stream(
         _FakeResponse(lines), deadline=time.time() + 30,
     )
 
-    assert error is None
-    assert body == "### 총평\n- **판단**: 중립"
-    assert "이건 무시" not in body, "[DONE] 뒤의 내용까지 읽었습니다"
+    assert out["error"] is None
+    assert out["content"] == "### 총평\n- **판단**: 중립"
+    assert "이건 무시" not in out["content"], "[DONE] 뒤의 내용까지 읽었습니다"
 
 
 def test_stream_keeps_partial_output_when_the_deadline_hits():
@@ -1194,12 +1194,12 @@ def test_stream_keeps_partial_output_when_the_deadline_hits():
             while True:
                 yield 'data: {"choices":[{"delta":{"content":"."}}]}'
 
-    body, _, error = ai._consume_openai_stream(
+    out = ai._consume_openai_stream(
         _EndlessResponse(), deadline=time.time() - 1,  # 이미 지난 시한
     )
 
-    assert error is not None, "중단 사실을 알려야 합니다"
-    assert "제한 시간" in error
+    assert out["error"] is not None, "중단 사실을 알려야 합니다"
+    assert "제한 시간" in out["error"]
 
 
 def test_reasoning_only_stream_still_produces_a_body():
@@ -1213,8 +1213,82 @@ def test_reasoning_only_stream_still_produces_a_body():
                 "data: [DONE]",
             ])
 
-    body, reasoning, error = ai._consume_openai_stream(_R(), time.time() + 30)
-    assert body == "" and reasoning == "속으로" and error is None
+    out = ai._consume_openai_stream(_R(), time.time() + 30)
+    assert out["content"] == ""
+    assert out["reasoning"] == "속으로"
+    assert out["error"] is None
+
+
+def test_truncated_generation_is_not_reported_as_success():
+    """
+    [회귀] finish_reason을 읽지 않아서, 토큰 상한에 걸려 문장 중간에
+    끊긴 리포트가 "✅ 성공"으로 표시됐다. 실제로 총평만 나오고
+    "핵심 근거: 10년 국채"에서 끝난 리포트가 성공으로 찍혔다.
+
+    gpt-oss 계열은 사고 과정(reasoning_content)도 같은 max_tokens에서
+    깎아 쓰므로, 사고가 길면 본문을 쓸 예산이 남지 않는다.
+    """
+    import services.ai_service as ai
+
+    class _Cut:
+        def iter_lines(self, decode_unicode=False):
+            return iter([
+                'data: {"choices":[{"delta":{"reasoning_content":"길게 생각"}}]}',
+                'data: {"choices":[{"delta":{"content":"### 총평\\n- 핵심 근거: 10년 국채"}}]}',
+                'data: {"choices":[{"delta":{},"finish_reason":"length"}]}',
+            ])
+
+    out = ai._consume_openai_stream(_Cut(), time.time() + 30)
+    assert out["finish_reason"] == "length", "종료 사유를 잡지 못했습니다"
+    assert out["reasoning"], "사고 과정도 함께 모아야 진단이 가능합니다"
+
+
+def test_call_wrapper_flags_a_length_stop(monkeypatch):
+    """토큰 상한에 걸렸으면 결과에 truncated 표시와 경고가 붙어야 한다."""
+    import services.ai_service as ai
+
+    monkeypatch.setattr(
+        ai, "_post_openai_stream",
+        lambda endpoint, headers, payload: {
+            "content": "### 총평\n- 핵심 근거: 10년 국채",
+            "reasoning": "아주 긴 사고 과정" * 100,
+            "finish_reason": "length",
+            "error": None,
+        },
+    )
+
+    result = ai._call_openai_format(
+        engine_name="테스트", endpoint="http://x", api_key="k",
+        model="m", prompt="p", max_tokens=6144,
+    )
+
+    assert result["status"] is True, "받은 본문은 살려야 합니다"
+    assert result["truncated"] is True
+    assert "잘림" in result["pipeline_step"]
+    assert "토큰 상한" in result["warning"]
+    assert "6,144" in result["warning"], "어느 값에 걸렸는지 알려야 합니다"
+
+
+def test_normal_stop_is_not_flagged_as_truncated(monkeypatch):
+    """정상 종료에 잘림 딱지를 붙이면 경고가 늘 떠서 의미가 없어진다."""
+    import services.ai_service as ai
+
+    monkeypatch.setattr(
+        ai, "_post_openai_stream",
+        lambda endpoint, headers, payload: {
+            "content": "### 총평\n정상", "reasoning": "",
+            "finish_reason": "stop", "error": None,
+        },
+    )
+
+    result = ai._call_openai_format(
+        engine_name="테스트", endpoint="http://x", api_key="k",
+        model="m", prompt="p",
+    )
+
+    assert result.get("truncated") is not True
+    assert result.get("warning") is None
+    assert "성공" in result["pipeline_step"]
 
 
 def test_transport_errors_tell_the_user_what_to_do():
@@ -1439,3 +1513,72 @@ def test_prompt_forces_an_explicit_conflict_count():
         )
         assert "자기 점검" in prompt, report_type
         assert "'높음'으로 쓸 수 없습니다" in prompt, report_type
+
+
+# ==============================================================================
+# 17. 진단·로그가 사실을 말해야 한다
+# ==============================================================================
+def test_streamlit_runtime_notice_is_filtered_not_levelled():
+    """
+    [회귀] 수집 로그가 "No runtime found, using MemoryCacheStorageManager"로
+    도배돼 진짜 로그를 덮었다(한 번 수집에 수십 줄).
+
+    레벨 조정으로는 막을 수 없다. Streamlit은 설정을 파싱할 때 자기 로거
+    레벨을 config 값(기본 info)으로 **되돌린다.** st.cache_data를 처음
+    쓰는 순간 그 일이 일어나므로, 시작할 때 아무리 낮춰도 수집 도중 다시
+    INFO가 된다. 필터는 setLevel에 지워지지 않는다.
+    """
+    import logging
+
+    import collector
+
+    drop = collector._DropStreamlitRuntimeNotice()
+
+    def _record(msg):
+        return logging.LogRecord("x", logging.WARNING, "f", 1, msg, None, None)
+
+    assert drop.filter(_record("No runtime found, using MemoryCacheStorageManager")) is False
+
+    # 다른 경고까지 함께 숨기면 안 된다.
+    assert drop.filter(_record("진짜 중요한 경고")) is True
+    assert drop.filter(_record("Session state does not function...")) is True
+
+
+def test_kis_diagnostic_separates_rejection_from_empty_data():
+    """
+    [회귀] KIS가 rt_cd=0에 msg1="정상처리 되었습니다"와 빈 리스트를 주면
+    로그에 "KIS 가집계 API 실패: 정상처리 되었습니다"라는 앞뒤가 안 맞는
+    줄이 남았다. 호출은 성공했고 돌려줄 행이 없었을 뿐이라 조치가 전혀
+    다르다.
+
+    진단 문구도 원인과 무관하게 "장 마감 후에는 정상"이라고만 안내해서,
+    장중에 빈 응답이 와도 정상으로 오해하게 만들었다.
+    """
+    import services.radar_service as r
+
+    # 키가 없으면 rt_cd=-1로 거절된다 → '거절'로 보고해야 한다.
+    ok, message = r.test_kis_connection()
+    assert ok is False
+    assert "거절" in message
+    assert "정상처리" not in message, "성공 메시지를 실패 사유로 쓰고 있습니다"
+
+
+def test_kis_diagnostic_mentions_session_time_for_empty_data(monkeypatch):
+    """
+    빈 응답일 때는 지금이 장중인지에 따라 안내가 달라야 한다. 장중인데도
+    "장 마감 후에는 정상"이라고 하면 진짜 문제를 덮는다.
+    """
+    import services.radar_service as r
+
+    monkeypatch.setattr(
+        r, "call_kis_api",
+        lambda tr_id, endpoint, params: {"rt_cd": "0", "output": []},
+    )
+
+    ok, message = r.test_kis_connection()
+
+    assert ok is False
+    assert "비어" in message
+    assert "인증" in message and "성공" in message, (
+        "인증은 통과했다는 사실을 알려야 원인을 좁힐 수 있습니다"
+    )

@@ -435,12 +435,16 @@ def _render_report_body(result: dict) -> None:
     """
     body = result["body"]
     parsed = parse_report_sections(body)
+    has_verdict = any(parsed["verdict"].values())
 
-    if not parsed["structured"]:
-        # 모델이 형식을 어겼습니다. 내용은 그대로 보여 줍니다.
+    if not has_verdict:
+        # 총평조차 못 읽었습니다. 형식을 크게 어긴 것이므로 원문 그대로.
         st.markdown(body)
         return
 
+    # 총평만 읽혔어도 배너는 그립니다. 생성이 잘린 리포트에서 가장
+    # 쓸모 있는 부분이 총평이라, 원시 마크다운으로 떨어뜨리면 오히려
+    # 읽기 어려워집니다.
     _render_verdict_banner(
         parsed["verdict"], result["report_type"], parsed["sections"],
     )
@@ -448,7 +452,14 @@ def _render_report_body(result: dict) -> None:
     if parsed["preamble"]:
         st.markdown(parsed["preamble"])
 
-    _render_sections(parsed["sections"])
+    if parsed["sections"]:
+        _render_sections(parsed["sections"])
+    else:
+        st.info(
+            "총평 외의 분석 섹션이 없습니다. 생성이 중간에 끊겼거나 모델이 "
+            "형식을 지키지 않은 것입니다 — 위의 경고와 원문을 확인하세요.",
+            icon="📄",
+        )
 
 
 def _render_failure_help(result: dict) -> None:

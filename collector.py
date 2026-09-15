@@ -60,8 +60,67 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-# Streamlit의 "No runtime found" 경고는 이 맥락에서 정상이므로 낮춥니다.
-logging.getLogger("streamlit").setLevel(logging.ERROR)
+class _DropStreamlitRuntimeNotice(logging.Filter):
+    """
+    Streamlit의 "No runtime found" 안내만 골라 버리는 로그 필터.
+
+    파라미터:
+        없음 (logging.Filter를 그대로 씁니다).
+
+    반환값:
+        filter()가 False를 돌려주면 그 로그 줄은 출력되지 않습니다.
+
+    주의사항:
+        - **레벨 조정으로는 막을 수 없어서 필터를 씁니다.** Streamlit은
+          설정을 파싱할 때 자기 로거 레벨을 config 값(기본 info)으로
+          되돌립니다. st.cache_data를 처음 쓰는 순간 그 일이 일어나므로,
+          시작할 때 아무리 ERROR로 낮춰도 수집 도중 다시 INFO가 됩니다.
+          필터는 setLevel에 지워지지 않습니다.
+        - 이 스크립트가 Streamlit 런타임 **밖에서** 도는 것은 의도된
+          동작이라 저 안내는 정상입니다. 다만 한 번 수집에 수십 줄이
+          찍혀 진짜 로그를 덮습니다.
+        - 다른 Streamlit 경고는 그대로 통과시킵니다. 메시지 본문으로만
+          판정하므로 필요한 경고를 함께 숨기지 않습니다.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "No runtime found" not in record.getMessage()
+
+
+def _quiet_streamlit_logs() -> None:
+    """
+    Streamlit의 런타임 부재 안내를 잠재웁니다.
+
+    파라미터:
+        없음.
+
+    반환값:
+        없음.
+
+    주의사항:
+        - Streamlit 로거는 propagate=False에 자체 핸들러를 갖고 있어,
+          상위 로거에 필터를 걸어도 닿지 않습니다. 그래서 해당 로거에
+          직접 붙입니다.
+        - 아직 만들어지지 않은 로거에는 붙일 수 없으므로, streamlit을
+          먼저 임포트해 로거가 생성되게 한 뒤 붙입니다.
+        - 실패해도 로그가 시끄러워질 뿐이라 조용히 넘어갑니다.
+    """
+    noise_filter = _DropStreamlitRuntimeNotice()
+
+    try:
+        import streamlit  # noqa: F401  (로거가 만들어지도록 임포트)
+        from streamlit import logger as st_logger
+
+        for log in list(st_logger._loggers.values()):
+            log.addFilter(noise_filter)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+    # 나중에 만들어지는 로거까지 덮도록 루트에도 걸어 둡니다.
+    logging.getLogger().addFilter(noise_filter)
+
+
+_quiet_streamlit_logs()
 
 logger = logging.getLogger("collector")
 

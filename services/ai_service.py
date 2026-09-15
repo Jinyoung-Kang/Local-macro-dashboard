@@ -768,41 +768,43 @@ def translate_response_if_needed(
 # 2. API 호출 공통 래퍼 (OpenAI / Cloudflare / Cerebras)
 # ==============================================================================
 
-def _consume_openai_stream(response, deadline: float) -> tuple[str, str, str | None]:
+def _consume_openai_stream(response, deadline: float) -> dict:
     """
-    OpenAI 호환 SSE 스트림을 끝까지 읽어 본문을 모읍니다.
+    OpenAI 호환 SSE 스트림을 끝까지 읽어 본문과 종료 사유를 모읍니다.
 
     파라미터:
         response : stream=True로 연 requests Response 객체.
         deadline : 이 시각(time.time() 기준)을 넘기면 중단합니다.
 
     반환값:
-        (본문, 사고과정, 오류) 세 값의 튜플.
-        오류가 None이면 정상입니다. 마감 시한을 넘겨 중단한 경우에도
-        **그때까지 모은 본문은 그대로 돌려줍니다** — 잘린 리포트가
-        빈 리포트보다 낫습니다.
+        dict:
+          content       : 모은 본문
+          reasoning     : 모은 사고 과정(reasoning_content)
+          finish_reason : 제공자가 알려준 종료 사유. "stop"이면 정상,
+                          **"length"면 토큰 상한에 걸려 잘린 것**입니다.
+          error         : 마감 시한 초과 등. 정상이면 None
 
     주의사항:
-        - SSE 한 줄은 `data: {...}` 형태이고 마지막은 `data: [DONE]`입니다.
-          JSON으로 파싱되지 않는 줄(주석·하트비트)은 조용히 건너뜁니다.
-          제공자마다 하트비트 형식이 달라 엄격하게 굴면 깨집니다.
-        - reasoning 계열 모델은 delta에 content 대신 reasoning_content를
-          싣습니다. 둘 다 모으고, 본문이 비었을 때만 사고과정을 씁니다.
-        - 마감 시한을 넘기면 루프를 빠져나오지만 **예외를 던지지 않습니다.**
-          호출부가 부분 결과를 살릴 수 있어야 하기 때문입니다.
+        - **finish_reason을 반드시 확인하세요.** "length"인데 그냥 넘기면
+          문장 중간에 끊긴 리포트가 "성공"으로 표시됩니다. 실제로 그랬습니다.
+        - reasoning 계열 모델(gpt-oss 등)은 reasoning_content에 사고 과정을
+          싣고, **그 토큰도 max_tokens에서 함께 깎입니다.** 사고가 길면
+          본문을 쓸 예산이 남지 않아 총평만 나오고 끝납니다.
+        - JSON으로 파싱되지 않는 줄(하트비트 등)은 조용히 건너뜁니다.
+        - 마감 시한을 넘겨도 예외를 던지지 않고 그때까지 모은 본문을
+          돌려줍니다. 잘린 리포트가 빈 리포트보다 낫습니다.
     """
     parts: list[str] = []
     reasoning_parts: list[str] = []
-    truncated = False
+    finish_reason = None
+    truncated_by_deadline = False
 
     for line in response.iter_lines(decode_unicode=True):
         if time.time() > deadline:
-            truncated = True
+            truncated_by_deadline = True
             break
 
-        if not line:
-            continue
-        if not line.startswith("data:"):
+        if not line or not line.startswith("data:"):
             continue
 
         payload = line[len("data:"):].strip()
@@ -812,34 +814,38 @@ def _consume_openai_stream(response, deadline: float) -> tuple[str, str, str | N
         try:
             chunk = json.loads(payload)
         except ValueError:
-            # 하트비트나 제공자 고유의 비-JSON 줄. 무시합니다.
             continue
 
         choices = chunk.get("choices") or []
         if not choices:
             continue
 
-        delta = choices[0].get("delta") or {}
+        choice = choices[0]
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+
+        delta = choice.get("delta") or {}
         if delta.get("content"):
             parts.append(delta["content"])
         if delta.get("reasoning_content"):
             reasoning_parts.append(delta["reasoning_content"])
 
     error = None
-    if truncated:
+    if truncated_by_deadline:
         error = (
             f"생성이 전체 제한 시간({OVERALL_DEADLINE:.0f}초)을 넘겨 "
             "중단했습니다. 받은 부분까지만 표시합니다."
         )
 
-    return "".join(parts), "".join(reasoning_parts), error
+    return {
+        "content": "".join(parts),
+        "reasoning": "".join(reasoning_parts),
+        "finish_reason": finish_reason,
+        "error": error,
+    }
 
 
-def _post_openai_stream(
-    endpoint: str,
-    headers: dict,
-    payload: dict,
-) -> tuple[str, str, str | None]:
+def _post_openai_stream(endpoint: str, headers: dict, payload: dict) -> dict:
     """
     OpenAI 호환 엔드포인트에 스트리밍으로 요청하고 본문을 모읍니다.
 
@@ -849,7 +855,8 @@ def _post_openai_stream(
         payload  : 요청 본문. 이 함수가 stream=True를 넣어 보냅니다.
 
     반환값:
-        (본문, 사고과정, 오류) 튜플. 오류가 None이면 정상입니다.
+        _consume_openai_stream과 같은 dict
+        (content / reasoning / finish_reason / error).
 
     주의사항:
         - **타임아웃이 (연결, 조각 간 대기) 두 값입니다.** 비스트리밍의
@@ -872,7 +879,10 @@ def _post_openai_stream(
     ) as response:
         if response.status_code != 200:
             detail = response.text[:PROVIDER_ERROR_CHARS]
-            return "", "", f"HTTP {response.status_code}: {detail}"
+            return {
+                "content": "", "reasoning": "", "finish_reason": None,
+                "error": f"HTTP {response.status_code}: {detail}",
+            }
 
         return _consume_openai_stream(response, deadline)
 
@@ -969,31 +979,52 @@ def _call_openai_format(
 
     try:
         if stream:
-            text, reasoning, error = _post_openai_stream(endpoint, headers, payload)
+            out = _post_openai_stream(endpoint, headers, payload)
         else:
-            text, reasoning, error = _post_openai_once(
-                endpoint, headers, payload, timeout,
-            )
+            out = _post_openai_once(endpoint, headers, payload, timeout)
     except Exception as e:                                   # noqa: BLE001
         return _fail(_describe_transport_error(e), step="에러")
 
-    body = (text or "").strip() or (reasoning or "").strip()
+    text = (out.get("content") or "").strip()
+    reasoning = (out.get("reasoning") or "").strip()
+    error = out.get("error")
+    body = text or reasoning
 
-    if body:
-        secs, ms = _elapsed()
-        result = {
-            "status": True, "response": body, "error": None,
-            "provider": engine_name, "pipeline_step": f"{engine_name} 성공",
-            "latency_ms": ms, "latency": secs, "model": model,
-        }
-        if error:
-            # 마감 시한에 걸려 잘렸지만 받은 만큼은 살립니다.
-            result["truncated"] = True
-            result["pipeline_step"] = f"{engine_name} 부분 성공"
-            result["warning"] = error
-        return result
+    if not body:
+        return _fail(error or "응답 텍스트 추출 실패")
 
-    return _fail(error or "응답 텍스트 추출 실패")
+    secs, ms = _elapsed()
+    result = {
+        "status": True, "response": body, "error": None,
+        "provider": engine_name, "pipeline_step": f"{engine_name} 성공",
+        "latency_ms": ms, "latency": secs, "model": model,
+    }
+
+    # [버그 수정] finish_reason을 무시해서, 토큰 상한에 걸려 문장 중간에
+    # 끊긴 리포트가 "✅ 성공"으로 표시됐습니다. 실제로 총평만 나오고
+    # "핵심 근거: 10년 국채"에서 끝난 리포트가 성공으로 찍혔습니다.
+    if out.get("finish_reason") == "length":
+        result["truncated"] = True
+        result["pipeline_step"] = f"{engine_name} 잘림"
+        hint = ""
+        if reasoning and not text:
+            hint = " 모델이 본문 대신 사고 과정만 내보냈습니다."
+        elif reasoning:
+            hint = (
+                f" 이 모델은 사고 과정({len(reasoning):,}자)도 같은 토큰"
+                " 예산에서 깎아 쓰므로, 본문을 쓸 여유가 없었습니다."
+            )
+        result["warning"] = (
+            f"생성이 토큰 상한(max_tokens={max_tokens:,})에 걸려 중간에 "
+            f"끊겼습니다.{hint} 입력을 줄이거나(COT 상세 끄기) 더 큰 "
+            "모델로 바꿔 보세요."
+        )
+    elif error:
+        result["truncated"] = True
+        result["pipeline_step"] = f"{engine_name} 부분 성공"
+        result["warning"] = error
+
+    return result
 
 
 def _post_openai_once(
@@ -1001,7 +1032,7 @@ def _post_openai_once(
     headers: dict,
     payload: dict,
     timeout: float,
-) -> tuple[str, str, str | None]:
+) -> dict:
     """
     OpenAI 호환 엔드포인트에 **비스트리밍**으로 한 번 요청합니다.
 
@@ -1012,7 +1043,8 @@ def _post_openai_once(
         timeout  : 전체 응답까지의 제한 시간(초).
 
     반환값:
-        (본문, 사고과정, 오류) 튜플. _post_openai_stream과 같은 모양입니다.
+        _post_openai_stream과 같은 dict
+        (content / reasoning / finish_reason / error).
 
     주의사항:
         **긴 리포트에 이 경로를 쓰지 마세요.** 생성이 전부 끝날 때까지
@@ -1024,19 +1056,27 @@ def _post_openai_once(
     )
 
     if response.status_code != 200:
-        return "", "", f"HTTP {response.status_code}: {response.text[:PROVIDER_ERROR_CHARS]}"
+        return {
+            "content": "", "reasoning": "", "finish_reason": None,
+            "error": f"HTTP {response.status_code}: {response.text[:PROVIDER_ERROR_CHARS]}",
+        }
 
     data = response.json()
     choices = data.get("choices") or []
     if not choices:
-        return "", "", "응답에 choices가 없습니다"
+        return {
+            "content": "", "reasoning": "", "finish_reason": None,
+            "error": "응답에 choices가 없습니다",
+        }
 
-    message = choices[0].get("message") or {}
-    return (
-        message.get("content") or "",
-        message.get("reasoning_content") or "",
-        None,
-    )
+    choice = choices[0]
+    message = choice.get("message") or {}
+    return {
+        "content": message.get("content") or "",
+        "reasoning": message.get("reasoning_content") or "",
+        "finish_reason": choice.get("finish_reason"),
+        "error": None,
+    }
 
 
 def _describe_transport_error(exc: Exception) -> str:
