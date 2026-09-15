@@ -1,7 +1,12 @@
 """
 services/sector_service.py
-섹터 및 자산군 시계열/로테이션 수집 엔진
-섹터/자산군 순위 평가 독립 분리 및 기존 calculate_returns_matrix 복원 적용 
+섹터·자산군 ETF의 종가 시계열과 로테이션 순위.
+
+[순위는 상대적인 값입니다]
+"에너지 3개월 순위 1위"는 에너지가 올랐다는 뜻이 아니라 **다른 것보다
+덜 빠졌을 수도** 있다는 뜻입니다. 전 섹터가 하락한 구간에서도 1위는
+존재합니다. 화면과 AI 리포트는 순위와 수익률을 **함께** 보여 줘야
+합니다.
 """
 import logging
 from datetime import datetime

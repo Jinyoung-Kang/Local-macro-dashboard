@@ -353,14 +353,41 @@ def render_toss_test_view():
         "🔬 Daum 기간 선택 네트워크 요청 캡처 실행",
         key="btn_debug_daum_period",
     ):
-        with st.spinner(
-            "헤드리스 브라우저로 페이지를 열고 드롭다운 구조를 "
-            "확인한 뒤, 각 기간 옵션을 선택하며 네트워크 요청을 "
-            "캡처하는 중..."
-        ):
-            debug_result = debug_daum_investor_periods()
+        # [버그 수정] 이 진단은 Playwright + Chromium이 있어야 돕니다.
+        # 없으면 ImportError나 "Executable doesn't exist"가 그대로 올라와
+        # 화면에 빨간 트레이스백이 떴습니다. README는 "playwright install
+        # chromium을 실행했는지 확인하라"고 안내하는데, 정작 화면은 그
+        # 안내를 하지 않았습니다. 여기서 잡아 할 일을 알려 줍니다.
+        try:
+            with st.spinner(
+                "헤드리스 브라우저로 페이지를 열고 드롭다운 구조를 "
+                "확인한 뒤, 각 기간 옵션을 선택하며 네트워크 요청을 "
+                "캡처하는 중..."
+            ):
+                debug_result = debug_daum_investor_periods()
+        except ImportError:
+            st.error(
+                "이 진단은 Playwright가 필요합니다. 터미널에서 "
+                "`pip install playwright` 뒤 `playwright install chromium`을 "
+                "실행하세요.",
+                icon="🧩",
+            )
+            debug_result = None
+        except Exception as exc:                                 # noqa: BLE001
+            # 브라우저 미설치·실행 실패·페이지 구조 변경이 모두 여기로
+            # 옵니다. 원문을 함께 보여 줘야 무엇이 문제인지 알 수 있습니다.
+            hint = ""
+            if "Executable doesn" in str(exc) or "playwright install" in str(exc):
+                hint = " `playwright install chromium`을 실행했는지 확인하세요."
+            st.error(
+                f"진단 실행에 실패했습니다: {type(exc).__name__}: {exc}{hint}",
+                icon="🧩",
+            )
+            debug_result = None
 
-        for section_name, payload in debug_result.items():
+        # [주의] 여기서 return하면 아래 진단 섹션들까지 통째로 사라집니다.
+        # 실패한 것은 이 진단 하나뿐이므로 결과 렌더링만 건너뜁니다.
+        for section_name, payload in (debug_result or {}).items():
             st.markdown(f"**{section_name}**")
 
             if section_name == "__select_구조__":
@@ -377,8 +404,9 @@ def render_toss_test_view():
             for item in payload:
                 st.code(item, language="text")
 
-        with st.expander("원본 응답 보기"):
-            st.json(debug_result)
+        if debug_result:
+            with st.expander("원본 응답 보기"):
+                st.json(debug_result)
 
     # ==========================================================================
     # [진단 전용] Daum investor_purchase API 실제 JSON 응답 구조 확인

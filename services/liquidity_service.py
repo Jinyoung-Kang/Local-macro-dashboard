@@ -1,7 +1,14 @@
 """
 services/liquidity_service.py
-연준 순유동성(Fed Net Liquidity) 지표 수집 및 분석 서비스 모듈
-(WALCL, WTREGEN, RRPONTSYD 수집, 단위 정규화 및 무중단 Fallback 탑재 + 병렬 수집 최적화)
+연준 순유동성 = WALCL − TGA − ON RRP.
+
+[단위가 서로 다릅니다]
+FRED에서 WALCL은 백만 달러, WTREGEN·RRPONTSYD는 십억 달러로 옵니다.
+정규화를 빠뜨리면 순유동성이 수천 배로 어긋나므로, 값을 더하기 전에
+반드시 같은 단위로 맞추세요.
+
+발표 주기도 다릅니다(WALCL 주간, 나머지 일간). 가장 최근 값끼리
+빼는 것이라 **며칠 시차가 섞여 있습니다.**
 """
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor

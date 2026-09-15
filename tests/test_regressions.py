@@ -2576,3 +2576,40 @@ def test_no_unused_imports_in_shipped_code():
         if "imported but unused" in line
     ]
     assert not unused, "쓰지 않는 import가 있습니다:\n" + "\n".join(unused)
+
+
+def test_playwright_diagnostic_does_not_show_a_traceback():
+    """
+    `🔬 Daum 기간 선택 네트워크 요청 캡처 실행` 버튼은 Playwright와
+    Chromium이 있어야 돈다. 없으면 ImportError나 "Executable doesn't
+    exist"가 그대로 올라와 화면에 빨간 트레이스백이 떴다. README는
+    `playwright install chromium`을 안내하는데 화면은 하지 않았다.
+
+    실패하더라도 **아래 진단 섹션들은 남아야 한다** — return으로 빠져나가면
+    화면 절반이 통째로 사라진다.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path("views/toss_test_view.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    view = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "render_toss_test_view"
+    )
+
+    guarded = [
+        node for node in ast.walk(view)
+        if isinstance(node, ast.Try)
+        and "debug_daum_investor_periods" in ast.unparse(node.body)
+    ]
+    assert guarded, "진단 호출이 try로 감싸여 있지 않습니다"
+
+    handler_src = "\n".join(ast.unparse(h) for h in guarded[0].handlers)
+    assert "ImportError" in ast.unparse(guarded[0]), "ImportError를 따로 잡아야 합니다"
+    assert "playwright install chromium" in handler_src, (
+        "해야 할 일(playwright install chromium)을 알려 줘야 합니다"
+    )
+    assert "return" not in handler_src, (
+        "return하면 아래 진단 섹션까지 사라집니다 — 결과 렌더링만 건너뛰세요"
+    )

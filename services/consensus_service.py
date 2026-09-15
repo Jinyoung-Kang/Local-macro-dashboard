@@ -1,7 +1,13 @@
 """
 services/consensus_service.py
-기관 13F Money 교집합 (Consensus) 분석 퀀트 엔진
-다수 기관의 분기별 포트폴리오를 대조하여 공통 보유, 동시 순매수/순매도 집중 종목 산출
+여러 기관의 13F를 대조해 공통 보유·동시 매수/매도 종목을 찾습니다.
+
+[교집합이 곧 신호는 아닙니다]
+대형 기관 다수가 같은 종목을 들고 있는 것은 그 종목이 지수에 크게
+들어 있기 때문인 경우가 많습니다(예: 시가총액 상위주). 보유 자체보다
+**분기 대비 증감**이 신호에 가깝습니다.
+
+sec_service의 경고가 그대로 적용됩니다 — 최대 4개월 전 데이터입니다.
 """
 import pandas as pd
 from services.sec_service import fetch_sec_13f_multi_quarters, classify_qoq_action

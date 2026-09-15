@@ -1,7 +1,13 @@
 """
 services/sec_service.py
-SEC EDGAR 13F-HR 공시 데이터 수집 및 기관 포트폴리오 분석 엔진
-(강력한 Session 기반 통신 방어, 콤마 수치 정제 및 무적 ElementTree XML 파서 탑재)
+SEC EDGAR 13F-HR 공시 수집과 기관 포트폴리오 집계.
+
+[13F의 성질]
+- 분기별 공시이고 제출 시한이 분기 종료 후 45일입니다. 즉 여기 보이는
+  포지션은 **최대 4개월 전**의 것입니다. "지금 기관이 사고 있다"로
+  읽으면 안 됩니다.
+- 공매도 포지션과 비상장 지분은 잡히지 않습니다.
+- EDGAR는 User-Agent에 연락처를 요구합니다. 없으면 403입니다.
 """
 import logging
 import threading

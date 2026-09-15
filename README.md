@@ -707,7 +707,7 @@ git push -u origin <브랜치명>
 | `다른 수집기가 이미 실행 중입니다` | 중복 실행 방지. 기존 프로세스를 끄거나 `--force` |
 | KRX 선물이 "추정치" | `krx.api_key` 미설정. KODEX 200 기반 폴백입니다 |
 | 수급 레이더 종목 조회 실패 | `--only fast`로 재수집하세요 (과거 버전이 저장한 종목코드 손상 가능성) |
-| `playwright` 관련 오류 | `playwright install chromium` 을 실행했는지 확인 |
+| `playwright` 관련 오류 | `playwright install chromium` 을 실행했는지 확인. 토스 메뉴의 Daum 캡처 진단은 이제 트레이스백 대신 이 안내를 띄웁니다 |
 | `--verify`가 "KIS OAuth2 토큰 발급 실패" | `[kis] app_key`/`app_secret` 오타, 또는 실전/모의 서버 불일치 |
 | `--verify`가 "확인 못 함"만 나옴 | 시간 조건 때문입니다. 시세 대조는 장 마감 후, 수급 대조는 정규장 중에만 가능합니다 |
 | `--verify`에서 불일치 발견 | 비공식 소스(Daum·Naver·TradingView)의 페이지 구조 변경을 먼저 의심하세요 |
