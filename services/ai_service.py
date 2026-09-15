@@ -850,6 +850,104 @@ def _condition_cells(sections: list) -> list:
     return cells
 
 
+# 첫 섹션 제목 앞에 이만큼 넘게 글이 붙어 있으면 리포트가 아니라
+# 모델의 사고 과정으로 봅니다. 정상 리포트의 preamble은 비어 있거나
+# 한두 줄입니다.
+_REASONING_PREAMBLE_CHARS = 400
+
+
+def detect_reasoning_dump(parsed: dict) -> str | None:
+    """
+    본문이 완성된 리포트가 아니라 모델의 사고 과정인지 판별합니다.
+
+    파라미터:
+        parsed : parse_report_sections()가 돌려준 dict 전체.
+
+    반환값:
+        사고 과정으로 보이면 설명 문자열, 아니면 None.
+
+    주의사항:
+        - **strip_reasoning_artifacts()로는 못 잡습니다.** 그 함수는
+          <think> 태그를 지우는데, 어떤 모델은 표시 없이 평문으로
+          "We need to produce a report with sections…"부터 시작해
+          수백 줄을 쏟아냅니다(2026-09-16 00:18 Nemotron).
+        - 판별 기준은 **첫 섹션 제목 앞의 분량**입니다. 완성된 리포트는
+          "### 총평"으로 시작하므로 그 앞이 비어 있습니다. 어휘로
+          판별하면 언어와 모델마다 달라 놓칩니다.
+        - 이때 화면은 총평 배너를 그리면 **안 됩니다.** 사고 과정 안의
+          초안을 확정된 판단처럼 보여 주게 됩니다.
+    """
+    preamble = (parsed or {}).get("preamble") or ""
+    if len(preamble) <= _REASONING_PREAMBLE_CHARS:
+        return None
+
+    sections = (parsed or {}).get("sections") or []
+    where = "본문 전체가" if not sections else "본문 앞부분이"
+
+    return (
+        f"{where} 완성된 리포트가 아니라 **모델의 사고 과정**입니다"
+        f"({len(preamble):,}자). 아래 내용은 초안이므로 결론으로 읽지 "
+        "마세요. 총평 배너도 그리지 않았습니다 — 그 안의 판단은 모델이 "
+        "검토 중이던 후보이지 확정된 결론이 아닙니다. 다른 엔진으로 "
+        "다시 생성하거나 입력을 줄여 보세요."
+    )
+
+
+def get_allowed_judgements(report_type: str) -> tuple:
+    """
+    이 리포트 유형에서 허용하는 판단 값 집합.
+
+    파라미터:
+        report_type : REPORT_PROFILES의 키.
+
+    반환값:
+        예) ("낮음", "보통", "높음", "경계") 튜플.
+
+    주의사항:
+        출처는 REPORT_PROFILES[...]["judgements"] 하나입니다. 프롬프트가
+        모델에게 제시하는 것과 화면이 검사하는 것이 같아야 합니다.
+    """
+    profile = REPORT_PROFILES.get(report_type) or REPORT_PROFILES[DEFAULT_REPORT_TYPE]
+    return tuple(
+        value.strip() for value in profile.get("judgements", "").split("|")
+        if value.strip()
+    )
+
+
+def detect_judgement_out_of_vocabulary(verdict: dict, report_type: str) -> str | None:
+    """
+    총평의 판단이 그 유형의 허용 어휘를 벗어났는지 검사합니다.
+
+    파라미터:
+        verdict     : parse_report_sections()가 돌려준 verdict dict.
+        report_type : 그 리포트를 만들 때 쓴 유형.
+
+    반환값:
+        어휘를 벗어났으면 설명 문자열, 없으면 None.
+
+    주의사항:
+        - 2026-09-16 00:20 금리 리포트가 판단을 "위험선호"로 썼습니다.
+          그 유형의 어휘는 "낮음 | 보통 | 높음 | 경계"입니다. 화면은
+          "리스크 수준: 위험선호"라고 초록색으로 그려서, 마치 리스크가
+          낮다는 정상 판단처럼 보였습니다.
+        - 판단이 비어 있으면 검사하지 않습니다. 그것은 파싱 실패이지
+          어휘 문제가 아닙니다.
+    """
+    judgement = (verdict.get("판단") or "").strip()
+    if not judgement:
+        return None
+
+    allowed = get_allowed_judgements(report_type)
+    if not allowed or judgement in allowed:
+        return None
+
+    return (
+        f"총평의 판단이 '{judgement}'인데, 이 리포트 유형이 허용하는 값은 "
+        + " / ".join(allowed) + " 입니다. 모델이 다른 리포트의 어휘를 "
+        "가져다 쓴 것이므로, 배너의 색과 아이콘을 그대로 믿지 마세요."
+    )
+
+
 def detect_valueless_conditions(sections: list) -> str | None:
     """
     '발생 조건' 칸에 현재값만 적고 부등호를 빼먹었는지 검사합니다.

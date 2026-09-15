@@ -29,7 +29,9 @@ from services.ai_service import (
     check_all_engines,
     detect_foreign_script,
     detect_invented_weights,
+    detect_judgement_out_of_vocabulary,
     detect_prompt_leak,
+    detect_reasoning_dump,
     detect_valueless_conditions,
     detect_verdict_conflict,
     detect_verdict_language_issue,
@@ -356,6 +358,8 @@ def _render_verdict_banner(
           한국어면 자동 번역 단계를 건너뛰기 때문에 생깁니다.
         - 프롬프트 지시문이 본문에 섞이거나 한자가 흘러나오면 캡션으로
           알립니다. 모델이 언어·역할을 흘린 신호입니다.
+        - 판단이 이 유형의 어휘를 벗어나면 경고합니다. 배너의 색과
+          아이콘이 엉뚱한 뜻으로 읽히기 때문입니다.
     """
     judgement = verdict.get("판단")
     if not judgement:
@@ -414,6 +418,10 @@ def _render_verdict_banner(
         """,
         unsafe_allow_html=True,
     )
+
+    vocabulary = detect_judgement_out_of_vocabulary(verdict, report_type)
+    if vocabulary:
+        st.warning(vocabulary, icon="🔤")
 
     conflict_note = (verdict.get("상충 신호") or "").strip()
     if conflict_note and "없음" not in conflict_note:
@@ -508,6 +516,16 @@ def _render_report_body(result: dict) -> None:
     body = result["body"]
     parsed = parse_report_sections(body)
     has_verdict = any(parsed["verdict"].values())
+
+    # [중요] 본문이 사고 과정이면 **배너를 그리지 않습니다.** 사고 과정
+    # 안에는 모델이 검토하다 만 총평 초안이 들어 있어서, 그것을 배너로
+    # 그리면 후보를 확정된 판단처럼 보여 주게 됩니다(2026-09-16 00:18).
+    # 내용은 하나도 버리지 않고 원문 그대로 보여 줍니다.
+    reasoning = detect_reasoning_dump(parsed)
+    if reasoning:
+        st.error(reasoning, icon="🧠")
+        st.markdown(body)
+        return
 
     if not has_verdict:
         # 총평조차 못 읽었습니다. 형식을 크게 어긴 것이므로 원문 그대로.

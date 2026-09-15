@@ -2379,3 +2379,133 @@ def test_markdown_export_does_not_double_the_closing_rule():
     assert "---\n\n---" not in out, out[-200:]
     assert out.count("\n---\n") == 2, "머리말 구분선과 꼬리말 구분선만 남아야 합니다"
     assert "- 판단: 낮음" in out
+
+
+# ==============================================================================
+# 24. 2026-09-16 00:18 / 00:20 리포트(Nemotron-3 Super 120B)에서 나온 결함
+# ==============================================================================
+def test_reasoning_dump_is_detected():
+    """
+    00:18 리포트의 본문은 리포트가 아니라 영어 사고 과정 540여 줄이었다
+    ("We need to produce a report with sections: 총평, 거시 국면 …").
+    그 안에는 모델이 검토하다 만 총평 **초안**이 들어 있어서, 화면이
+    그것으로 확정 판단 배너를 그렸다.
+
+    strip_reasoning_artifacts()는 <think> 태그만 지우므로 평문 사고
+    과정은 그대로 통과한다. 첫 섹션 제목 앞의 분량으로 판별한다.
+    """
+    from services.ai_service import detect_reasoning_dump, parse_report_sections
+
+    dump = (
+        "We need to produce a report with sections: 총평, 거시 국면.\n"
+        "We must follow the rules: no numbers not in data.\n"
+        + "Let's extract relevant data and count conflicting signals.\n" * 12
+        + "\n### 총평\n- 판단: 위험회피\n- 신뢰도: 낮음\n"
+    )
+    note = detect_reasoning_dump(parse_report_sections(dump))
+
+    assert note is not None, "사고 과정을 잡지 못했습니다"
+    assert "사고 과정" in note
+
+
+def test_normal_reports_are_not_mistaken_for_reasoning():
+    """
+    정상 리포트는 "### 총평"으로 시작하므로 앞부분이 비어 있다.
+    짧은 머리말 한 줄까지는 허용해야 오탐이 나지 않는다.
+    """
+    from services.ai_service import detect_reasoning_dump, parse_report_sections
+
+    for body in (
+        "### 총평\n- **판단**: 중립\n\n### 거시 국면\n금리는 정상 범위다.\n",
+        "기준 시각: 2026-09-16 00:00 KST\n\n### 총평\n- **판단**: 중립\n",
+    ):
+        assert detect_reasoning_dump(parse_report_sections(body)) is None, body[:40]
+
+    assert detect_reasoning_dump({}) is None
+    assert detect_reasoning_dump({"preamble": "", "sections": []}) is None
+
+
+def test_reasoning_dump_suppresses_the_verdict_banner():
+    """
+    사고 과정일 때 배너를 그리면 '검토 중이던 후보'가 확정 판단처럼
+    보인다. 배너는 빼되 본문은 한 글자도 버리지 않아야 한다.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    body_fn = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_render_report_body"
+    )
+    flat = ast.unparse(body_fn)
+
+    # 검사 → 원문 출력 → return 이 배너보다 먼저 와야 한다.
+    assert flat.index("detect_reasoning_dump") < flat.index("_render_verdict_banner"), (
+        "배너를 그린 뒤에 검사하면 이미 늦습니다"
+    )
+    assert "st.markdown(body)" in flat, "사고 과정일 때 원문을 버리면 안 됩니다"
+
+
+def test_judgement_outside_the_profile_vocabulary_is_flagged():
+    """
+    00:20 금리 리포트는 판단을 "위험선호"로 썼다. 그 유형의 어휘는
+    "낮음 | 보통 | 높음 | 경계"다. 화면은 "리스크 수준: 위험선호"를
+    초록색으로 그려서 리스크가 낮다는 정상 판단처럼 보였다.
+    """
+    from services.ai_service import (
+        detect_judgement_out_of_vocabulary,
+        get_allowed_judgements,
+        get_report_types,
+    )
+
+    note = detect_judgement_out_of_vocabulary(
+        {"판단": "위험선호"}, "금리 및 유동성 리스크 점검",
+    )
+    assert note is not None, "어휘를 벗어난 판단을 잡지 못했습니다"
+    assert "위험선호" in note and "낮음" in note
+
+    # 각 유형의 정상 어휘는 조용해야 한다.
+    for report_type in get_report_types():
+        for judgement in get_allowed_judgements(report_type):
+            assert detect_judgement_out_of_vocabulary(
+                {"판단": judgement}, report_type,
+            ) is None, (report_type, judgement)
+
+    # 판단이 비어 있으면 파싱 실패이지 어휘 문제가 아니다.
+    assert detect_judgement_out_of_vocabulary({}, "종합 거시경제 & 수급 전략") is None
+
+
+def test_allowed_judgements_match_the_tone_map():
+    """
+    화면의 색 매핑(_JUDGEMENT_TONE)이 프로파일 어휘를 모두 알고 있어야
+    한다. 빠지면 그 판단이 조용히 '중립' 색으로 떨어진다.
+    """
+    import ast
+    import pathlib
+
+    from services.ai_service import get_allowed_judgements, get_report_types
+
+    source = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+    tone_map = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", "") == "_JUDGEMENT_TONE" for t in node.targets)
+    )
+    known = {k.value for k in tone_map.value.keys}
+
+    for report_type in get_report_types():
+        for judgement in get_allowed_judgements(report_type):
+            assert judgement in known, f"{report_type}의 '{judgement}'에 색이 없습니다"
+
+
+def test_prompt_forbids_emitting_the_thinking():
+    """규칙이 사라지면 사고 과정 덤프가 조용히 돌아온다."""
+    from services.ai_service import get_report_system_prompt, get_report_types
+
+    for report_type in get_report_types():
+        prompt = get_report_system_prompt(report_type)
+        assert "생각한 과정을 출력하지 마십시오" in prompt, report_type
+        assert "출력의 첫 글자는" in prompt, report_type
+        assert "판단 값은 이 리포트 유형에 지정된 것만" in prompt, report_type
