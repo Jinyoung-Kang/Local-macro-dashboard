@@ -2063,10 +2063,10 @@ def test_risk_indicators_declare_which_way_is_dangerous():
     _append_risk_section(lines, {"VIX": None, "MOVE": None})
     text = "\n".join(lines)
 
-    assert "값이 높을수록" in text.replace("**", ""), (
-        "다섯 지표의 위험 방향이 문맥에 없습니다"
-    )
-    assert "위험회피 근거로 쓸 수 없습니다" in text
+    flat = text.replace("**", "")
+    assert "값이 높을수록" in flat, "다섯 지표의 위험 방향이 문맥에 없습니다"
+    # 방향만으로는 부족해서 국면 라벨까지 적게 되었다(23:48 리포트 참조).
+    assert "스프레드(HY OAS·IG·CP)와 금융스트레스(STLFSI4)가 낮으면 위험선호" in flat
 
 
 def test_advanced_indicators_carry_a_risk_direction():
@@ -2159,3 +2159,97 @@ def test_scrapers_say_whether_the_previous_close_was_measured():
             f"{path}: 역산 {derived_sites}곳 중 표시가 {flags}곳뿐입니다"
         )
         assert '"prev_is_derived": True' in source, path
+
+
+# ==============================================================================
+# 22. 2026-09-15 23:48 / 23:52 리포트에서 나온 결함
+# ==============================================================================
+def test_context_maps_indicator_levels_to_regime_labels():
+    """
+    23:48 종합 리포트는 "신용 스프레드는 HY OAS 2.65%(낮음)... 위험이 낮다",
+    "VIX 17.47, MOVE 109.33으로 변동성이 높다"라고 맞게 써 놓고, 바로 다음
+    문장에서 "금리·신용·유동성은 위험회피를 시사하지만 변동성은 위험선호를
+    시사한다"로 라벨을 뒤바꿨다.
+
+    문맥이 "값이 높을수록 위험"까지만 말하고 그것이 어느 국면인지는
+    연결해 주지 않았던 것이 원인이다.
+    """
+    from services.dashboard_snapshot_service import _append_risk_section
+
+    lines = []
+    _append_risk_section(lines, {"VIX": None})
+    note = next(ln for ln in lines if ln.startswith("※"))
+    flat = note.replace("**", "")
+
+    assert "변동성(VIX·MOVE)이 높으면 위험회피" in flat, note
+    assert "낮으면 위험선호" in flat, note
+    assert "뒤집지 마십시오" in flat
+
+
+def test_context_explains_the_two_spreads_are_not_comparable():
+    """
+    23:52 금리 리포트는 "10Y-3M(0.860)이 10Y-2Y(0.349)보다 크게 높아 단기
+    스프레드가 급격히 가파르게 상승"을 핵심 근거로 삼고 상충 신호로도
+    셌다. 3M < 2Y이므로 정상 곡선에서는 당연한 관계다. 같은 문장에서
+    "직전 대비 0.030p 감소했으나"라고 써 놓고 "상승"이라고 했다.
+    """
+    from services.advanced_macro_service import (
+        ADVANCED_SERIES,
+        summarize_advanced_for_ai,
+    )
+
+    assert ADVANCED_SERIES["T10Y3M"].get("note"), "곡선 형태 설명이 없습니다"
+
+    summary = summarize_advanced_for_ai({"latest": {
+        "T10Y3M": {"label": "장단기 금리차 10Y-3M", "available": True,
+                   "value": 0.860, "digits": 3, "unit": "%p", "delta": -0.030,
+                   "status": "정상", "percentile": 63.1},
+    }})
+    assert "참고:" in summary
+    assert "이상 신호도, 상충도 아닙니다" in summary
+
+    # note가 없는 지표에는 참고 줄을 붙이지 않는다.
+    plain = summarize_advanced_for_ai({"latest": {
+        "DFII10": {"label": "10년 실질금리 (TIPS)", "available": True,
+                   "value": 2.6, "digits": 3, "unit": "%", "delta": 0.05,
+                   "status": "긴축적", "percentile": 100.0},
+    }})
+    assert "참고:" not in plain
+    assert "위험 방향:" in plain
+
+
+def test_prompt_narrows_what_counts_as_a_conflict():
+    """
+    크기 비교("A가 B보다 크다")를 상충으로 세면 신뢰도가 근거 없이 내려간다.
+    23:52 리포트는 그렇게 센 상충 3개로 신뢰도를 '낮음'으로 떨어뜨렸다.
+    """
+    from services.ai_service import get_report_system_prompt, get_report_types
+
+    for report_type in get_report_types():
+        prompt = get_report_system_prompt(report_type)
+        assert "크기 비교를 상충으로" in prompt, report_type
+        assert "서로 다른 국면을 가리킬 때만" in prompt, report_type
+
+
+def test_prompt_requires_falsifiers_to_weaken_the_verdict():
+    """
+    23:48 리포트의 반증 조건 1번은 "VIX가 10으로 내려가고 섹터 로테이션이
+    여전히 위험선호면 위험선호 판단이 틀렸음"이었다. 그것은 반증이 아니라
+    확증이다.
+    """
+    from services.ai_service import get_report_system_prompt, get_report_types
+
+    for report_type in get_report_types():
+        prompt = get_report_system_prompt(report_type)
+        assert "반증 조건은 판단을 **약화시키는** 쪽이어야" in prompt, report_type
+        assert "반증이 아니라 확증입니다" in prompt, report_type
+
+
+def test_self_check_covers_level_to_label_direction():
+    """서술한 수준과 붙인 국면 라벨이 맞는지 스스로 대조하게 한다."""
+    from services.ai_service import get_report_system_prompt, get_report_types
+
+    for report_type in get_report_types():
+        prompt = get_report_system_prompt(report_type)
+        assert '지표를 "높다/낮다"로 서술한 문장과' in prompt, report_type
+        assert "국면 라벨" in prompt, report_type

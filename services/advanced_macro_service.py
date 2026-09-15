@@ -52,6 +52,12 @@ ADVANCED_SERIES = {
         ),
         "source": "FRED T10Y3M (일간)",
         "risk_direction": "값이 **낮을수록**(0 아래로 역전될수록) 침체 위험이 큽니다",
+        "note": (
+            "정상적인 우상향 곡선에서는 3M 기준 스프레드가 2Y 기준보다 "
+            "큽니다(3M < 2Y이므로). 따라서 10Y-3M > 10Y-2Y 자체는 "
+            "이상 신호도, 상충도 아닙니다. 두 값의 **크기 차이**가 아니라 "
+            "각각의 **방향과 부호**를 보십시오."
+        ),
     },
     "DFII10": {
         "label": "10년 실질금리 (TIPS)",
@@ -330,9 +336,15 @@ def summarize_advanced_for_ai(result: dict) -> str:
         # 방향을 뒤집습니다 — 실제로 NFCI 경보선을 현재값(-0.564)보다 낮은
         # -1.0으로 잡은 리포트가 나왔습니다(2026-09-15 23:36). 그 방향은
         # 스트레스가 아니라 완화가 심해지는 쪽입니다.
-        direction = ADVANCED_SERIES.get(sid, {}).get("risk_direction")
+        meta = ADVANCED_SERIES.get(sid, {})
+        direction = meta.get("risk_direction")
         if direction:
             text += f"\n  · 위험 방향: {direction}"
+        # 지표별 함정. 실제로 "10Y-3M이 10Y-2Y보다 크다"를 상충 신호이자
+        # 핵심 근거로 올린 리포트가 나와서 넣었습니다(2026-09-15 23:52).
+        note = meta.get("note")
+        if note:
+            text += f"\n  · 참고: {note}"
 
         lines.append(text)
 

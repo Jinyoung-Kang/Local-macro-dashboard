@@ -236,8 +236,10 @@ def _append_risk_section(lines: list[str], risk_res):
     # 아닙니다. 방향을 한 줄로 못 박습니다.
     lines.append(
         "※ 아래 다섯 지표는 모두 **값이 높을수록 위험/스트레스가 큰** "
-        "지표입니다. 낮은 값(낮은 백분위)은 위험선호·안일을 뜻하며 "
-        "위험회피 근거로 쓸 수 없습니다."
+        "지표입니다. 국면 라벨은 다음과 같이 붙습니다 — "
+        "**변동성(VIX·MOVE)이 높으면 위험회피**, 낮으면 위험선호. "
+        "**스프레드(HY OAS·IG·CP)와 금융스트레스(STLFSI4)가 낮으면 "
+        "위험선호**, 높으면 위험회피. 이 대응을 뒤집지 마십시오."
     )
     lines.append(summarize_series_for_ai(risk_res.get("VIX"), "Close", "CBOE VIX (주식 변동성)"))
     lines.append(summarize_series_for_ai(risk_res.get("MOVE"), "Close", "ICE BofA MOVE (채권 변동성)"))
