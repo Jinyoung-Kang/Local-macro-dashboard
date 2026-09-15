@@ -289,8 +289,15 @@ def _append_cot_section(lines: list[str], cot_res):
 
 
 def _append_krx_section(lines: list[str], krx_res, krx_inv_res):
-    lines.append("## 6. KRX 외국인/기관 선물 누적 수급 동향")
-    
+    # [정확성] 이 섹션은 출처가 **둘**입니다. 선물 시계열은 KRX 공식
+    # API, 투자주체별 순매수는 Daum 포털 집계입니다. 예전에는 머리글이
+    # "KRX ..."로 하나뿐이라, 모델이 Daum 수치를 두고 "KRX 공식 확정치로
+    # 신뢰도 높음"이라고 쓴 리포트가 나왔습니다(사용자 제공 리포트).
+    # 소제목마다 출처를 붙여서 섞이지 않게 합니다.
+    lines.append("## 6. 국내 KOSPI 200 선물 수급 (소제목마다 출처가 다름)")
+
+    lines.append("\n### 6-1. 선물 시계열 (출처: KRX 공식 API — 확정치)")
+
     if krx_res is not None and isinstance(krx_res, pd.DataFrame) and not krx_res.empty:
         latest_krx = krx_res.iloc[-1]
         lines.extend([
@@ -312,7 +319,18 @@ def _append_krx_section(lines: list[str], krx_res, krx_inv_res):
             krx_inv_res.get("is_placeholder", pd.Series([False])).any()
         )
 
-        lines.append("\n### 주요 투자자 20일 누적 순매수:")
+        if is_placeholder:
+            heading = (
+                "\n### 6-2. 주요 투자자 20일 누적 순매수 "
+                "(출처: **고정 예시값 — 실데이터 아님**)"
+            )
+        else:
+            heading = (
+                "\n### 6-2. 주요 투자자 20일 누적 순매수 "
+                "(출처: Daum 포털 집계 — KRX 공식 확정치 아님)"
+            )
+        lines.append(heading)
+
         if is_placeholder:
             lines.append(
                 "⚠️ 아래 수치는 **고정 예시(placeholder)** 입니다. "

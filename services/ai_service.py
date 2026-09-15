@@ -263,6 +263,8 @@ def format_ai_engine(engine_id: str) -> str:
 from services.prompts import (                                  # noqa: E402
     CONFIDENCE_LEVELS,
     DEFAULT_REPORT_TYPE,
+    JUDGEMENT_RISK_OFF,
+    JUDGEMENT_RISK_ON,
     REPORT_PROFILES,
     VERDICT_FIELDS,
     VERDICT_SECTION,
@@ -332,6 +334,49 @@ def get_report_generation_params(report_type: str) -> dict:
         "temperature": profile.get("temperature", 0.3),
         "max_tokens": profile.get("max_tokens", DEFAULT_MAX_TOKENS),
     }
+
+
+def get_report_verdict_label(report_type: str) -> str:
+    """
+    총평의 "판단" 값이 무엇을 재는 것인지 알려 주는 짧은 라벨.
+
+    파라미터:
+        report_type : REPORT_PROFILES의 키.
+
+    반환값:
+        예) "리스크 수준", "시장 국면", "수급 주도권".
+
+    주의사항:
+        - **리포트 유형마다 판단 어휘가 다릅니다.** 금리 리포트의 판단은
+          "낮음 | 보통 | 높음 | 경계"라서, 신뢰도 어휘("높음 | 보통 |
+          낮음")와 글자가 겹칩니다. 라벨 없이 그리면 화면에 "낮음"과
+          "신뢰도 낮음"이 나란히 떠서 무엇이 무엇인지 알 수 없습니다.
+        - 라벨은 배너 표시용이고, 파싱 키("판단")는 바뀌지 않습니다.
+    """
+    profile = REPORT_PROFILES.get(report_type) or REPORT_PROFILES[DEFAULT_REPORT_TYPE]
+    return profile.get("verdict_label", "판단")
+
+
+def verdict_is_directional(report_type: str) -> bool:
+    """
+    이 유형의 판단이 "방향"인지 "수준"인지 알려 줍니다.
+
+    파라미터:
+        report_type : REPORT_PROFILES의 키.
+
+    반환값:
+        방향(위험선호↔위험회피, 매수↔매도)이면 True,
+        수준(낮음→경계)이면 False.
+
+    주의사항:
+        - 화면이 ▲/▼ 화살표를 붙일지 정하는 데 씁니다. 금리 리포트의
+          판단은 리스크 **수준**이라 "▲ 낮음"이 "낮은데 오르는 중"으로
+          읽힙니다. 수준형에는 화살표를 쓰지 않습니다.
+        - 색(초록/노랑/빨강)은 두 경우 모두 그대로 씁니다. 수준형에서는
+          리스크가 낮을수록 초록이라 방향형과 색의 의미가 반대입니다.
+    """
+    profile = REPORT_PROFILES.get(report_type) or REPORT_PROFILES[DEFAULT_REPORT_TYPE]
+    return bool(profile.get("verdict_is_directional", True))
 
 
 # ==============================================================================
@@ -534,30 +579,69 @@ _CONFLICT_MARKERS = (
     "모순", "배치되", "다른 신호", "괴리",
 )
 
+# 대응 전략에서 "위험자산"으로 볼 줄을 고르는 단어들. 판단이 위험선호인지
+# 위험회피인지는 결국 **주식 비중을 어느 쪽으로 트는가**로 드러납니다.
+_RISK_ASSET_WORDS = (
+    "주식", "증시", "코스피", "KOSPI", "S&P", "나스닥", "NASDAQ",
+)
 
-def detect_verdict_conflict(verdict: dict, sections: list) -> str | None:
+# 자산 비중 방향 어휘. 한 줄에 둘 다 있으면 방향을 알 수 없으므로 셈에서
+# 뺍니다("확대에서 축소로 전환" 같은 문장 때문입니다).
+_WEIGHT_UP = "확대"
+_WEIGHT_DOWN = "축소"
+
+# 이 검사를 적용할 섹션 제목. 다른 섹션(핵심 리스크 등)에는 "주식 축소"가
+# 가정법으로 등장할 수 있어서, 결론 섹션만 봅니다.
+_STRATEGY_SECTION_TITLE = "대응 전략"
+
+
+def _risk_asset_directions(sections: list) -> list:
     """
-    총평의 신뢰도가 본문의 서술과 모순되는지 검사합니다.
+    대응 전략 섹션에서 위험자산 줄의 비중 방향만 뽑습니다.
+
+    파라미터:
+        sections : parse_report_sections()가 돌려준 sections 리스트.
+
+    반환값:
+        ["축소", "확대", ...] 형태의 리스트. 판단할 줄이 없으면 빈 리스트.
+
+    주의사항:
+        - **결론 섹션("대응 전략")만 봅니다.** 다른 섹션에는 "주식이
+          축소되면" 같은 가정문이 나와서 오탐이 됩니다.
+        - 한 줄에 확대·축소가 같이 있으면 방향을 정할 수 없으므로 세지
+          않습니다. 억지로 한쪽으로 세면 없는 모순을 만들어 냅니다.
+    """
+    found = []
+    for section in sections or []:
+        if _STRATEGY_SECTION_TITLE not in (section.get("title") or ""):
+            continue
+        for line in (section.get("body") or "").splitlines():
+            if not any(word in line for word in _RISK_ASSET_WORDS):
+                continue
+            up = _WEIGHT_UP in line
+            down = _WEIGHT_DOWN in line
+            if up != down:
+                found.append(_WEIGHT_UP if up else _WEIGHT_DOWN)
+    return found
+
+
+def _confidence_conflict(verdict: dict, sections: list) -> str | None:
+    """
+    "신뢰도 높음"인데 본문·총평이 상충을 말하는 경우를 잡습니다.
 
     파라미터:
         verdict  : parse_report_sections()가 돌려준 verdict dict.
         sections : 같은 결과의 sections 리스트.
 
     반환값:
-        모순이 있으면 사람이 읽을 설명 문자열, 없으면 None.
+        모순이면 설명 문자열, 아니면 None.
 
     주의사항:
-        - 잡는 것은 **한 방향뿐입니다** — "본문은 상충을 말하는데
-          신뢰도가 높음"인 경우. 반대(본문은 일치하는데 신뢰도가 낮음)는
-          모델이 보수적으로 군 것이라 문제가 아닙니다.
-        - 어휘 매칭이라 완벽하지 않습니다. 모델이 "A는 X, B는 Y"처럼
-          접속사 없이 나열하면 놓칩니다. 이 검사는 **보조 장치**이고,
-          1차 방어선은 프롬프트의 신뢰도 판정 절차입니다.
-        - 오탐을 줄이려고 마커를 좁게 잡았습니다. 경고가 늘 떠 있으면
-          아무도 읽지 않게 되기 때문입니다.
+        - 잡는 것은 **한 방향뿐입니다.** 반대(본문은 일치하는데 신뢰도가
+          낮음)는 모델이 보수적으로 군 것이라 문제가 아닙니다.
+        - 어휘 매칭이라 완벽하지 않습니다. 1차 방어선은 프롬프트입니다.
     """
-    confidence = (verdict.get("신뢰도") or "").strip()
-    if confidence != "높음":
+    if (verdict.get("신뢰도") or "").strip() != "높음":
         return None
 
     body = "\n".join(s.get("body", "") for s in (sections or []))
@@ -581,6 +665,76 @@ def detect_verdict_conflict(verdict: dict, sections: list) -> str | None:
         "합니다. 결론을 그대로 받아들이기 전에 본문의 상충 부분을 직접 "
         "확인하세요."
     )
+
+
+def _strategy_conflict(verdict: dict, sections: list) -> str | None:
+    """
+    판단(위험선호/위험회피)과 대응 전략의 주식 비중 방향이 반대인지 봅니다.
+
+    파라미터:
+        verdict  : parse_report_sections()가 돌려준 verdict dict.
+        sections : 같은 결과의 sections 리스트.
+
+    반환값:
+        모순이면 설명 문자열, 아니면 None.
+
+    주의사항:
+        - **위험선호/위험회피 어휘를 쓰는 종합 리포트에만 걸립니다.**
+          다른 유형은 판단 어휘가 달라서(예: "낮음|보통|높음|경계")
+          비중 방향과 짝지을 수 없습니다.
+        - 대응 전략의 위험자산 줄이 **하나도 빠짐없이** 판단과 반대일
+          때만 경고합니다. 일부만 반대인 것은 전술적 조정일 수 있어
+          모순이라고 단정할 수 없습니다.
+        - 실제로 "판단: 위험선호"인데 "미국 주식 축소 / 글로벌 주식 축소"
+          로 끝난 리포트가 나와서 넣은 검사입니다(2026-09-15 사용자 제보).
+    """
+    judgement = (verdict.get("판단") or "").strip()
+    if judgement not in (JUDGEMENT_RISK_ON, JUDGEMENT_RISK_OFF):
+        return None
+
+    directions = _risk_asset_directions(sections)
+    if not directions:
+        return None
+
+    opposite = _WEIGHT_DOWN if judgement == JUDGEMENT_RISK_ON else _WEIGHT_UP
+    if not all(d == opposite for d in directions):
+        return None
+
+    return (
+        f"총평은 **{judgement}**인데, 대응 전략의 주식 관련 항목이 "
+        f"{len(directions)}개 모두 '{opposite}'입니다. 둘 중 하나가 "
+        "틀렸습니다. 포지션을 옮기기 전에 어느 쪽이 실제 결론인지 "
+        "본문에서 직접 확인하세요."
+    )
+
+
+def detect_verdict_conflict(verdict: dict, sections: list) -> str | None:
+    """
+    총평이 본문과 모순되는지 검사합니다.
+
+    파라미터:
+        verdict  : parse_report_sections()가 돌려준 verdict dict.
+        sections : 같은 결과의 sections 리스트.
+
+    반환값:
+        모순이 있으면 사람이 읽을 설명 문자열, 없으면 None.
+        둘 다 걸리면 빈 줄로 이어 붙여 함께 돌려줍니다.
+
+    주의사항:
+        - 검사는 둘입니다 — 신뢰도-상충 모순(_confidence_conflict)과
+          판단-전략 방향 모순(_strategy_conflict).
+        - 이 검사들은 **보조 장치**입니다. 1차 방어선은 프롬프트이고,
+          여기서 잡히는 것은 프롬프트가 무시당한 경우뿐입니다.
+        - 오탐을 줄이려고 조건을 좁게 잡았습니다. 경고가 늘 떠 있으면
+          아무도 읽지 않게 되기 때문입니다.
+    """
+    notes = [
+        note for note in (
+            _confidence_conflict(verdict, sections),
+            _strategy_conflict(verdict, sections),
+        ) if note
+    ]
+    return "\n\n".join(notes) if notes else None
 
 
 def get_confidence_levels() -> tuple:

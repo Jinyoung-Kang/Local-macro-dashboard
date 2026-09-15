@@ -37,6 +37,8 @@ from services.ai_service import (
     get_report_generation_params,
     get_report_system_prompt,
     get_report_types,
+    get_report_verdict_label,
+    verdict_is_directional,
     get_unavailable_engines,
     parse_report_sections,
 )
@@ -245,6 +247,10 @@ _TONE_STYLE = {
     _TONE_NEGATIVE: {"bg": "#2A1215", "border": "#DA3633", "fg": "#F85149", "icon": "▼"},
 }
 
+# 판단이 "방향"이 아니라 "수준"인 리포트(금리 리스크 점검)에서 쓰는 기호.
+# 화살표를 그대로 쓰면 "▲ 낮음"이 "낮은데 오르는 중"으로 읽힙니다.
+_LEVEL_ICON = "●"
+
 # 신뢰도 → 표시. 낮은 신뢰도를 눈에 띄게 해서 과신을 막습니다.
 _CONFIDENCE_ICON = {"높음": "●●●", "보통": "●●○", "낮음": "●○○"}
 
@@ -288,6 +294,28 @@ def _judgement_tone(judgement: str | None) -> str:
     return _JUDGEMENT_TONE.get(judgement.strip(), _TONE_NEUTRAL)
 
 
+def _report_title(report_type: str) -> str:
+    """
+    리포트 유형 이름을 화면/파일 제목으로 바꿉니다.
+
+    파라미터:
+        report_type : REPORT_PROFILES의 키. 예) "금리 및 유동성 리스크 점검".
+
+    반환값:
+        제목 문자열. 예) "금리 및 유동성 리스크 점검 분석 리포트".
+
+    주의사항:
+        - **유형 이름이 이미 "분석"으로 끝나면 "분석"을 덧붙이지 않습니다.**
+          예전에는 무조건 " 분석 리포트"를 붙여서 "외국인/기관 수급 집중
+          분석 분석 리포트"가 나왔습니다(사용자 리포트 파일에서 확인).
+        - 화면 제목과 내려받는 .md의 제목이 같아야 하므로, 두 곳 모두
+          이 함수를 거칩니다.
+    """
+    name = (report_type or "").strip()
+    suffix = "리포트" if name.endswith("분석") else "분석 리포트"
+    return f"{name} {suffix}" if name else "분석 리포트"
+
+
 def _render_verdict_banner(
     verdict: dict,
     report_type: str,
@@ -310,6 +338,10 @@ def _render_verdict_banner(
           이라는 잘못된 인상을 줍니다.
         - 신뢰도가 "낮음"이면 경고 문구를 함께 띄웁니다. 낮은 신뢰도
           리포트를 확신처럼 읽는 것이 이 화면의 가장 큰 위험입니다.
+        - 판단 값 앞에 **무엇을 재는 판단인지** 라벨을 붙입니다. 금리
+          리포트는 판단 어휘가 "낮음|보통|높음|경계"라 신뢰도와 글자가
+          겹치고, 라벨이 없으면 "낮음 / 신뢰도 낮음"이 나란히 떠서
+          구분되지 않습니다.
         - 신뢰도가 "높음"인데 본문이 상충을 말하면 **모순 경고**를
           띄웁니다. 모델이 신뢰도 기준을 지키지 않는 일이 실제로 있어서,
           프롬프트만으로는 부족합니다.
@@ -321,6 +353,8 @@ def _render_verdict_banner(
     confidence = verdict.get("신뢰도") or "—"
     rationale = verdict.get("핵심 근거") or ""
     style = _TONE_STYLE[_judgement_tone(judgement)]
+    verdict_label = get_report_verdict_label(report_type)
+    icon = style["icon"] if verdict_is_directional(report_type) else _LEVEL_ICON
 
     # [보안] 아래 세 값은 **모델이 생성한 문자열**이고, 모델의 입력에는
     # Naver·Daum·TradingView에서 스크래핑한 내용이 들어갑니다. 즉 외부에서
@@ -334,6 +368,7 @@ def _render_verdict_banner(
     safe_judgement = html.escape(judgement)
     safe_confidence = html.escape(confidence)
     safe_rationale = html.escape(rationale)
+    safe_label = html.escape(verdict_label)
 
     st.markdown(
         f"""
@@ -349,8 +384,9 @@ def _render_verdict_banner(
             {html.escape(report_type)}
           </div>
           <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;">
+            <span style="color:#8B949E;font-size:0.85rem;">{safe_label}</span>
             <span style="color:{style['fg']};font-size:1.6rem;font-weight:700;">
-              {style['icon']} {safe_judgement}
+              {icon} {safe_judgement}
             </span>
             <span style="color:#8B949E;font-size:0.9rem;">
               신뢰도 <b style="color:#C9D1D9;">{safe_confidence}</b>
@@ -560,7 +596,7 @@ def _render_report(result: dict) -> None:
         with st.expander("🔍 번역 전 AI 원문 확인", expanded=False):
             st.markdown(result["original_response"])
 
-    st.markdown(f"### 📋 {result['report_type']} 분석 리포트")
+    st.markdown(f"### 📋 {_report_title(result['report_type'])}")
 
     meta = (
         f"분석 엔진: `{format_ai_engine(result['engine'])}` | "
@@ -641,7 +677,7 @@ def _report_as_markdown(result: dict) -> str:
           투자 판단의 근거처럼 보이는 것을 막습니다.
     """
     return (
-        f"# {result['report_type']} 분석 리포트\n\n"
+        f"# {_report_title(result['report_type'])}\n\n"
         f"- 생성 시각: {result['created_at']}\n"
         f"- 분석 엔진: {format_ai_engine(result['engine'])}\n"
         f"- 실행 경로: {result['pipeline_step']}\n\n"

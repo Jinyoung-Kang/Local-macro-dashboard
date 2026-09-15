@@ -1582,3 +1582,230 @@ def test_kis_diagnostic_mentions_session_time_for_empty_data(monkeypatch):
     assert "인증" in message and "성공" in message, (
         "인증은 통과했다는 사실을 알려야 원인을 좁힐 수 있습니다"
     )
+
+
+# ==============================================================================
+# 18. 2026-09-15 실제 리포트 3종에서 나온 결함
+# ==============================================================================
+def _load_view_function(name: str):
+    """
+    views/ai_report_view.py의 함수 하나만 떼어 실행 가능한 형태로 돌려줍니다.
+
+    파라미터:
+        name : 가져올 함수 이름.
+
+    반환값:
+        호출 가능한 함수 객체.
+
+    주의사항:
+        모듈을 통째로 import하면 streamlit 런타임이 필요해집니다. 이 파일의
+        다른 화면 테스트와 같은 이유로 AST에서 함수만 떼어 씁니다.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+    node = next(
+        n for n in ast.parse(source).body
+        if isinstance(n, ast.FunctionDef) and n.name == name
+    )
+    namespace = {}
+    exec(compile(ast.Module([node], []), "<view>", "exec"), namespace)
+    return namespace[name]
+
+
+def test_report_title_does_not_duplicate_the_word_analysis():
+    """
+    2026-09-15 리포트 파일의 첫 줄이 "# 외국인/기관 수급 집중 분석 분석
+    리포트"였다. 제목을 f"{유형} 분석 리포트"로 만들었는데, 그 유형 이름이
+    이미 "분석"으로 끝나기 때문이다. 화면 제목과 내려받는 .md 양쪽에서
+    같은 글자가 두 번 나왔다.
+    """
+    from services.ai_service import get_report_types
+
+    title = _load_view_function("_report_title")
+
+    assert title("외국인/기관 수급 집중 분석") == "외국인/기관 수급 집중 분석 리포트"
+    assert title("종합 거시경제 & 수급 전략") == "종합 거시경제 & 수급 전략 분석 리포트"
+
+    for report_type in get_report_types():
+        assert "분석 분석" not in title(report_type)
+
+
+def test_both_title_sites_go_through_the_helper():
+    """
+    제목을 만드는 곳은 화면과 .md 두 군데다. 한 곳만 고치면 파일 제목에만
+    "분석 분석"이 남는다. 둘 다 헬퍼를 거치는지 소스에서 확인한다.
+    """
+    import pathlib
+
+    source = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+
+    assert source.count("_report_title(result['report_type'])") == 2
+    assert "report_type']} 분석 리포트" not in source, (
+        "제목을 직접 이어 붙이는 자리가 남아 있습니다"
+    )
+
+
+def test_verdict_banner_labels_what_the_judgement_measures():
+    """
+    금리 리포트의 판단 어휘는 "낮음|보통|높음|경계"라서 신뢰도 어휘와
+    글자가 겹친다. 2026-09-15 리포트는 배너에 "낮음"과 "신뢰도 낮음"이
+    나란히 떠서 무엇이 무엇인지 알 수 없었다. 판단 앞에 라벨이 필요하다.
+    """
+    from services.ai_service import get_report_verdict_label, get_report_types
+    from services.prompts import CONFIDENCE_LEVELS
+
+    labels = {t: get_report_verdict_label(t) for t in get_report_types()}
+
+    assert len(set(labels.values())) == len(labels), f"라벨이 겹칩니다: {labels}"
+    for report_type, label in labels.items():
+        assert label and label not in CONFIDENCE_LEVELS
+
+    assert get_report_verdict_label("금리 및 유동성 리스크 점검") == "리스크 수준"
+
+    # 알 수 없는 유형이 와도 터지지 않고 기본 프로파일의 라벨을 준다.
+    assert get_report_verdict_label("없는 유형") == labels[
+        __import__("services.ai_service", fromlist=["x"]).DEFAULT_REPORT_TYPE
+    ]
+
+
+def test_strategy_direction_conflict_fires_on_the_real_report():
+    """
+    2026-09-15 19:10 리포트는 판단을 '위험선호'로 쓰고 대응 전략에서
+    "미국 주식: 축소", "글로벌 주식: 축소"로 끝냈다. 신뢰도가 '보통'이라
+    기존 검사(신뢰도 높음일 때만 동작)에는 걸리지 않았다.
+    """
+    from services.ai_service import detect_verdict_conflict, parse_report_sections
+
+    real = (
+        "### 총평\n"
+        "- **판단**: 위험선호\n"
+        "- **신뢰도**: 보통\n"
+        "- **핵심 근거**: 섹터 로테이션에서 에너지·헬스케어가 상위\n\n"
+        "### 대응 전략\n"
+        "- **미국 주식**: 축소 (스마트머니 순 포지션 ≤ -70k 시점에 청산)\n"
+        "- **글로벌 주식**: 축소 (스마트머니 순 포지션 ≤ -70k 시점에 청산)\n"
+        "- **금**: 확대 (GLD 3개월 상승 ≥ 1% 시점에 진입)\n"
+    )
+    parsed = parse_report_sections(real)
+    note = detect_verdict_conflict(parsed["verdict"], parsed["sections"])
+
+    assert note is not None, "판단과 전략이 반대인데 경고가 없습니다"
+    assert "위험선호" in note and "축소" in note
+
+
+def test_strategy_direction_conflict_stays_quiet_when_it_should():
+    """
+    이 검사는 오탐이 나면 못 쓴다. 조용해야 하는 경우들을 못 박아 둔다.
+    """
+    from services.ai_service import detect_verdict_conflict
+
+    def check(verdict, body):
+        return detect_verdict_conflict(verdict, [{"title": "대응 전략", "body": body}])
+
+    # 방향이 판단과 맞으면 조용하다.
+    assert check({"판단": "위험선호", "신뢰도": "보통"}, "- 주식: 확대") is None
+
+    # 일부만 반대면 전술적 조정일 수 있으므로 단정하지 않는다.
+    assert check(
+        {"판단": "위험선호", "신뢰도": "보통"},
+        "- 미국 주식: 확대\n- 중국 주식: 축소",
+    ) is None
+
+    # 판단 어휘가 다른 리포트 유형에는 걸지 않는다.
+    assert check({"판단": "낮음", "신뢰도": "낮음"}, "- 주식: 축소") is None
+
+    # 결론 섹션이 아닌 곳의 가정문은 세지 않는다.
+    assert detect_verdict_conflict(
+        {"판단": "위험선호", "신뢰도": "보통"},
+        [{"title": "핵심 리스크", "body": "- 주식 비중을 축소해야 할 상황이 온다면"}],
+    ) is None
+
+    # 한 줄에 확대·축소가 같이 있으면 방향을 정할 수 없다.
+    assert check(
+        {"판단": "위험선호", "신뢰도": "보통"}, "- 주식: 확대에서 축소로 전환",
+    ) is None
+
+
+def test_snapshot_heading_does_not_let_daum_data_pass_as_official():
+    """
+    Context의 6번 섹션 머리글이 "KRX 외국인/기관 ..." 하나뿐이라, 그 아래
+    Daum 포털 집계 수치까지 KRX 것으로 읽혔다. 2026-09-15 수급 리포트는
+    "데이터 품질은 KRX 공식 확정치로 신뢰도 높음"이라고 썼다 — 문맥에 적힌
+    단서와 정반대다. 소제목마다 출처를 붙여 섞이지 않게 한다.
+    """
+    import pandas as pd
+
+    from services.dashboard_snapshot_service import _append_krx_section
+
+    investors = pd.DataFrame(
+        [{"투자 주체": "외국인", "20일 누적": 4658.0, "is_placeholder": False}]
+    )
+    lines = []
+    _append_krx_section(lines, None, investors)
+    text = "\n".join(lines)
+
+    heading = next(ln for ln in lines if "20일 누적 순매수" in ln)
+    assert "Daum" in heading and "KRX 공식 확정치 아님" in heading, (
+        f"소제목이 출처를 밝히지 않습니다: {heading!r}"
+    )
+
+    futures_heading = next(ln for ln in lines if "선물 시계열" in ln)
+    assert "KRX 공식" in futures_heading
+
+    # 실데이터가 아닐 때는 소제목에서부터 경고해야 한다.
+    placeholder = investors.assign(is_placeholder=True)
+    lines2 = []
+    _append_krx_section(lines2, None, placeholder)
+    ph_heading = next(ln for ln in lines2 if "20일 누적 순매수" in ln)
+    assert "실데이터 아님" in ph_heading
+
+
+def test_prompts_carry_the_rules_the_real_reports_broke():
+    """
+    2026-09-15 리포트 3종이 각각 깨뜨린 규칙을 프롬프트에 명시했는지
+    확인한다. 규칙이 사라지면 같은 결함이 조용히 돌아온다.
+    """
+    from services.ai_service import get_report_system_prompt, get_report_types
+
+    for report_type in get_report_types():
+        prompt = get_report_system_prompt(report_type)
+        # 출처 품질을 격상시키지 말 것 (수급 리포트가 깨뜨린 규칙)
+        assert "출처의 품질을 올려 부르지" in prompt, report_type
+        # 있는 데이터를 '데이터 없음'으로 적지 말 것
+        assert '"데이터 없음"으로 적기' in prompt, report_type
+        # 상충으로 적은 것을 본문에서 일치라고 쓰지 말 것
+        assert "'상충 신호'에 적은 항목을 본문에서" in prompt, report_type
+        # 판단과 결론 방향이 같아야 할 것 (종합 리포트가 깨뜨린 규칙)
+        assert "판단**과 결론 섹션의 **방향**이 같은지" in prompt, report_type
+
+    alerts = get_report_system_prompt("금리 및 유동성 리스크 점검")
+    assert "아직 닿지 않은 선" in alerts, (
+        "이미 충족된 값을 경보로 쓰는 것을 막아야 합니다 (NFCI < -0.5 사례)"
+    )
+    assert "스트레스가 커지는 방향" in alerts
+
+    strategy = get_report_system_prompt("종합 거시경제 & 수급 전략")
+    assert "총평의 판단과 같은 방향이어야 합니다" in strategy
+
+
+def test_level_verdicts_do_not_get_a_direction_arrow():
+    """
+    금리 리포트의 판단은 방향이 아니라 리스크 **수준**이다. 배너가
+    "▲ 낮음"을 그리면 "낮은데 오르는 중"으로 읽힌다. 수준형에는 화살표를
+    쓰지 않는다. 색은 그대로 둔다 — 초록/빨강은 여전히 좋음/나쁨이다.
+    """
+    from services.ai_service import verdict_is_directional
+
+    assert verdict_is_directional("종합 거시경제 & 수급 전략") is True
+    assert verdict_is_directional("외국인/기관 수급 집중 분석") is True
+    assert verdict_is_directional("금리 및 유동성 리스크 점검") is False
+    assert verdict_is_directional("없는 유형") is True  # 기본 프로파일
+
+    import pathlib
+
+    source = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+    assert "verdict_is_directional(report_type)" in source, (
+        "배너가 유형별 기호를 고르지 않고 있습니다"
+    )
