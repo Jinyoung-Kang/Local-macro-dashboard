@@ -30,6 +30,7 @@ from services.ai_service import (
     detect_foreign_script,
     detect_invented_weights,
     detect_prompt_leak,
+    detect_valueless_conditions,
     detect_verdict_conflict,
     detect_verdict_language_issue,
     extract_report_text,
@@ -441,6 +442,12 @@ def _render_verdict_banner(
         if note:
             st.caption(f"📝 {note}")
 
+    # 조건 칸에 현재값만 적힌 경우. 경보로 쓸 수 없는 행이라 눈에 띄게
+    # 경고합니다.
+    valueless = detect_valueless_conditions(sections or [])
+    if valueless:
+        st.warning(valueless, icon="📏")
+
     if (verdict.get("신뢰도") or "").strip() == "낮음":
         st.warning(
             "신뢰도가 **낮음**입니다. 지표가 서로 상충하거나 핵심 데이터가 "
@@ -705,13 +712,20 @@ def _report_as_markdown(result: dict) -> str:
         - 문서 끝에 면책 문구를 답니다. AI 생성물이 그대로 돌아다니다
           투자 판단의 근거처럼 보이는 것을 막습니다.
     """
+    # 모델이 본문 끝에 구분선을 붙이는 일이 있습니다. 아래에서 다시
+    # 붙이므로 그대로 두면 "---"가 두 줄 연달아 나옵니다
+    # (2026-09-16 00:08 리포트에서 확인).
+    body = (result.get("body") or "").strip()
+    while body.endswith("---"):
+        body = body[: -len("---")].rstrip()
+
     return (
         f"# {_report_title(result['report_type'])}\n\n"
         f"- 생성 시각: {result['created_at']}\n"
         f"- 분석 엔진: {format_ai_engine(result['engine'])}\n"
         f"- 실행 경로: {result['pipeline_step']}\n\n"
         "---\n\n"
-        f"{result['body']}\n\n"
+        f"{body}\n\n"
         "---\n\n"
         "> 이 문서는 대시보드가 수집한 데이터를 바탕으로 AI가 생성한 "
         "분석입니다. 투자 판단의 최종 책임은 이용자에게 있습니다.\n"

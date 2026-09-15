@@ -1587,30 +1587,37 @@ def test_kis_diagnostic_mentions_session_time_for_empty_data(monkeypatch):
 # ==============================================================================
 # 18. 2026-09-15 실제 리포트 3종에서 나온 결함
 # ==============================================================================
-def _load_view_function(name: str):
+def _load_view_function(name: str, *also: str):
     """
-    views/ai_report_view.py의 함수 하나만 떼어 실행 가능한 형태로 돌려줍니다.
+    views/ai_report_view.py의 함수를 떼어 실행 가능한 형태로 돌려줍니다.
 
     파라미터:
-        name : 가져올 함수 이름.
+        name : 돌려받을 함수 이름.
+        also : 그 함수가 부르는 다른 함수 이름들(같은 파일 안에 있는 것).
 
     반환값:
-        호출 가능한 함수 객체.
+        호출 가능한 name 함수 객체.
 
     주의사항:
-        모듈을 통째로 import하면 streamlit 런타임이 필요해집니다. 이 파일의
-        다른 화면 테스트와 같은 이유로 AST에서 함수만 떼어 씁니다.
+        - 모듈을 통째로 import하면 streamlit 런타임이 필요해집니다. 이
+          파일의 다른 화면 테스트와 같은 이유로 AST에서 함수만 떼어 씁니다.
+        - 화면 함수가 서비스 계층을 부르면 also로는 해결되지 않으므로,
+          여기서 최소한의 대역만 심어 줍니다.
     """
     import ast
     import pathlib
 
     source = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
-    node = next(
-        n for n in ast.parse(source).body
-        if isinstance(n, ast.FunctionDef) and n.name == name
-    )
-    namespace = {}
-    exec(compile(ast.Module([node], []), "<view>", "exec"), namespace)
+    tree = ast.parse(source)
+    wanted = (name,) + also
+    nodes = [
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name in wanted
+    ]
+    assert len(nodes) == len(wanted), f"찾지 못한 함수가 있습니다: {wanted}"
+
+    namespace = {"format_ai_engine": lambda engine: str(engine)}
+    exec(compile(ast.Module(nodes, []), "<view>", "exec"), namespace)
     return namespace[name]
 
 
@@ -2253,3 +2260,122 @@ def test_self_check_covers_level_to_label_direction():
         prompt = get_report_system_prompt(report_type)
         assert '지표를 "높다/낮다"로 서술한 문장과' in prompt, report_type
         assert "국면 라벨" in prompt, report_type
+
+
+# ==============================================================================
+# 23. 2026-09-16 00:06 / 00:08 리포트에서 나온 결함
+# ==============================================================================
+def test_conditions_without_a_comparison_are_flagged():
+    """
+    00:06 종합 리포트의 핵심 리스크 표는 발생 조건에 **현재값**을 그대로
+    적었다: "VIX 17.47", "3M CP spread -0.25", "10Y-3M spread 0.860".
+    부등호가 없으면 언제 발생하는지 알 수 없어 조건이 아니다.
+
+    직전 라운드에 "조건은 아직 충족되지 않은 값"이라는 규칙을 넣었더니,
+    모델이 부등호를 아예 빼는 쪽으로 빠져나갔다.
+    """
+    from services.ai_service import detect_valueless_conditions, parse_report_sections
+
+    real = (
+        "### 핵심 리스크\n"
+        "| 리스크 | 발생 조건(구체적 수치) | 파급 경로 | 확인 지표 |\n"
+        "| :--- | :--- | :--- | :--- |\n"
+        "| 변동성 급등 | VIX 17.47 | 주식 급락 | VIX |\n"
+        "| 신용 스트레스 | 3M CP spread -0.25 | 자금비용 상승 | 3M CP spread |\n"
+    )
+    parsed = parse_report_sections(real)
+    note = detect_valueless_conditions(parsed["sections"])
+
+    assert note is not None, "조건 없는 '발생 조건'을 잡지 못했습니다"
+    assert "VIX 17.47" in note
+
+
+def test_proper_conditions_are_not_flagged():
+    """
+    오탐이 나면 이 검사는 못 쓴다. 부등호가 있는 정상 조건은 조용해야 한다.
+    """
+    from services.ai_service import detect_valueless_conditions, parse_report_sections
+
+    for condition in (
+        "VIX > 20",
+        "HY OAS > 3.50% (현재 2.65)",
+        "스마트머니 순 포지션 ≤ -70,000 계약",
+        "10Y-3M < 0",
+        "10년물 수익률 5.0% 이상",
+        "MOVE 120 초과",
+    ):
+        parsed = parse_report_sections(
+            "### 핵심 리스크\n"
+            "| 리스크 | 발생 조건(구체적 수치) | 파급 경로 |\n"
+            "| :--- | :--- | :--- |\n"
+            f"| 리스크 | {condition} | 경로 |\n"
+        )
+        assert detect_valueless_conditions(parsed["sections"]) is None, condition
+
+    # 표가 없거나 숫자가 없는 칸은 이 검사의 대상이 아니다.
+    assert detect_valueless_conditions([]) is None
+    assert detect_valueless_conditions([
+        {"title": "핵심 리스크",
+         "body": "| 리스크 | 발생 조건 |\n| :--- | :--- |\n| 리스크 | 데이터 없음 |"},
+    ]) is None
+
+
+def test_condition_column_is_found_by_name_not_position():
+    """열 순서를 프롬프트가 바꿔도 검사가 따라와야 한다."""
+    from services.ai_service import detect_valueless_conditions
+
+    note = detect_valueless_conditions([
+        {"title": "핵심 리스크",
+         "body": "| 파급 경로 | 확인 지표 | 발생 조건 |\n"
+                 "| :--- | :--- | :--- |\n"
+                 "| 주식 급락 | VIX | VIX 17.47 |"},
+    ])
+    assert note is not None and "VIX 17.47" in note
+
+
+def test_two_year_spread_carries_a_risk_direction():
+    """
+    §10의 심화 지표에는 위험 방향이 있는데 §1의 10Y-2Y에는 없었다.
+    그래서 00:08 리포트가 경보선을 "10Y-2Y > 0.50%"(현재 0.349%)로 잡았다.
+    그 방향은 곡선이 더 가팔라지는 쪽이라 침체 위험이 줄어드는 쪽이다.
+    """
+    from services.dashboard_snapshot_service import _append_macro_section
+
+    lines = []
+    _append_macro_section(lines, ({}, 5.008, None, 4.659, None))
+    text = "\n".join(lines).replace("**", "")
+
+    assert "10Y-2Y 스프레드: +0.349%p" in text
+    direction = next(ln for ln in lines if "위험 방향" in ln)
+    assert "낮을수록" in direction.replace("**", "")
+    assert "경보선은 현재값보다" in direction
+
+
+def test_prompt_requires_an_operator_in_every_condition():
+    """규칙이 사라지면 부등호 없는 조건이 조용히 돌아온다."""
+    from services.ai_service import get_report_system_prompt, get_report_types
+
+    for report_type in get_report_types():
+        prompt = get_report_system_prompt(report_type)
+        assert "`지표 부등호 임계값` 꼴로" in prompt, report_type
+        assert "VIX > 20 (현재 17.47)" in prompt, report_type
+
+
+def test_markdown_export_does_not_double_the_closing_rule():
+    """
+    모델이 본문 끝에 구분선을 붙이면 내려받는 .md에 '---'가 두 줄 연달아
+    나온다(00:08 리포트). 본문 끝의 구분선을 떼고 하나만 붙인다.
+    """
+    export = _load_view_function("_report_as_markdown", "_report_title")
+
+    out = export({
+        "report_type": "금리 및 유동성 리스크 점검",
+        "created_at": "2026-09-16 00:08:13 KST",
+        "engine": "nvidia_gpt_oss_20b",
+        "pipeline_step": "성공",
+        "body": "### 총평\n- 판단: 낮음\n\n---\n\n---",
+    })
+
+    assert "---\n\n---" not in out, out[-200:]
+    assert out.count("\n---\n") == 2, "머리말 구분선과 꼬리말 구분선만 남아야 합니다"
+    assert "- 판단: 낮음" in out

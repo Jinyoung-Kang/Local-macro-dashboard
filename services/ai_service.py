@@ -795,6 +795,96 @@ def _instruction_lines(system_prompt: str) -> list:
     return pieces
 
 
+# "발생 조건" 칸이 조건인지 현재값인지 가르는 기호들. 하나라도 있으면
+# 조건으로 봅니다.
+_COMPARISON_MARKERS = (
+    ">", "<", "≥", "≤", "＞", "＜", "이상", "이하", "초과", "미만",
+    "넘으면", "넘어서면", "밑돌면", "하회", "상회", "돌파", "~",
+)
+
+# 조건이 들어가야 하는 표의 열 이름.
+_CONDITION_COLUMN = "발생 조건"
+
+# 숫자가 들어 있는지 보는 패턴. 숫자도 없는 칸("데이터 없음")은 다른
+# 문제이므로 여기서 세지 않습니다.
+_HAS_NUMBER = re.compile(r"\d")
+
+
+def _condition_cells(sections: list) -> list:
+    """
+    핵심 리스크 표의 '발생 조건' 칸만 뽑아냅니다.
+
+    파라미터:
+        sections : parse_report_sections()가 돌려준 sections 리스트.
+
+    반환값:
+        각 행의 발생 조건 칸 문자열 리스트. 표가 없으면 빈 리스트.
+
+    주의사항:
+        - 머리글 줄에서 '발생 조건' 열의 위치를 찾아 그 열만 봅니다.
+          열 순서를 프롬프트가 바꿔도 따라갑니다.
+        - 구분선(| :--- |)은 건너뜁니다.
+    """
+    cells = []
+    for section in sections or []:
+        rows = [
+            [c.strip() for c in line.strip().strip("|").split("|")]
+            for line in (section.get("body") or "").splitlines()
+            if line.strip().startswith("|")
+        ]
+        if len(rows) < 2:
+            continue
+
+        header = rows[0]
+        index = next(
+            (i for i, name in enumerate(header) if _CONDITION_COLUMN in name),
+            None,
+        )
+        if index is None:
+            continue
+
+        for row in rows[1:]:
+            if len(row) <= index or set(row[index]) <= set(": -"):
+                continue
+            cells.append(row[index])
+    return cells
+
+
+def detect_valueless_conditions(sections: list) -> str | None:
+    """
+    '발생 조건' 칸에 현재값만 적고 부등호를 빼먹었는지 검사합니다.
+
+    파라미터:
+        sections : parse_report_sections()가 돌려준 sections 리스트.
+
+    반환값:
+        조건 구실을 못 하는 칸이 있으면 설명 문자열, 없으면 None.
+
+    주의사항:
+        - 2026-09-16 00:06 리포트는 발생 조건에 "VIX 17.47",
+          "3M CP spread -0.25"처럼 **지금 값**을 그대로 적었습니다.
+          부등호가 없으면 언제 발생하는지 알 수 없어 조건이 아닙니다.
+        - "조건은 아직 충족되지 않은 값이어야 한다"는 규칙을 넣었더니
+          모델이 부등호를 아예 빼는 쪽으로 빠져나갔습니다. 규칙만으로는
+          부족해서 화면에서도 봅니다.
+        - 숫자가 없는 칸은 세지 않습니다. 그것은 다른 문제입니다.
+    """
+    bad = [
+        cell for cell in _condition_cells(sections)
+        if _HAS_NUMBER.search(cell)
+        and not any(marker in cell for marker in _COMPARISON_MARKERS)
+    ]
+    if not bad:
+        return None
+
+    return (
+        f"핵심 리스크의 '발생 조건'에 부등호 없이 현재값만 적힌 칸이 "
+        f"{len(bad)}개 있습니다(예: \"{bad[0]}\"). 언제 발생하는지 알 수 "
+        "없으므로 조건 구실을 하지 못합니다. 그 행은 리스크 경보로 쓰지 "
+        "마세요."
+    )
+
+
 def detect_prompt_leak(sections: list, report_type: str) -> str | None:
     """
     시스템 프롬프트의 지시문이 리포트 본문에 그대로 나왔는지 검사합니다.
