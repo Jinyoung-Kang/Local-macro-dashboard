@@ -194,12 +194,17 @@ def _append_macro_section(lines: list[str], macro_res):
                 clean_name = clean_ui_tag(item.get("name", ""))
 
                 if status in ["ok", "single"]:
-                    lines.append(
+                    text = (
                         f"- {clean_name}: "
                         f"{item.get('price_str', 'N/A')} | "
                         f"{item.get('delta_str', 'N/A')} | "
                         f"직전: {item.get('prev_str', 'N/A')}"
                     )
+                    # 전일 종가가 역산값이면 밝힙니다. 밝히지 않으면 모델이
+                    # 공식 종가로 읽고 등락률을 확정치처럼 인용합니다.
+                    if item.get("prev_source") == "등락률 역산(측정값 아님)":
+                        text += " ⚠️ 직전값은 등락률 역산치(공식 종가 아님)"
+                    lines.append(text)
                 else:
                     lines.append(f"- {clean_name}: 데이터 수집 실패")
 
@@ -224,6 +229,16 @@ def _append_risk_section(lines: list[str], risk_res):
         lines.append("")
         return
 
+    # [정확성] 이 다섯은 모두 **값이 높을수록 위험**인 지표입니다. 그
+    # 방향을 적어 두지 않았더니, 백분위 3.5%인 하이일드 스프레드(2.65)를
+    # 두고 "위험회피를 지시한다"고 쓴 리포트가 나왔습니다(2026-09-15
+    # 23:30). 스프레드가 낮다는 것은 신용이 안일하다는 뜻이지 회피가
+    # 아닙니다. 방향을 한 줄로 못 박습니다.
+    lines.append(
+        "※ 아래 다섯 지표는 모두 **값이 높을수록 위험/스트레스가 큰** "
+        "지표입니다. 낮은 값(낮은 백분위)은 위험선호·안일을 뜻하며 "
+        "위험회피 근거로 쓸 수 없습니다."
+    )
     lines.append(summarize_series_for_ai(risk_res.get("VIX"), "Close", "CBOE VIX (주식 변동성)"))
     lines.append(summarize_series_for_ai(risk_res.get("MOVE"), "Close", "ICE BofA MOVE (채권 변동성)"))
     lines.append(summarize_series_for_ai(risk_res.get("HY_OAS"), "BAMLH0A0HYM2", "미국 하이일드 스프레드 (HY OAS)"))

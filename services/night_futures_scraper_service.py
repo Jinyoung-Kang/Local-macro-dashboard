@@ -90,12 +90,19 @@ def _fetch_from_tradingview() -> dict | None:
         if match.group(3) == "내렸":
             pct = -pct
 
+        # [정확성] 이 전일 종가는 **측정값이 아니라 역산값**입니다.
+        # 스크래핑한 등락률로 현재가를 나눠 얻은 것이라, 그 페이지가
+        # 기준선을 바꾸면(정규장 종가 ↔ 야간장 시작가, 월물 교체)
+        # 전일 종가가 같은 날 안에서도 움직입니다. 실제로 2026-09-15
+        # 20:27에 1,066.84였던 값이 23:29에 1,040.86으로 바뀌었고,
+        # 둘 다 KRX 정규장 종가(1048.4)와 맞지 않았습니다.
         prev_close = price / (1 + pct / 100.0) if pct != -100 else price
         contract_month = _parse_tradingview_contract_month(text)
 
         return {
             "price": price,
             "prev_close": prev_close,
+            "prev_is_derived": True,
             "pct": pct,
             "source": "TradingView (비공식 스크래핑)",
             "contract_month": contract_month,
@@ -139,6 +146,8 @@ def _fetch_from_investing() -> dict | None:
         return {
             "price": price,
             "prev_close": prev_close,
+            # 이쪽은 페이지가 "전일 종가"를 직접 적어 준 값입니다.
+            "prev_is_derived": False,
             "pct": ((price - prev_close) / prev_close) * 100.0,
             "source": "Investing.com (비공식 스크래핑, 캐시 위험)",
             "contract_month": contract_month,

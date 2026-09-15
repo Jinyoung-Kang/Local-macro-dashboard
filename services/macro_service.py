@@ -990,6 +990,13 @@ def collect_macro_data():
                 "is_estimated": is_estimated,
                 "contract_month": contract_month,
                 "source": source,
+                # 전일 종가가 등락률 역산이면 그 사실을 화면·스냅샷까지
+                # 가지고 갑니다. 역산값은 스크래핑한 페이지가 기준선을
+                # 바꾸면 같은 날 안에서도 움직입니다.
+                "prev_source": (
+                    "등락률 역산(측정값 아님)"
+                    if data.get("prev_is_derived") else None
+                ),
             })
         else:
             collected[target_cat].append({

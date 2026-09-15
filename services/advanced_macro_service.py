@@ -51,6 +51,7 @@ ADVANCED_SERIES = {
             "10Y-2Y보다 침체 예측력이 높다는 것이 연준 리서치의 정설입니다."
         ),
         "source": "FRED T10Y3M (일간)",
+        "risk_direction": "값이 **낮을수록**(0 아래로 역전될수록) 침체 위험이 큽니다",
     },
     "DFII10": {
         "label": "10년 실질금리 (TIPS)",
@@ -62,6 +63,7 @@ ADVANCED_SERIES = {
             "금·장기 성장주 밸류에이션에 가장 직접적으로 작용합니다."
         ),
         "source": "FRED DFII10 (일간)",
+        "risk_direction": "값이 **높을수록** 긴축적이고 위험자산에 부담입니다",
     },
     "T10YIE": {
         "label": "10년 기대인플레이션 (BEI)",
@@ -73,6 +75,7 @@ ADVANCED_SERIES = {
             "성장/긴축인지 인플레 기대인지 분해해 줍니다."
         ),
         "source": "FRED T10YIE (일간)",
+        "risk_direction": "한 방향이 위험은 아닙니다 — 급등은 인플레 압력, 급락은 성장 둔화 신호입니다",
     },
     "BAMLC0A0CM": {
         "label": "투자등급(IG) 회사채 스프레드",
@@ -84,6 +87,7 @@ ADVANCED_SERIES = {
             "하이일드만 보면 초기 단계를 놓칩니다."
         ),
         "source": "FRED BAMLC0A0CM (일간)",
+        "risk_direction": "값이 **높을수록** 신용 스트레스가 큽니다",
     },
     "NFCI": {
         "label": "시카고 연준 금융상황지수",
@@ -95,6 +99,7 @@ ADVANCED_SERIES = {
             "자체가 신호이며, 0보다 크면 평균보다 긴축적입니다."
         ),
         "source": "FRED NFCI (주간)",
+        "risk_direction": "값이 **높을수록** 긴축적입니다(0이 평균). 낮은 값은 완화이며 위험 신호가 아닙니다",
     },
 }
 
@@ -320,6 +325,14 @@ def summarize_advanced_for_ai(result: dict) -> str:
             text += f" | 상태: {entry['status']}"
         if entry.get("percentile") is not None:
             text += f" | 최근 표본 백분위 {entry['percentile']:.1f}%"
+
+        # [정확성] 어느 쪽이 '위험'인지 함께 적습니다. 이것이 없으면 모델이
+        # 방향을 뒤집습니다 — 실제로 NFCI 경보선을 현재값(-0.564)보다 낮은
+        # -1.0으로 잡은 리포트가 나왔습니다(2026-09-15 23:36). 그 방향은
+        # 스트레스가 아니라 완화가 심해지는 쪽입니다.
+        direction = ADVANCED_SERIES.get(sid, {}).get("risk_direction")
+        if direction:
+            text += f"\n  · 위험 방향: {direction}"
 
         lines.append(text)
 

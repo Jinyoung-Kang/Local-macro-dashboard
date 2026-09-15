@@ -121,6 +121,8 @@ def _parse_investing_data(text: str) -> dict | None:
     return {
         "price": price,
         "prev_close": prev_close,
+        # 페이지가 "전일 종가"를 직접 적어 준 값입니다.
+        "prev_is_derived": False,
         "pct": ((price - prev_close) / prev_close) * 100.0,
         "contract_month": f"{month_match.group(1)}물" if month_match else None,
     }
@@ -153,6 +155,9 @@ def _fetch_nikkei_from_tradingview() -> dict | None:
         return {
             "price": price,
             "prev_close": prev_close,
+            # 등락률로 역산한 값입니다. 페이지가 기준선을 바꾸면 전일 종가가
+            # 같은 날 안에서도 움직입니다(야간선물에서 실제로 발생).
+            "prev_is_derived": True,
             "pct": pct,
             "source": "TradingView (비공식 스크래핑)",
             "contract_month": contract_month,
@@ -251,6 +256,9 @@ def _fetch_hangseng_from_tradingview() -> dict | None:
         return {
             "price": price,
             "prev_close": prev_close,
+            # 등락률로 역산한 값입니다. 페이지가 기준선을 바꾸면 전일 종가가
+            # 같은 날 안에서도 움직입니다(야간선물에서 실제로 발생).
+            "prev_is_derived": True,
             "pct": pct,
             "source": "TradingView (비공식 스크래핑)",
             "contract_month": contract_month,

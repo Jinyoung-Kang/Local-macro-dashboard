@@ -2043,3 +2043,119 @@ def test_style_block_bans_hanja_and_quoting_the_instructions():
         prompt = get_report_system_prompt(report_type)
         assert "지시문의 문장을 리포트에 옮겨 적지 마십시오" in prompt, report_type
         assert "한자를 쓰지 마십시오" in prompt, report_type
+
+
+# ==============================================================================
+# 21. 2026-09-15 23:30 / 23:36 리포트에서 나온 결함
+# ==============================================================================
+def test_risk_indicators_declare_which_way_is_dangerous():
+    """
+    23:30 종합 리포트의 핵심 근거가 "10년 실질금리 2.600%와 HY OAS 2.65%가
+    위험회피를 지시한다"였다. HY OAS 2.65는 **백분위 3.5%** — 역사적으로
+    극히 낮은 값이고, 낮은 스프레드는 신용이 안일하다는 뜻이지 위험회피가
+    아니다. 문맥이 방향을 적어 주지 않으니 모델이 뒤집었다.
+    """
+    import pandas as pd
+
+    from services.dashboard_snapshot_service import _append_risk_section
+
+    lines = []
+    _append_risk_section(lines, {"VIX": None, "MOVE": None})
+    text = "\n".join(lines)
+
+    assert "값이 높을수록" in text.replace("**", ""), (
+        "다섯 지표의 위험 방향이 문맥에 없습니다"
+    )
+    assert "위험회피 근거로 쓸 수 없습니다" in text
+
+
+def test_advanced_indicators_carry_a_risk_direction():
+    """
+    23:36 금리 리포트는 NFCI 경보선을 -1.0으로 잡았다. 현재값이 -0.564이므로
+    그 선은 **더 완화되는 쪽**이고, 스트레스가 커지는 방향이 아니다.
+    영원히 울리지 않는 경보다.
+    """
+    from services.advanced_macro_service import (
+        ADVANCED_SERIES,
+        summarize_advanced_for_ai,
+    )
+
+    for sid, meta in ADVANCED_SERIES.items():
+        assert meta.get("risk_direction"), f"{sid}에 위험 방향이 없습니다"
+
+    summary = summarize_advanced_for_ai({"latest": {
+        "NFCI": {"label": "시카고 연준 금융상황지수", "available": True,
+                 "value": -0.564, "digits": 3, "unit": "", "delta": -0.004,
+                 "status": "매우 완화", "percentile": 26.6},
+    }})
+    assert "위험 방향" in summary
+    assert "낮은 값은 완화이며 위험 신호가 아닙니다" in summary
+
+
+def test_prompt_forbids_inverting_indicator_direction():
+    """방향 규칙이 사라지면 같은 실수가 조용히 돌아온다."""
+    from services.ai_service import get_report_system_prompt, get_report_types
+
+    for report_type in get_report_types():
+        prompt = get_report_system_prompt(report_type)
+        assert "지표의 방향을 뒤집지 마십시오" in prompt, report_type
+        assert "경보선은" in prompt and "위험한 쪽" in prompt, report_type
+
+
+def test_derived_previous_close_is_labelled():
+    """
+    야간선물의 전일 종가는 스크래핑한 등락률로 역산한 값이다
+    (prev_close = price / (1 + pct/100)). 그래서 페이지가 기준선을 바꾸면
+    같은 날 안에서도 움직인다 — 2026-09-15 20:27에 1,066.84였던 값이
+    23:29에 1,040.86이 되었고, 둘 다 KRX 정규장 종가(1048.4)와 달랐다.
+
+    화면 상단은 "직전 거래일 공식 종가 대비"라고 약속하므로, 역산값이면
+    반드시 밝혀야 한다.
+    """
+    from services.dashboard_snapshot_service import _append_macro_section
+
+    collected = {"🌏 아시아 주요 주가지수": [
+        {"name": "코스피200 야간선물 (CME 연계)", "status": "ok",
+         "price_str": "1,043.15", "delta_str": "+2.29 (+0.22%)",
+         "prev_str": "1,040.86", "prev_source": "등락률 역산(측정값 아님)"},
+        {"name": "닛케이 225 (Nikkei)", "status": "ok",
+         "price_str": "63,611.84", "delta_str": "+118.85 (+0.19%)",
+         "prev_str": "63,492.99"},
+    ]}
+    lines = []
+    _append_macro_section(lines, (collected, None, None, None, None))
+
+    night = next(ln for ln in lines if "야간선물" in ln)
+    assert "역산" in night and "공식 종가 아님" in night, night
+
+    # 역산이 아닌 항목에는 경고를 붙이지 않는다.
+    nikkei = next(ln for ln in lines if "닛케이" in ln)
+    assert "역산" not in nikkei
+
+
+def test_scrapers_say_whether_the_previous_close_was_measured():
+    """
+    등락률로 역산한 곳과 페이지가 '전일 종가'를 직접 준 곳을 구분해 둔다.
+    구분이 사라지면 화면이 역산값을 공식 종가로 표시하게 된다.
+    """
+    import ast
+    import pathlib
+
+    for path in (
+        "services/night_futures_scraper_service.py",
+        "services/foreign_index_futures_scraper_service.py",
+    ):
+        source = pathlib.Path(path).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        derived_sites = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Div)
+            and "1 + pct" in ast.unparse(node)
+        )
+        flags = source.count('"prev_is_derived"')
+        assert flags >= derived_sites, (
+            f"{path}: 역산 {derived_sites}곳 중 표시가 {flags}곳뿐입니다"
+        )
+        assert '"prev_is_derived": True' in source, path

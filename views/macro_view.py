@@ -576,6 +576,10 @@ def render_macro_view(now_str_kst: str, refresh_interval: int):
                         # 현재가(TradingView 실시간)와 전일값(FRED 확정치)의
                         # 출처가 다르다는 점을 반드시 밝힙니다.
                         prev_label += " :gray[(FRED 확정치)]"
+                    elif prev_source == "등락률 역산(측정값 아님)":
+                        # 스크래핑한 등락률로 현재가를 나눠 얻은 값입니다.
+                        # 공식 전일 종가가 아니므로 반드시 밝힙니다.
+                        prev_label += " :orange[(등락률 역산)]"
                     elif prev_source == "일봉 직전 거래일 종가":
                         # 분봉이 마지막 봉을 반복해 전일 대비를 못 줄 때,
                         # 같은 심볼의 일봉에서 직전 거래일 종가를 가져온
