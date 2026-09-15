@@ -874,13 +874,13 @@ def test_long_context_recommendation_only_names_live_engines():
     """
     죽은 엔진을 "긴 분석에 권장"으로 안내하면 그 안내가 거짓말이 된다.
     """
-    import views.ai_report_view as view
+    import services.ai_service as service
     from services.ai_service import get_unavailable_engines
 
     dead = set(get_unavailable_engines())
-    assert not (view.LONG_CONTEXT_MODELS & dead), (
+    assert not (service.LONG_CONTEXT_ENGINES & dead), (
         f"권장 목록에 쓸 수 없는 엔진이 있습니다: "
-        f"{view.LONG_CONTEXT_MODELS & dead}"
+        f"{service.LONG_CONTEXT_ENGINES & dead}"
     )
 
 
@@ -2509,3 +2509,70 @@ def test_prompt_forbids_emitting_the_thinking():
         assert "생각한 과정을 출력하지 마십시오" in prompt, report_type
         assert "출력의 첫 글자는" in prompt, report_type
         assert "판단 값은 이 리포트 유형에 지정된 것만" in prompt, report_type
+
+
+# ==============================================================================
+# 25. 전체 메뉴 점검에서 나온 것
+# ==============================================================================
+def test_large_context_threshold_is_actually_used():
+    """
+    LARGE_CONTEXT_TOKENS는 "2분 기다린 뒤에야 타임아웃을 보는 일을 막는
+    기준"이라고 적혀 있었지만 **아무 코드도 읽지 않았다.** 긴 입력 경고는
+    COT 체크박스만 보고 떠서, 체크를 끈 채 Context가 커진 경우를 놓쳤다.
+
+    값도 12,000이라 실제 Context(4천~6천)로는 영영 발동하지 않았다.
+    """
+    import pathlib
+
+    from services.ai_service import LARGE_CONTEXT_TOKENS, is_large_context
+
+    # 2026-09-15~16 실측: 6,346토큰에서 296초, 4,054토큰에서 63~196초.
+    assert LARGE_CONTEXT_TOKENS == 6000
+    assert is_large_context(6346, "nvidia_gpt_oss_20b") is True
+    assert is_large_context(4054, "nvidia_gpt_oss_20b") is False
+
+    # 긴 입력을 감당하는 엔진과 자동 탐색에는 걸지 않는다.
+    assert is_large_context(6346, "nvidia_nemotron") is False
+    assert is_large_context(6346, "auto") is False
+
+    # 화면이 실제로 그 판정을 쓰고 표시해야 한다.
+    view = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+    assert "is_large_context(context_tokens, ai_engine)" in view
+    assert "context_is_large" in view
+    assert "LARGE_CONTEXT_TOKENS" in view, "상수를 표시에 쓰지 않고 있습니다"
+
+
+def test_long_context_engine_list_has_one_home():
+    """
+    긴 Context를 감당하는 엔진 목록이 화면과 서비스 양쪽에 있으면 한쪽만
+    고쳐지고 다른 쪽이 옛 목록으로 남는다. 출처는 서비스 하나다.
+    """
+    import pathlib
+
+    from services.ai_service import LONG_CONTEXT_ENGINES
+
+    assert LONG_CONTEXT_ENGINES, "목록이 비어 있습니다"
+
+    view = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
+    assert "LONG_CONTEXT_MODELS" not in view, (
+        "화면에 목록 사본이 남아 있습니다 — 서비스의 것을 import하세요"
+    )
+
+
+def test_no_unused_imports_in_shipped_code():
+    """
+    죽은 import는 "이 모듈이 무엇을 쓰는가"를 거짓으로 말한다. 6개월 뒤에
+    읽는 사람이 없는 의존성을 따라가게 된다.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        ["python3", "-m", "pyflakes", "app.py", "config.py",
+         "services/ai_service.py", "views/ai_report_view.py"],
+        capture_output=True, text=True,
+    )
+    unused = [
+        line for line in result.stdout.splitlines()
+        if "imported but unused" in line
+    ]
+    assert not unused, "쓰지 않는 import가 있습니다:\n" + "\n".join(unused)

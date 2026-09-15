@@ -25,7 +25,6 @@ from views.data_status_view import (
     render_data_freshness_sidebar,
     render_data_status_view,
 )
-from services import store
 from views._ui import refresh_button
 
 # SSL 경고 비활성화

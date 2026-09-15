@@ -15,6 +15,14 @@ AI 매크로 & 멀티에셋 종합 리포트 화면.
 - 모델이 만든 문자열을 unsafe_allow_html에 넣을 때는 **반드시
   html.escape()** 를 거칩니다. 모델 입력에 스크래핑 데이터가 섞이므로
   외부 텍스트로 취급해야 합니다.
+- 본문이 모델의 **사고 과정**이면 총평 배너를 그리지 않습니다. 그 안의
+  판단은 모델이 검토 중이던 후보이지 결론이 아닙니다. 대신 원문을
+  통째로 보여 줍니다 — 어떤 경우에도 내용을 버리지 않습니다.
+- 품질 경고는 ai_service의 detect_* 함수에서 옵니다. 새 경고를 넣을
+  때도 판정은 서비스에, 표시만 여기에 두세요. 그래야 테스트가
+  Streamlit 런타임 없이 판정을 검사할 수 있습니다.
+- 경고를 늘릴 때는 **오탐을 먼저 재보세요.** 늘 떠 있는 경고는 아무도
+  읽지 않게 되고, 그러면 진짜 경고도 함께 묻힙니다.
 """
 import html
 import logging
@@ -39,6 +47,8 @@ from services.ai_service import (
     format_ai_engine,
     get_ai_engine_options,
     LARGE_CONTEXT_TOKENS,
+    LONG_CONTEXT_ENGINES,
+    is_large_context,
     estimate_prompt_tokens,
     get_configured_providers,
     get_report_generation_params,
@@ -61,16 +71,6 @@ logger = logging.getLogger(__name__)
 # 그대로 남습니다.
 _RESULT_KEY = "ai_report_result"
 _HEALTH_KEY = "ai_report_engine_health"
-
-# 긴 Context를 감당할 수 있다고 보는 엔진들. 짧은 모델에 COT 상세표까지
-# 넣으면 컨텍스트 한도를 넘겨 400이 납니다.
-# 2026-09-14 실측에서 응답이 확인됐고 긴 Context를 감당하는 엔진.
-# nvidia_gpt_oss_120b(410 종료)와 cerebras_llama(404)는 여기서 뺐습니다 —
-# 죽은 엔진을 "권장"으로 남겨 두면 안내가 거짓말이 됩니다.
-LONG_CONTEXT_MODELS = {
-    "nvidia_nemotron",
-    "cloudflare_llama",
-}
 
 _STATE_BADGE = {
     "ok": ("✅", "정상"),
@@ -204,10 +204,16 @@ def _generate_report(
 
     body, ok = extract_report_text(res)
 
+    # [정확성] 예전에는 "COT 상세 체크박스"만 보고 긴 입력을 경고해서,
+    # 체크를 끈 채로 Context가 커진 경우를 놓쳤습니다. 실제로 센 크기로
+    # 판단합니다.
+    context_tokens = estimate_prompt_tokens(context)
+
     return {
         "ok": ok,
         "body": body,
-        "context_tokens": estimate_prompt_tokens(context),
+        "context_tokens": context_tokens,
+        "context_is_large": is_large_context(context_tokens, ai_engine),
         "warning": res.get("warning"),
         "engine": ai_engine,
         "report_type": report_type,
@@ -662,6 +668,18 @@ def _render_report(result: dict) -> None:
         meta += f" | 입력: `~{result['context_tokens']:,} 토큰`"
     st.caption(meta)
 
+    # 입력이 이 엔진에 부담스러운 크기였다면 왜 느렸는지(또는 왜 잘렸는지)
+    # 알려 줍니다. 생성 전 경고는 옵션만 보고 판단해서 놓치는 경우가
+    # 있었습니다 — 여기서는 실제로 센 크기로 말합니다.
+    if result.get("context_is_large"):
+        st.caption(
+            f"🐢 입력이 `{LARGE_CONTEXT_TOKENS:,} 토큰`을 넘었습니다. "
+            "이 엔진에서는 응답이 느려지고 토큰 상한에 걸리기 쉽습니다 — "
+            "`CFTC COT 상세`를 끄거나 긴 입력을 감당하는 엔진"
+            "(Nemotron 120B / Cloudflare Llama 3.3 70B)이나 `⚡ 자동 탐색`을 "
+            "쓰세요."
+        )
+
     if result["ok"]:
         _render_report_body(result)
     else:
@@ -913,7 +931,7 @@ def render_ai_report_view():
 
     if (
         include_recent_cot_history
-        and ai_engine not in LONG_CONTEXT_MODELS
+        and ai_engine not in LONG_CONTEXT_ENGINES
         and ai_engine != "auto"
     ):
         # 실측: 이 조합(작은 모델 + COT 상세)에서 금리·수급 리포트가

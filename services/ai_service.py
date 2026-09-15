@@ -1,8 +1,27 @@
 """
 services/ai_service.py
-AI 모델 레지스트리 기반 엔진 (NVIDIA, Cloudflare, Cerebras 및 자동 Failover 파이프라인)
-분석 엔진과 번역 전용 엔진(Gemma 4 26B/31B)의 철저한 분리 및 한국어 판별 자동 번역기 탑재
-(ai_test_view.py 등 레거시 호환성을 위한 래퍼 함수 완벽 복구)
+AI 리포트의 엔진 계층. 이 파일이 맡는 일은 네 가지입니다.
+
+1) 엔진 호출 — NVIDIA·Cloudflare·Cerebras를 같은 OpenAI 호환 형식으로
+   부르고, 긴 생성은 **SSE 스트리밍**으로 받습니다. 비스트리밍이던 시절에는
+   생성이 다 끝날 때까지 한 번의 read 안에서 기다려야 해서 120초에 끊겼습니다.
+   `⚡ 자동 탐색`은 AUTO_FAILOVER_ORDER 순으로 넘깁니다.
+
+2) 엔진 점검 — 모델 ID는 제공자가 예고 없이 내립니다(HTTP 410). 목록을
+   믿지 말고 `probe_engine()` / `check_all_engines()`의 실측을 믿으세요.
+
+3) 응답 해석 — `extract_report_text()`로 본문을 꺼내고
+   (`res.get("response", ...)`는 실패 시 빈 화면이 됩니다),
+   `parse_report_sections()`로 프롬프트가 지시한 구조로 자릅니다.
+
+4) 품질 검사 — 프롬프트로 규칙을 정해도 모델이 지키지 않는 일이
+   반복돼서, 결과를 **다시 검사**합니다. detect_* 함수들이 그것이며
+   각각 실제로 관찰된 결함 하나를 고정한 회귀 테스트를 가집니다.
+   검사는 모두 **보조 장치**입니다 — 1차 방어선은 services/prompts.py이고,
+   여기서 잡히는 것은 프롬프트가 무시당한 경우뿐입니다.
+
+번역기(Gemma)는 분석 엔진과 분리돼 있고, 응답이 한국어가 아닐 때만
+탑니다. 프롬프트에서 한국어를 지시해 이 경로를 아예 안 타는 편이 낫습니다.
 """
 import json
 import logging
@@ -412,9 +431,48 @@ def estimate_prompt_tokens(text: str) -> int:
     return len(text) // 2
 
 
-# 이 크기를 넘는 Context는 작은 모델에서 첫 응답까지 오래 걸립니다.
-# 사용자가 2분을 기다린 뒤에야 타임아웃을 보는 일을 막기 위한 기준입니다.
-LARGE_CONTEXT_TOKENS = 12000
+# 긴 Context를 감당한다고 확인된 엔진들. 짧은 모델에 COT 상세표까지
+# 넣으면 컨텍스트 한도를 넘겨 400이 납니다.
+# 2026-09-14 실측에서 응답이 확인된 것만 남깁니다 —
+# nvidia_gpt_oss_120b(410 종료)와 cerebras_llama(404)는 뺐습니다.
+# 죽은 엔진을 "권장"으로 남겨 두면 안내가 거짓말이 됩니다.
+LONG_CONTEXT_ENGINES = frozenset({
+    "nvidia_nemotron",
+    "cloudflare_llama",
+})
+
+# 이 크기를 넘는 Context는 작은 모델에서 눈에 띄게 느려집니다.
+#
+# 2026-09-15~16 실측(NVIDIA GPT-OSS 20B):
+#   ~4,054 토큰 →  63 ~ 196초
+#   ~6,346 토큰 → 174 ~ 296초
+# 예전 값은 12,000이었는데 실제 Context가 거기까지 가는 일이 없어서
+# 한 번도 발동하지 않았습니다. 실측에 맞춰 6,000으로 낮췄습니다.
+LARGE_CONTEXT_TOKENS = 6000
+
+
+def is_large_context(token_estimate: int, engine_name: str) -> bool:
+    """
+    이 입력이 이 엔진에 부담스러운 크기인지 알려 줍니다.
+
+    파라미터:
+        token_estimate : estimate_prompt_tokens()가 센 대략의 토큰 수.
+        engine_name    : 선택된 엔진 키. "auto"는 부담스럽지 않다고 봅니다
+                         (자동 탐색이 긴 입력을 감당하는 엔진을 고릅니다).
+
+    반환값:
+        느려질 것으로 보이면 True.
+
+    주의사항:
+        - 긴 Context를 감당하는 엔진(LONG_CONTEXT_ENGINES)에는 걸지
+          않습니다. 그 조합은 실측에서 문제가 없었습니다.
+        - 판단 기준은 **실제 Context 크기**입니다. 예전에는 화면이
+          "COT 상세 체크박스"만 보고 경고해서, 체크를 끈 채로 입력이
+          커진 경우를 놓쳤습니다.
+    """
+    if engine_name in ("auto", *LONG_CONTEXT_ENGINES):
+        return False
+    return token_estimate > LARGE_CONTEXT_TOKENS
 
 
 def strip_reasoning_artifacts(text: str) -> str:

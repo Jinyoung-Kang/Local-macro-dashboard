@@ -2,8 +2,6 @@
 config.py
 매크로 대시보드 환경설정, API 엔드포인트/시크릿 관리 및 시장 지표·해석 메타데이터 정의
 """
-import os
-import streamlit as st
 
 # 시크릿 탐색 규칙은 services/secrets.py 한 곳에만 둡니다.
 # 예전에는 같은 구현이 config.py · kis_service.py · ls_service.py 세 곳에
