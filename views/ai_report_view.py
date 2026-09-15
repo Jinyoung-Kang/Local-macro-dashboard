@@ -27,7 +27,9 @@ from services.ai_service import (
     DEFAULT_REPORT_TYPE,
     call_selected_ai_engine,
     check_all_engines,
+    detect_invented_weights,
     detect_verdict_conflict,
+    detect_verdict_language_issue,
     extract_report_text,
     format_ai_engine,
     get_ai_engine_options,
@@ -345,6 +347,10 @@ def _render_verdict_banner(
         - 신뢰도가 "높음"인데 본문이 상충을 말하면 **모순 경고**를
           띄웁니다. 모델이 신뢰도 기준을 지키지 않는 일이 실제로 있어서,
           프롬프트만으로는 부족합니다.
+        - 대응 전략이 보유 비중을 수치로 적으면 **지어낸 값**이므로
+          따로 경고합니다. 이 대시보드는 보유 내역을 모릅니다.
+        - 총평 항목이 영어로 남아 있으면 캡션으로 알립니다. 본문이
+          한국어면 자동 번역 단계를 건너뛰기 때문에 생깁니다.
     """
     judgement = verdict.get("판단")
     if not judgement:
@@ -411,6 +417,16 @@ def _render_verdict_banner(
     mismatch = detect_verdict_conflict(verdict, sections or [])
     if mismatch:
         st.warning(mismatch, icon="⚠️")
+
+    # 대시보드가 모르는 수치(보유 비중)를 모델이 지어낸 경우. 방향보다
+    # 훨씬 위험한 오류라 상충 경고와 따로 띄웁니다.
+    invented = detect_invented_weights(sections or [])
+    if invented:
+        st.warning(invented, icon="🚫")
+
+    language_note = detect_verdict_language_issue(verdict)
+    if language_note:
+        st.caption(f"🌐 {language_note}")
 
     if (verdict.get("신뢰도") or "").strip() == "낮음":
         st.warning(

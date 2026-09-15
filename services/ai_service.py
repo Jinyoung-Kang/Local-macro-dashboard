@@ -708,6 +708,125 @@ def _strategy_conflict(verdict: dict, sections: list) -> str | None:
     )
 
 
+# 총평 한 항목이 "번역되지 않았다"고 볼 기준. 항목은 짧아서
+# is_korean_response()의 8자 기준으로는 판별되지 않습니다.
+_UNTRANSLATED_MIN_LATIN = 20
+_UNTRANSLATED_MAX_HANGUL_RATIO = 0.15
+
+# 한국어 리포트에서도 원문 그대로 쓰는 것이 자연스러운 항목. 세면
+# "VIX 상승"처럼 정상인 문장이 영어로 잡힙니다.
+_ALLOWED_ENGLISH_TERMS = (
+    "NASDAQ", "S&P", "KOSPI", "VIX", "MOVE", "COT", "CFTC", "OAS", "NFCI",
+    "STLFSI", "WTI", "TGA", "RRP", "WALCL", "DXY", "USD", "KRW", "JPY",
+    "ETF", "TIPS", "BEI", "IG", "HY", "CP", "FRED", "KRX", "SEC",
+)
+
+
+def _looks_untranslated(text: str) -> bool:
+    """
+    총평 한 항목이 한국어로 번역되지 않았는지 봅니다.
+
+    파라미터:
+        text : 총평의 한 항목 값(판단/신뢰도/상충 신호/핵심 근거).
+
+    반환값:
+        영어 문장으로 보이면 True.
+
+    주의사항:
+        - 지표 이름(VIX, COT, S&P 500)은 한국어 리포트에서도 원문으로
+          쓰는 것이 정상이라 **세기 전에 지웁니다.** 지우지 않으면
+          "VIX 상승" 같은 정상 문장이 영어로 잡힙니다.
+        - 라틴 문자가 적으면(_UNTRANSLATED_MIN_LATIN 미만) 판단하지
+          않습니다. 짧은 항목에서 억지로 판정하면 오탐만 납니다.
+    """
+    if not text:
+        return False
+
+    stripped = text
+    for term in _ALLOWED_ENGLISH_TERMS:
+        stripped = stripped.replace(term, " ")
+
+    latin = len(re.findall(r"[A-Za-z]", stripped))
+    hangul = len(re.findall(r"[가-힣]", stripped))
+    if latin < _UNTRANSLATED_MIN_LATIN:
+        return False
+    return hangul / max(latin + hangul, 1) < _UNTRANSLATED_MAX_HANGUL_RATIO
+
+
+# "비중 30 %"처럼 포트폴리오 비중을 수치로 적은 자리를 찾는 패턴.
+# 이 대시보드는 사용자의 보유 내역을 **전혀** 모르므로, 이런 수치는
+# 언제나 모델이 지어낸 것입니다.
+_WEIGHT_CLAIM = re.compile(r"비중[^가-힣\n]{0,4}\d+(?:[.,]\d+)?\s*%")
+
+
+def detect_invented_weights(sections: list) -> str | None:
+    """
+    대응 전략이 포트폴리오 비중을 수치로 지어냈는지 검사합니다.
+
+    파라미터:
+        sections : parse_report_sections()가 돌려준 sections 리스트.
+
+    반환값:
+        지어낸 비중이 있으면 설명 문자열, 없으면 None.
+
+    주의사항:
+        - **이 대시보드는 사용자의 보유 내역을 모릅니다 — 수집하지도,
+          입력받지도 않습니다.** 따라서 "현재 비중 30%"는 출처가 있을 수
+          없는 수치입니다. 2026-09-15 20:31 리포트가 "주식: 축소(현재
+          비중 30 % → 20 %)"라고 써서 넣은 검사입니다.
+        - 임계치(예: "VIX > 20", "10Y-3M > 1 %")는 잡지 않습니다.
+          "비중" 바로 뒤의 숫자만 봅니다.
+    """
+    hits = []
+    for section in sections or []:
+        if _STRATEGY_SECTION_TITLE not in (section.get("title") or ""):
+            continue
+        hits.extend(_WEIGHT_CLAIM.findall(section.get("body") or ""))
+
+    if not hits:
+        return None
+
+    return (
+        f"대응 전략이 포트폴리오 비중을 수치로 적었습니다({len(hits)}곳). "
+        "**이 대시보드는 보유 내역을 수집하지 않습니다** — 모델이 지어낸 "
+        "숫자이니 그대로 따르지 마세요. 방향(확대/유지/축소)만 참고하세요."
+    )
+
+
+def detect_verdict_language_issue(verdict: dict) -> str | None:
+    """
+    총평 항목이 영어로 남아 있는지 검사합니다.
+
+    파라미터:
+        verdict : parse_report_sections()가 돌려준 verdict dict.
+
+    반환값:
+        영어로 남은 항목이 있으면 설명 문자열, 없으면 None.
+
+    주의사항:
+        - **본문 전체 판정으로는 이 경우를 못 잡습니다.** 번역 여부는
+          is_korean_response()가 본문 전체의 한글 비율(5%)로 정하는데,
+          본문이 한국어면 총평만 영어여도 통과합니다. 그런데 화면 배너에
+          크게 뜨는 것이 바로 그 총평입니다(2026-09-15 20:31 리포트).
+        - 리포트 전체를 다시 번역하지는 않습니다. 멀쩡한 한국어 본문까지
+          번역기를 한 번 더 태우면 느려지고 표가 깨질 수 있습니다.
+          여기서는 사실만 알리고, 고치는 것은 프롬프트의 일입니다.
+    """
+    bad = [
+        field for field in ("상충 신호", "핵심 근거")
+        if _looks_untranslated((verdict.get(field) or "").strip())
+    ]
+    if not bad:
+        return None
+
+    return (
+        "총평의 " + ", ".join(f"'{f}'" for f in bad) + " 항목이 한국어로 "
+        "번역되지 않았습니다. 본문이 한국어라 자동 번역 단계를 건너뛰었는데, "
+        "화면 위 배너에 뜨는 것은 이 항목입니다. 내용 자체는 유효하니 "
+        "그대로 읽으셔도 됩니다."
+    )
+
+
 def detect_verdict_conflict(verdict: dict, sections: list) -> str | None:
     """
     총평이 본문과 모순되는지 검사합니다.

@@ -1772,7 +1772,7 @@ def test_prompts_carry_the_rules_the_real_reports_broke():
     for report_type in get_report_types():
         prompt = get_report_system_prompt(report_type)
         # 출처 품질을 격상시키지 말 것 (수급 리포트가 깨뜨린 규칙)
-        assert "출처의 품질을 올려 부르지" in prompt, report_type
+        assert "출처의 이름과 품질을 바꾸지" in prompt, report_type
         # 있는 데이터를 '데이터 없음'으로 적지 말 것
         assert '"데이터 없음"으로 적기' in prompt, report_type
         # 상충으로 적은 것을 본문에서 일치라고 쓰지 말 것
@@ -1808,4 +1808,125 @@ def test_level_verdicts_do_not_get_a_direction_arrow():
     source = pathlib.Path("views/ai_report_view.py").read_text(encoding="utf-8")
     assert "verdict_is_directional(report_type)" in source, (
         "배너가 유형별 기호를 고르지 않고 있습니다"
+    )
+
+
+# ==============================================================================
+# 19. 2026-09-15 20:31 리포트에서 나온 결함
+# ==============================================================================
+def test_english_verdict_fields_are_flagged():
+    """
+    본문은 한국어인데 총평의 '상충 신호'·'핵심 근거'만 영어로 나왔다.
+    is_korean_response()는 본문 전체의 한글 비율(5%)로 판정하므로 통과했고,
+    화면에는 "번역 불필요 — 한국어 응답"이 떴다. 그런데 배너에 크게 뜨는
+    것이 바로 그 두 줄이다.
+    """
+    from services.ai_service import (
+        detect_verdict_language_issue,
+        is_korean_response,
+        parse_report_sections,
+    )
+
+    real = (
+        "### 총평\n"
+        "- **판단**: 위험회피\n"
+        "- **신뢰도**: 낮음\n"
+        "- **상충 신호**: 4개 — Tech sector lagging vs smart money long on "
+        "NASDAQ 100, Gold price down vs smart money long on gold.\n"
+        "- **핵심 근거**: CFTC COT smart money long on NASDAQ 100 while "
+        "S&P 500 sector rotation shows tech lagging.\n\n"
+        "### 거시 국면\n"
+        "금리 상승세가 이어지는 가운데 신용 스프레드는 낮은 수준을 유지한다.\n"
+    )
+    parsed = parse_report_sections(real)
+
+    # 본문 전체 판정으로는 한국어로 보인다 — 그래서 번역을 건너뛴다.
+    assert is_korean_response(real) is True
+
+    note = detect_verdict_language_issue(parsed["verdict"])
+    assert note is not None, "영어로 남은 총평을 잡지 못했습니다"
+    assert "상충 신호" in note and "핵심 근거" in note
+
+
+def test_korean_verdict_fields_are_not_flagged():
+    """
+    지표 이름은 한국어 리포트에서도 영어로 쓴다. 그것까지 세면 정상 리포트에
+    경고가 붙는다.
+    """
+    from services.ai_service import detect_verdict_language_issue
+
+    for verdict in (
+        {"상충 신호": "1개 — 섹터 로테이션 위험선호 vs CFTC COT 스마트머니 매도",
+         "핵심 근거": "에너지·헬스케어·금융이 3개월 순위 1~3위로 상승"},
+        {"상충 신호": "없음", "핵심 근거": "VIX 17.52, MOVE 109.28 추정치"},
+        {"상충 신호": "3개 — S&P 500 vs KOSPI 200, NASDAQ vs DXY, WTI vs GLD"},
+        {},
+    ):
+        assert detect_verdict_language_issue(verdict) is None, verdict
+
+
+def test_invented_portfolio_weights_are_flagged():
+    """
+    2026-09-15 20:31 리포트는 "주식: 축소(현재 비중 30 % → 20 %)"라고 썼다.
+    이 대시보드는 사용자의 보유 내역을 수집하지 않으므로, '현재 비중'은
+    출처가 있을 수 없는 숫자다. 방향은 참고할 수 있어도 이 수치는 아니다.
+    """
+    from services.ai_service import detect_invented_weights, parse_report_sections
+
+    real = (
+        "### 대응 전략\n"
+        "- **주식**: 축소(현재 비중 30 % → 20 %) – VIX > 20 시 청산.\n"
+        "- **채권**: 확대(현재 비중 40 % → 50 %) – 10Y > 5.5 % 시 추가 매수.\n"
+        "- **원자재**: 유지 – WTI > +5 % 시 매수.\n"
+    )
+    parsed = parse_report_sections(real)
+    note = detect_invented_weights(parsed["sections"])
+
+    assert note is not None, "지어낸 보유 비중을 잡지 못했습니다"
+    assert "보유 내역을 수집하지 않습니다" in note
+
+
+def test_numeric_thresholds_are_not_mistaken_for_weights():
+    """
+    대응 전략에는 임계치 퍼센트가 정상적으로 등장한다("10Y-3M > 1 %").
+    그것까지 경고하면 이 검사는 못 쓴다.
+    """
+    from services.ai_service import detect_invented_weights
+
+    assert detect_invented_weights([
+        {"title": "대응 전략",
+         "body": "- 미국 주식: 축소 (스마트머니 ≤ -70k 시 청산)\n"
+                 "- 채권: 확대 (10Y-3M > 1 % 시 추가 매수)\n"
+                 "- 금: 확대 (GLD 3개월 상승 ≥ 1% 시 진입)"},
+    ]) is None
+
+    # 결론 섹션이 아닌 곳의 서술은 보지 않는다.
+    assert detect_invented_weights([
+        {"title": "핵심 리스크", "body": "주식 비중 30 % 축소 시나리오"},
+    ]) is None
+
+    assert detect_invented_weights([]) is None
+
+
+def test_prompts_ban_invented_weights_and_renamed_sources():
+    """
+    2026-09-15 20:31 리포트가 깨뜨린 규칙 3종을 프롬프트에 못 박는다.
+    - Daum 집계 수치를 "KIS 수급"이라고 부름 (문맥에 KIS는 없음)
+    - "현재 비중 30 %" — 대시보드가 모르는 값
+    - 총평 항목만 영어
+    """
+    from services.ai_service import get_report_system_prompt, get_report_types
+
+    for report_type in get_report_types():
+        prompt = get_report_system_prompt(report_type)
+        assert "문맥에 없는 기관 이름을 붙이지 마십시오" in prompt, report_type
+        assert "포트폴리오를 모릅니다" in prompt, report_type
+        assert "퍼센트를 붙이지 마십시오" in prompt, report_type
+        assert "총평의 항목 값도 한국어입니다" in prompt, report_type
+        assert "조건은 아직 일어나지 않은 것이어야 합니다" in prompt, report_type
+
+    comprehensive = get_report_system_prompt("종합 거시경제 & 수급 전략")
+    assert "발생 조건은 **아직 충족되지 않은** 값이어야" in comprehensive, (
+        "핵심 리스크의 발생 조건도 미래형이어야 합니다"
+        " (KOSPI 200 선물 신규 숏 & 외국인 ≥ 4,658 — 둘 다 이미 참이었음)"
     )
