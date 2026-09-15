@@ -1004,7 +1004,7 @@ def test_ui_has_a_colour_for_every_judgement_the_prompts_allow():
     보여, 위험회피인지 위험선호인지 구분이 안 된다.
     """
     import views.ai_report_view as view
-    from services.prompts import REPORT_PROFILES
+    from services.prompts import REPORT_PROFILES, VERDICT_FIELDS
 
     missing = []
     for report_type, profile in REPORT_PROFILES.items():
@@ -1077,7 +1077,7 @@ def test_generation_params_stay_in_the_low_temperature_range():
     다양해지지만 없는 값을 그럴듯하게 채워 넣을 위험이 커진다.
     """
     from services.ai_service import get_report_generation_params
-    from services.prompts import REPORT_PROFILES
+    from services.prompts import REPORT_PROFILES, VERDICT_FIELDS
 
     for report_type in REPORT_PROFILES:
         params = get_report_generation_params(report_type)
@@ -1094,7 +1094,7 @@ def test_data_integrity_rules_are_in_every_report_prompt():
     "없는 수치를 지어내지 마라"와 "추정치를 밝혀라"는 이 대시보드에서
     타협할 수 없는 규칙이다. 유형이 늘어도 빠지면 안 된다.
     """
-    from services.prompts import REPORT_PROFILES
+    from services.prompts import REPORT_PROFILES, VERDICT_FIELDS
 
     for report_type, profile in REPORT_PROFILES.items():
         prompt = profile["system_prompt"]
@@ -1787,7 +1787,7 @@ def test_prompts_carry_the_rules_the_real_reports_broke():
     assert "스트레스가 커지는 방향" in alerts
 
     strategy = get_report_system_prompt("종합 거시경제 & 수급 전략")
-    assert "총평의 판단과 같은 방향이어야 합니다" in strategy
+    assert "방향을 총평의 판단과 맞추십시오" in strategy
 
 
 def test_level_verdicts_do_not_get_a_direction_arrow():
@@ -1930,3 +1930,116 @@ def test_prompts_ban_invented_weights_and_renamed_sources():
         "핵심 리스크의 발생 조건도 미래형이어야 합니다"
         " (KOSPI 200 선물 신규 숏 & 외국인 ≥ 4,658 — 둘 다 이미 참이었음)"
     )
+
+
+# ==============================================================================
+# 20. 2026-09-15 20:49 리포트(Nemotron-3 Super 120B)에서 나온 결함
+# ==============================================================================
+def test_prompt_instructions_do_not_look_like_output():
+    """
+    [내가 만든 회귀] 직전 라운드에 넣은 규칙을
+
+        "- **총평의 판단과 같은 방향이어야 합니다.** ..."
+
+    처럼 **불릿 + 굵게 + 평서문**으로 썼더니, 출력 한 줄과 생김새가 같아서
+    모델이 그대로 베껴 적었다. 실제 리포트의 대응 전략 첫 줄이
+    "- **총평의 판단과 같은 방향이어야 합니다.** 판단이 중립이므로
+    자산군별 비중은 **유지**한다."였다.
+
+    지시문은 명령형으로 끝나야 출력과 구분된다.
+    """
+    from services.ai_service import get_report_system_prompt, get_report_types
+    from services.prompts import REPORT_PROFILES, VERDICT_FIELDS
+
+    # 유출된 그 문장은 더 이상 프롬프트에 없어야 한다.
+    for report_type in get_report_types():
+        assert "총평의 판단과 같은 방향이어야 합니다" not in (
+            get_report_system_prompt(report_type)
+        ), report_type
+
+    # 굵게로 시작하는 불릿은 특히 출력처럼 보이기 쉬우므로, 명령형
+    # ("~하십시오"/"~마십시오")을 담고 있어야 한다. 총평 서식 템플릿
+    # (- **판단**: ...)은 예외다 — 그것은 출력 모양을 정의하는 줄이고,
+    # 리포트에 그대로 나오는 것이 정상이다.
+    template_labels = tuple(f"- **{name}**" for name in VERDICT_FIELDS.values())
+    for report_type, profile in REPORT_PROFILES.items():
+        for line in profile["system_prompt"].splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- **"):
+                continue
+            if stripped.startswith(template_labels):
+                continue
+            assert "십시오" in stripped, (
+                f"{report_type}: 출력처럼 보이는 지시문 — {stripped!r}"
+            )
+
+
+def test_prompt_leak_is_detected_in_the_body():
+    """
+    프롬프트를 고쳐도 다른 줄에서 같은 일이 생길 수 있다. 화면에서도 잡는다.
+    """
+    from services.ai_service import detect_prompt_leak, get_report_system_prompt
+
+    report_type = "종합 거시경제 & 수급 전략"
+
+    # 현재 프롬프트의 지시문 한 줄을 실제로 골라 베낀다 — 문구가 바뀌어도
+    # 이 테스트는 따라온다.
+    instruction = next(
+        line.strip().lstrip("- ").replace("**", "")
+        for line in get_report_system_prompt(report_type).splitlines()
+        if line.strip().startswith("- ") and len(line.strip()) > 30
+    )
+    leaked = [{"title": "대응 전략", "body": f"- **{instruction}** 그래서 유지한다."}]
+
+    note = detect_prompt_leak(leaked, report_type)
+    assert note is not None, "본문에 섞인 지시문을 잡지 못했습니다"
+    assert "지시문" in note
+
+
+def test_prompt_leak_check_does_not_fire_on_real_reports():
+    """
+    이 검사는 오탐이 나면 못 쓴다. 섹션 제목과 표 머리글은 리포트에 그대로
+    나오는 것이 정상이므로 비교 대상에서 빠져야 한다.
+    """
+    from services.ai_service import detect_prompt_leak
+
+    clean = [
+        {"title": "거시 국면", "body": "금리 상승세가 이어지는 가운데 신용 스프레드는 낮다."},
+        {"title": "핵심 리스크",
+         "body": "| 리스크 | 발생 조건(구체적 수치) | 파급 경로 | 확인 지표 |\n"
+                 "| :--- | :--- | :--- | :--- |\n"
+                 "| 신용 스프레드 급등 | HY OAS > 3.50% (현재 2.65) | 자금 조달 비용 상승 | BAMLH0A0HYM2 |"},
+        {"title": "대응 전략", "body": "- 미국 주식: 축소 (스마트머니 ≤ -70k 시 청산)"},
+    ]
+    assert detect_prompt_leak(clean, "종합 거시경제 & 수급 전략") is None
+    assert detect_prompt_leak([], "종합 거시경제 & 수급 전략") is None
+
+
+def test_hanja_in_the_korean_body_is_flagged():
+    """
+    Nemotron-3가 "WTI가 110달러를突破하면"처럼 한자를 띄어쓰기 없이 붙여
+    썼다. 한국어 리포트에 한자가 섞이면 모델이 언어를 흘린 것이다.
+    """
+    from services.ai_service import detect_foreign_script
+
+    note = detect_foreign_script([
+        {"title": "대응 전략", "body": "- 트리거: WTI가 110달러를突破하면 확대."},
+    ])
+    assert note is not None, "한자를 잡지 못했습니다"
+    assert "突" in note or "破" in note
+
+    # 한글·영문 지표 이름만 있는 정상 본문은 조용해야 한다.
+    assert detect_foreign_script([
+        {"title": "거시 국면", "body": "VIX 17.52, MOVE 109.28 추정치. S&P 500 하락."},
+    ]) is None
+    assert detect_foreign_script([]) is None
+
+
+def test_style_block_bans_hanja_and_quoting_the_instructions():
+    """규칙이 사라지면 같은 결함이 조용히 돌아온다."""
+    from services.ai_service import get_report_system_prompt, get_report_types
+
+    for report_type in get_report_types():
+        prompt = get_report_system_prompt(report_type)
+        assert "지시문의 문장을 리포트에 옮겨 적지 마십시오" in prompt, report_type
+        assert "한자를 쓰지 마십시오" in prompt, report_type

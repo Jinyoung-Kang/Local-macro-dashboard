@@ -759,6 +759,107 @@ def _looks_untranslated(text: str) -> bool:
 _WEIGHT_CLAIM = re.compile(r"비중[^가-힣\n]{0,4}\d+(?:[.,]\d+)?\s*%")
 
 
+# 지시문 한 줄이 본문에 그대로 옮겨졌는지 볼 때 쓰는 길이. 짧게 잡으면
+# "쓰십시오" 같은 흔한 꼬리가 걸리고, 길게 잡으면 앞부분만 베낀 경우를
+# 놓칩니다. 실제 유출(2026-09-15 20:49)은 앞 20자로 잡힙니다.
+_PROMPT_LEAK_PREFIX = 20
+
+# 한자(CJK 통합 한자). 한국어 리포트에 섞이면 모델이 언어를 흘린 것입니다.
+_HANJA = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _instruction_lines(system_prompt: str) -> list:
+    """
+    시스템 프롬프트에서 '본문에 나오면 안 되는' 지시문 줄만 골라냅니다.
+
+    파라미터:
+        system_prompt : get_report_system_prompt()이 돌려준 문자열.
+
+    반환값:
+        비교에 쓸 지시문 조각 리스트(각 _PROMPT_LEAK_PREFIX자).
+
+    주의사항:
+        - 섹션 제목(### 로 시작)과 표 서식 줄(|)은 **뺍니다.** 그것들은
+          리포트에 그대로 나오는 것이 정상입니다.
+        - 불릿과 굵게 표시를 지우고 비교합니다. 모델이 "- **" 를 떼고
+          옮겨 적어도 잡기 위해서입니다.
+    """
+    pieces = []
+    for raw in system_prompt.splitlines():
+        line = raw.strip().lstrip("-*0123456789. ").replace("**", "").strip()
+        if not line or line.startswith("#") or line.startswith("|"):
+            continue
+        if len(line) < _PROMPT_LEAK_PREFIX:
+            continue
+        pieces.append(line[:_PROMPT_LEAK_PREFIX])
+    return pieces
+
+
+def detect_prompt_leak(sections: list, report_type: str) -> str | None:
+    """
+    시스템 프롬프트의 지시문이 리포트 본문에 그대로 나왔는지 검사합니다.
+
+    파라미터:
+        sections    : parse_report_sections()가 돌려준 sections 리스트.
+        report_type : 그 리포트를 만들 때 쓴 유형(프롬프트를 되찾는 데 씁니다).
+
+    반환값:
+        유출이 있으면 설명 문자열, 없으면 None.
+
+    주의사항:
+        - 2026-09-15 20:49 리포트의 대응 전략 첫 줄이 프롬프트의 지시문
+          "**총평의 판단과 같은 방향이어야 합니다.**"를 그대로 옮겨 적고
+          이어서 문장을 완성했습니다. 지시문이 출력 한 줄처럼 생겼던 것이
+          원인이라 프롬프트 쪽을 고쳤지만, 다른 줄에서 또 생길 수 있습니다.
+        - 섹션 제목과 표 머리글은 비교 대상에서 빠집니다. 그것들이 본문에
+          나오는 것은 정상입니다.
+    """
+    body = "\n".join(sec.get("body", "") for sec in (sections or []))
+    if not body.strip():
+        return None
+
+    flat = body.replace("**", "")
+    leaked = sorted({piece for piece in _instruction_lines(
+        get_report_system_prompt(report_type)) if piece in flat})
+    if not leaked:
+        return None
+
+    sample = leaked[0]
+    return (
+        f"본문에 프롬프트 지시문이 그대로 섞여 나왔습니다({len(leaked)}곳, "
+        f"예: \"{sample}…\"). 모델이 지시를 출력의 일부로 착각한 것이며, "
+        "그 문장은 분석 내용이 아닙니다. 해당 줄은 무시하세요."
+    )
+
+
+def detect_foreign_script(sections: list) -> str | None:
+    """
+    한국어 리포트 본문에 한자가 섞였는지 검사합니다.
+
+    파라미터:
+        sections : parse_report_sections()가 돌려준 sections 리스트.
+
+    반환값:
+        한자가 있으면 설명 문자열, 없으면 None.
+
+    주의사항:
+        - Nemotron-3가 "110달러를突破하면"처럼 한자를 붙여 썼습니다
+          (2026-09-15 20:49). 띄어쓰기도 함께 깨져 읽기 어렵습니다.
+        - 한자만 봅니다. 영어 단어가 섞이는 것("financing 조건")은 지표
+          이름과 구분하기 어려워 프롬프트에 맡깁니다.
+    """
+    body = "\n".join(sec.get("body", "") for sec in (sections or []))
+    found = sorted(set(_HANJA.findall(body)))
+    if not found:
+        return None
+
+    return (
+        "본문에 한자가 섞여 있습니다(" + ", ".join(found[:6]) + "). "
+        "모델이 한국어 외 문자를 흘린 것이며, 붙어 있는 문장은 띄어쓰기도 "
+        "깨져 있을 수 있습니다. 다른 엔진으로 다시 생성해 보세요."
+    )
+
+
 def detect_invented_weights(sections: list) -> str | None:
     """
     대응 전략이 포트폴리오 비중을 수치로 지어냈는지 검사합니다.

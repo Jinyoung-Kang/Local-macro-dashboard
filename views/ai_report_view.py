@@ -27,7 +27,9 @@ from services.ai_service import (
     DEFAULT_REPORT_TYPE,
     call_selected_ai_engine,
     check_all_engines,
+    detect_foreign_script,
     detect_invented_weights,
+    detect_prompt_leak,
     detect_verdict_conflict,
     detect_verdict_language_issue,
     extract_report_text,
@@ -351,6 +353,8 @@ def _render_verdict_banner(
           따로 경고합니다. 이 대시보드는 보유 내역을 모릅니다.
         - 총평 항목이 영어로 남아 있으면 캡션으로 알립니다. 본문이
           한국어면 자동 번역 단계를 건너뛰기 때문에 생깁니다.
+        - 프롬프트 지시문이 본문에 섞이거나 한자가 흘러나오면 캡션으로
+          알립니다. 모델이 언어·역할을 흘린 신호입니다.
     """
     judgement = verdict.get("판단")
     if not judgement:
@@ -427,6 +431,15 @@ def _render_verdict_banner(
     language_note = detect_verdict_language_issue(verdict)
     if language_note:
         st.caption(f"🌐 {language_note}")
+
+    # 모델이 지시문을 출력으로 착각했거나 한국어 외 문자를 흘린 경우.
+    # 분석의 옳고 그름과 별개로 "이 줄은 내용이 아니다"를 알려야 합니다.
+    for note in (
+        detect_prompt_leak(sections or [], report_type),
+        detect_foreign_script(sections or []),
+    ):
+        if note:
+            st.caption(f"📝 {note}")
 
     if (verdict.get("신뢰도") or "").strip() == "낮음":
         st.warning(
