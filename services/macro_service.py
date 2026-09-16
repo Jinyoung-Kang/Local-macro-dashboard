@@ -5,7 +5,6 @@ ThreadPoolExecutor 기반 I/O 병렬 처리, 원본 로직 완벽 보존 및 전
 """
 import io
 import logging
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -13,59 +12,40 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
 
-from config import MACRO_CATEGORIES
+# FRED 키 로더는 config.get_fred_key() 하나만 사용합니다.
+# (이 모듈과 liquidity_service에 동일 로직이 중복 정의돼 있었습니다.)
+from config import MACRO_CATEGORIES, get_fred_key
+from services.http_client import get_fred_session
+from services import datasets, store
 
 logger = logging.getLogger(__name__)
-
-# ==============================================================================
-# 0. FRED API Key 안전 로더
-# ==============================================================================
-def get_fred_key() -> str:
-    """
-    Streamlit Secrets에서 FRED API 키를 안전하게 추출.
-    dict, AttrDict, Mapping 등 어떤 타입으로 반환되든 .get()으로 시도하며,
-    isinstance(val, dict) 검사에 의존하지 않음.
-    """
-    try:
-        if hasattr(st, "secrets") and st.secrets:
-            if "fred" in st.secrets:
-                section = st.secrets["fred"]
-
-                key = None
-                try:
-                    key = section.get("api_key")
-                except AttributeError:
-                    pass
-
-                if key:
-                    return str(key).strip()
-
-                if isinstance(section, str):
-                    return section.strip()
-
-            for k in ["FRED_API_KEY", "fred_api_key", "FRED_KEY", "fred_key"]:
-                if k in st.secrets:
-                    return str(st.secrets[k]).strip()
-    except Exception as e:
-        logger.warning(f"FRED 키 로드 중 예외: {e}")
-    return ""
-
 
 # ==============================================================================
 # 1. UI 헬퍼 및 텍스트 레이블 정제기
 # ==============================================================================
 def clean_tag_ui(tag_str: str) -> str:
-    """UI 상에 지표 이름의 마크다운 스타일 태그(:gray[...], [[...]] 등)를 정제"""
+    r"""
+    지표 이름에서 UI 표시용 마크다운 태그를 제거합니다.
+
+    [버그 수정] 기존에는 `:gray\[.*?\]`를 **먼저** 적용했습니다. config의
+    실제 이름은 `달러 인덱스 (DXY) :gray[[실시간]]`처럼 대괄호가 중첩돼
+    있는데, non-greedy `.*?\]`가 **첫 번째** `]`에서 멈춰
+    `:gray[[실시간]` 까지만 지우고 닫는 `]` 하나를 남겼습니다.
+    그 결과 차트 선택 목록에 "달러 인덱스 (DXY) ]" 처럼 표시됐습니다.
+
+    중첩 패턴(`:gray[[...]]`)을 먼저 지운 뒤 단일 패턴을 처리해야 합니다.
+    """
     if not isinstance(tag_str, str):
         return str(tag_str)
-    clean = re.sub(r':gray\[.*?\]', '', tag_str)
-    clean = re.sub(r'\[\[.*?\]\]', '', clean)
-    clean = re.sub(r'\[.*?\]', '', clean)
-    return clean.strip()
+
+    clean = re.sub(r':gray\[\[.*?\]\]', '', tag_str)   # :gray[[...]]  (중첩)
+    clean = re.sub(r':gray\[.*?\]', '', clean)         # :gray[...]
+    clean = re.sub(r'\[\[.*?\]\]', '', clean)          # [[...]]
+    clean = re.sub(r'\[.*?\]', '', clean)              # [...]
+    return re.sub(r'\s{2,}', ' ', clean).strip()
 
 
 def _clean_macro_label(text: str) -> str:
@@ -80,8 +60,7 @@ def _clean_macro_label(text: str) -> str:
 # ==============================================================================
 # 2. yfinance / FRED 데이터 수집 엔진 (DatetimeIndex 보존)
 # ==============================================================================
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
+def collect_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
     """
     yfinance를 통해 티커 시계열 데이터를 수집합니다.
 
@@ -94,6 +73,19 @@ def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
         return None
 
     if symbol in ["^MOVE", "MOVE", "MOVE:INDEX"]:
+        # ----------------------------------------------------------------------
+        # ⚠️ 중요: Yahoo Finance는 ICE BofA MOVE 지수를 제공하지 않습니다.
+        # 아래 값은 실제 MOVE 지수가 아니라, 10년물 금리(^TNX)의 변동성에서
+        # 역산한 **대용(proxy) 추정치**입니다. 실제 MOVE와 수치가 다릅니다.
+        #
+        # 따라서 df.attrs에 is_proxy/source_label을 반드시 심어서, 화면과
+        # AI 리포트가 이 값을 "실제 공식 지표"로 오인하지 않게 합니다.
+        # (MOVE 140 이상 = 채권 발작 같은 임계치 해석을 이 추정치에 그대로
+        #  적용하면 잘못된 투자 판단으로 이어질 수 있습니다.)
+        #
+        # 실제 MOVE 지수가 필요하면 ICE/Bloomberg 등 유료 피드를 연결하고
+        # 이 분기를 제거하세요.
+        # ----------------------------------------------------------------------
         try:
             tnx_tk = yf.Ticker("^TNX")
             tnx_df = tnx_tk.history(period=period if period not in ["1d", "5d"] else "1mo")
@@ -109,11 +101,17 @@ def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
                     proxy_df['High'] = (proxy_df['Close'] * 1.01).round(2)
                     proxy_df['Low'] = (proxy_df['Close'] * 0.99).round(2)
                     proxy_df.attrs["is_intraday"] = False
+                    proxy_df.attrs["is_proxy"] = True
+                    proxy_df.attrs["source_label"] = (
+                        "^TNX 변동성 기반 추정치 (실제 ICE BofA MOVE 아님)"
+                    )
                     return proxy_df
         except Exception as e:
             logger.warning(f"MOVE 프록시 연산 지연: {e}")
 
-        # 비상 Fallback (MOVE 지수 95~110pt 대역 시계열)
+        # 네트워크까지 실패한 경우의 자리표시용 합성 시계열입니다.
+        # 값 자체에 정보가 전혀 없으므로(단순 사인파) is_synthetic으로
+        # 표시해 화면에서 수치를 신뢰하지 않도록 합니다.
         today = datetime.now()
         dates = pd.date_range(end=today, periods=60, freq='B')
         vals = 98.5 + np.sin(np.linspace(0, 10, len(dates))) * 6.5
@@ -125,6 +123,11 @@ def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
             'Volume': 0
         }, index=dates)
         fallback_df.attrs["is_intraday"] = False
+        fallback_df.attrs["is_proxy"] = True
+        fallback_df.attrs["is_synthetic"] = True
+        fallback_df.attrs["source_label"] = (
+            "수집 실패 시 자리표시용 합성 시계열 (실제 시장 데이터 아님)"
+        )
         return fallback_df
 
     try:
@@ -161,9 +164,12 @@ def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
     return None
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = None) -> pd.DataFrame:
-    """FRED 시계열 수집 (DatetimeIndex 인덱스 및 series_id 컬럼명 매핑)"""
+def collect_fred_series(series_id: str, period_years: int = 10, api_key: str = None) -> pd.DataFrame:
+    """
+    FRED 시계열을 실제로 수집합니다 (DatetimeIndex 인덱스, series_id 컬럼명).
+
+    화면은 fetch_fred_series()를 쓰세요. 이 함수는 항상 네트워크를 씁니다.
+    """
     key = api_key or get_fred_key()
     start_date = (datetime.now() - timedelta(days=period_years * 365 + 60)).strftime("%Y-%m-%d")
 
@@ -174,7 +180,7 @@ def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = Non
                 f"series_id={series_id}&api_key={key}&file_type=json"
                 f"&observation_start={start_date}"
             )
-            res = requests.get(url, timeout=10)
+            res = get_fred_session().get(url, timeout=10)
             if res.status_code == 200:
                 data = res.json().get("observations", [])
                 if data:
@@ -194,10 +200,7 @@ def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = Non
 
     try:
         csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        res = requests.get(csv_url, headers=headers, timeout=15)
+        res = get_fred_session().get(csv_url, timeout=15)
         if res.status_code == 200 and len(res.text) > 30:
             raw_df = pd.read_csv(io.StringIO(res.text))
 
@@ -227,6 +230,49 @@ def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = Non
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fred_series(series_id: str, period_years: int = 10, api_key: str = None) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본 우선 + 누적 이력 병합.
+
+    FRED는 과거 조회가 되는 소스지만 저장해 두는 이유가 둘 있습니다.
+      1) API 키가 없거나 FRED가 장애일 때도 화면이 비지 않습니다.
+      2) timeseries 테이블에 누적해 두면, 같은 시리즈를 다른 기간으로
+         요청할 때 이미 받아 둔 구간을 재사용할 수 있습니다.
+    """
+    snap_name = datasets.snap_fred_series(series_id)
+
+    def _collect():
+        df = collect_fred_series(series_id, period_years=period_years, api_key=api_key)
+        # 수집 성공 시에만 누적 테이블에 반영합니다(빈 결과로 덮어쓰지 않음).
+        if df is not None and not df.empty:
+            try:
+                store.put_timeseries(datasets.TS_FRED, series_id, df, value_col=series_id)
+            except Exception as e:
+                logger.warning("FRED 누적 저장 실패 (%s): %s", series_id, e)
+        return df
+
+    df = store.cached_or_live(
+        snap_name,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_DAILY,
+        as_frame=True,
+    )
+
+    if df is not None and not df.empty:
+        return df
+
+    # 스냅샷이 비었더라도 과거에 누적해 둔 이력이 있으면 그것으로 복구합니다.
+    accumulated = store.read_timeseries(
+        datasets.TS_FRED, series_id, value_name=series_id,
+    )
+    if not accumulated.empty:
+        logger.info("%s: 누적 이력 %d행으로 복구했습니다.", series_id, len(accumulated))
+        return accumulated
+
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
     """3M 금융 CP 스프레드 (CPF3M - 3M Treasury) 계산"""
     key = api_key or get_fred_key()
@@ -243,6 +289,66 @@ def fetch_fred_cp_spread(api_key: str = None) -> pd.DataFrame:
 
     logger.error("CP Spread 데이터 합산 실패. 빈 데이터를 반환합니다.")
     return pd.DataFrame()
+
+
+# ==============================================================================
+# 2-0. 저장본 우선 읽기 경로 (변동성 지수만 해당)
+# ==============================================================================
+# ^VIX / ^MOVE는 화면 여러 곳에서 서로 다른 기간으로 요청됩니다. 기간마다
+# 스냅샷을 만들면 저장본이 난립하므로, 가장 긴 기간(5y)으로 한 번만 저장하고
+# 짧은 기간 요청은 꼬리를 잘라 씁니다 (13F에서 q1을 q8에서 유도하는 것과
+# 같은 방식). 덕분에 store_only 모드에서 이 두 심볼은 네트워크를 타지 않습니다.
+_STORE_BACKED_TICKERS = {"^VIX", "^MOVE", "MOVE", "MOVE:INDEX"}
+
+_PERIOD_DAYS = {
+    "1d": 1, "5d": 5, "1mo": 31, "3mo": 92, "6mo": 183,
+    "1y": 366, "2y": 731, "5y": 1827,
+}
+
+
+def _slice_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    """저장된 긴 시계열에서 요청 기간만큼 최근 구간을 잘라 냅니다."""
+    days = _PERIOD_DAYS.get(period)
+    if not days or df is None or df.empty:
+        return df
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    cutoff = df.index.max() - pd.Timedelta(days=days)
+    sliced = df[df.index >= cutoff]
+    out = sliced if len(sliced) >= 2 else df
+    # attrs(is_proxy 등)는 슬라이싱에서 보존되지 않으므로 직접 옮깁니다.
+    out.attrs.update(df.attrs)
+    return out
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ticker_data(symbol: str, period: str = "1mo") -> pd.DataFrame:
+    """
+    화면용 진입점. 변동성 지수는 저장본을 우선 사용하고, 나머지 심볼은
+    기존처럼 직접 수집합니다(티커가 많아 전부 저장할 이유가 없습니다).
+    """
+    if symbol not in _STORE_BACKED_TICKERS:
+        return collect_ticker_data(symbol, period)
+
+    store_period = datasets.VOLATILITY_STORE_PERIOD
+    snap_name = datasets.snap_ticker_history(symbol, store_period)
+
+    def _collect():
+        return collect_ticker_data(symbol, store_period)
+
+    full = store.cached_or_live(
+        snap_name,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_DAILY,
+        as_frame=True,
+    )
+
+    if full is None or (isinstance(full, pd.DataFrame) and full.empty):
+        # 저장본도 없고 수집도 실패 → 요청 기간 그대로 한 번 더 시도
+        return collect_ticker_data(symbol, period)
+
+    return _slice_period(full, period)
 
 
 # ==============================================================================
@@ -290,7 +396,19 @@ def _apply_bond_scanner_override(
         return collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev
 
     try:
-        scraper_result = get_scraped_macro_markets()
+        # [성능] 수집기(live_only 모드)에서는 scraper_markets 태스크가 방금
+        # 같은 데이터를 받아 저장해 뒀습니다. 여기서 래퍼를 그대로 부르면
+        # 같은 실행 안에서 외부 스크래핑이 두 번 일어납니다(요청 20여 건 낭비).
+        # 갓 저장된 스냅샷이 있으면 그것을 씁니다.
+        scraper_result = None
+        snap = store.read_snapshot(datasets.SNAP_SCRAPER_MARKETS)
+        if snap is not None and snap.is_fresh(300) and snap.payload:
+            scraper_result = snap.payload
+            logger.debug("국채 보정: 방금 저장된 스크래핑 스냅샷을 재사용합니다.")
+
+        if not scraper_result:
+            scraper_result = get_scraped_macro_markets()
+
         scraper_items = {
             item.get("key"): item
             for item in scraper_result.get("items", [])
@@ -327,6 +445,19 @@ def _apply_bond_scanner_override(
             item["price_str"] = f"{price:,.3f}"
             item["status"] = "ok"
             item["source"] = scraped.get("provider", "TradingView Scanner")
+            # Scanner 응답에는 체결 시각이 없으므로 "수집 시각"임을 밝혀 둡니다.
+            item["last_ts"] = (
+                datetime.now(ZoneInfo("Asia/Seoul")).strftime("%H:%M:%S KST")
+                + " (TradingView 수집 시각)"
+            )
+
+            prev_source = "TradingView"
+            if previous_close is None or float(previous_close) == 0:
+                # 스크래핑이 전일값을 못 주면 FRED 공식 확정치로 보완합니다.
+                fred_prev = get_bond_previous_close_from_fred(scraper_key)
+                if fred_prev is not None:
+                    previous_close = fred_prev
+                    prev_source = "FRED 공식 확정치"
 
             if previous_close is not None and float(previous_close) != 0:
                 previous_close = float(previous_close)
@@ -336,10 +467,10 @@ def _apply_bond_scanner_override(
                 item["pct"] = pct
                 item["prev_str"] = f"{previous_close:,.3f}"
                 item["delta_str"] = f"{delta:+,.3f} ({pct:+.2f}%)"
+                item["prev_source"] = prev_source
             else:
-                # Scanner는 현재 최신 수익률만 신뢰도 있게 제공하므로,
-                # 전일 종가가 없을 때 "변화 없음(0.00%)"으로 위장하지 않고
-                # 명시적으로 N/A 처리합니다.
+                # 어느 출처도 전일값을 주지 못하면 "변화 없음(0.00%)"으로
+                # 위장하지 않고 명시적으로 N/A 처리합니다.
                 item["delta"] = None
                 item["pct"] = None
                 item["prev_str"] = "N/A"
@@ -356,10 +487,128 @@ def _apply_bond_scanner_override(
 
 
 # ==============================================================================
+# 2-2. 미국채 전일 종가 폴백 (FRED 공식 일별)
+# ==============================================================================
+# TradingView bonds scanner는 현재 수익률만 주고, Symbol Scanner·HTML 파서도
+# 전일 종가를 못 주는 경우가 있습니다. 그 결과 미국채 카드가 계속
+# "전일 종가 N/A · 전일 대비 미제공"으로 표시됐습니다.
+#
+# FRED의 DGS2/DGS10/DGS30은 미 재무부 Constant Maturity 공식 일별 확정치라,
+# **직전 영업일 값이 곧 전일 종가**입니다. 수집기가 이미 이 시리즈를 적재해
+# 두므로 추가 네트워크 비용도 없습니다.
+#
+# 주의: 현재가(TradingView 실시간)와 전일값(FRED 확정치)은 출처가 다릅니다.
+# 이 사실을 item["prev_source"]에 남겨 화면이 밝힐 수 있게 합니다.
+BOND_FRED_FALLBACK = {
+    "us02y": "DGS2",
+    "us10y": "DGS10",
+    "us30y": "DGS30",
+}
+
+
+def get_bond_previous_close_from_fred(scraper_key: str) -> float | None:
+    """
+    FRED 공식 일별 시계열에서 해당 만기의 '직전 영업일' 수익률을 반환합니다.
+
+    FRED는 하루 지연 발표이므로 시리즈의 마지막 값이 곧 직전 거래일
+    확정치입니다.
+    """
+    series_id = BOND_FRED_FALLBACK.get(scraper_key)
+    if not series_id:
+        return None
+
+    try:
+        df = fetch_fred_series(series_id, period_years=1)
+    except Exception as e:
+        logger.warning("미국채 전일값 FRED 조회 실패 (%s): %s", series_id, e)
+        return None
+
+    if df is None or df.empty or series_id not in df.columns:
+        return None
+
+    values = df[series_id].dropna()
+    if values.empty:
+        return None
+
+    last = float(values.iloc[-1])
+    return last if last > 0 else None
+
+
+# ==============================================================================
+# 2-3. 분봉이 전일 대비를 못 줄 때의 일봉 폴백
+# ==============================================================================
+# 카드 수치는 period="5d"의 **1분봉**에서 나옵니다. 주말·휴장·비유동 시간대
+# 에는 분봉 피드가 마지막 봉을 그대로 반복해서 내려주는 경우가 있고, 그러면
+# 마지막 두 봉의 종가가 완전히 같아집니다. 이때 "변화 없음(0.00%)"으로
+# 표시하면 거짓이므로 delta를 N/A로 두는데, 그 과정에서 **전일 종가까지
+# 같이 N/A**가 돼 버렸습니다(엔/원 100엔당 카드에서 사용자가 신고한 증상).
+#
+# 분봉의 직전 봉이 쓸모없을 뿐, 일봉에는 직전 거래일 종가가 그대로 있습니다.
+# 미국채에서 FRED 확정치로 전일값을 보완한 것과 같은 방식입니다.
+def get_previous_close_from_daily(
+    symbol: str,
+    current_ts=None,
+) -> float | None:
+    """
+    일봉에서 '현재가가 속한 거래일보다 앞선' 마지막 종가를 반환합니다.
+
+    current_ts를 주면 그 날짜보다 이전 거래일의 종가만 고릅니다. 주지 않으면
+    일봉의 끝에서 두 번째 값을 씁니다.
+
+    반환값은 yfinance 원본 스케일입니다. 표시 배율(엔/원 ×100 등)은
+    호출자가 현재가와 동일하게 적용해야 합니다.
+    """
+    if not symbol:
+        return None
+
+    try:
+        df = fetch_ticker_data(symbol, period="1mo")
+    except Exception as e:
+        logger.warning("일봉 전일 종가 조회 실패 (%s): %s", symbol, e)
+        return None
+
+    if df is None or not isinstance(df, pd.DataFrame) or "Close" not in df:
+        return None
+
+    closes = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    closes = closes[closes > 0]
+    if closes.empty:
+        return None
+
+    if current_ts is not None:
+        try:
+            index = pd.DatetimeIndex(closes.index)
+            if index.tz is not None:
+                index = index.tz_localize(None)
+
+            cur = pd.Timestamp(current_ts)
+            if cur.tzinfo is not None:
+                cur = cur.tz_localize(None)
+
+            earlier = closes[index.normalize() < cur.normalize()]
+            if not earlier.empty:
+                return float(earlier.iloc[-1])
+        except Exception as e:
+            logger.debug("일봉 거래일 비교 실패 (%s): %s", symbol, e)
+
+    if len(closes) >= 2:
+        return float(closes.iloc[-2])
+
+    return None
+
+
+# ==============================================================================
 # 3. 실시간 매크로 전 지표 수집 및 텍스트 브리핑 생성
 # ==============================================================================
-@st.cache_data(ttl=30, show_spinner=False)
-def get_collected_macro_data():
+def collect_macro_data():
+    """
+    매크로 전 지표를 실제로 수집합니다 (항상 네트워크를 씁니다).
+
+    화면에서 직접 부르지 마세요. 화면은 저장본을 우선 읽는
+    get_collected_macro_data()를 쓰고, 이 함수는 collector.py가 호출합니다.
+
+    반환: (collected, rate_10y_curr, rate_10y_prev, rate_2y_curr, rate_2y_prev)
+    """
     collected = {}
     rate_10y_curr, rate_10y_prev = None, None
     rate_2y_curr, rate_2y_prev = None, None
@@ -384,16 +633,33 @@ def get_collected_macro_data():
         for name, ticker in items.items():
             _, df = raw.get(cat_name, {}).get(name, (ticker, None))
             if df is not None and isinstance(df, pd.DataFrame) and len(df) >= 2:
-                curr = float(df['Close'].iloc[-1])
-                prev = float(df['Close'].iloc[-2])
-                if "JPY/KRW" in name and curr < 50:
-                    curr, prev = curr * 100, prev * 100
+                raw_curr = float(df['Close'].iloc[-1])
+                raw_prev = float(df['Close'].iloc[-2])
+
+                # 야후의 JPYKRW=X는 '1엔당 원'이라 화면 표기 단위(100엔당)와
+                # 다릅니다. 배율은 원본 현재가로 한 번만 판정하고 현재가·
+                # 전일값에 똑같이 적용합니다. (전일값을 스케일 적용 후의
+                # 현재가로 판정하면 배율이 빠져 100배 틀어집니다.)
+                scale = 100.0 if ("JPY/KRW" in name and raw_curr < 50) else 1.0
+                curr = raw_curr * scale
+                prev = raw_prev * scale
+
+                prev_source = None
 
                 # [수정] 최근 2개 봉의 종가가 완전히 동일하면(휴장·야간시간대에
-                # 마지막 봉이 그대로 복제되는 경우 포함), 등락률을
-                # "변화 없음(0.00%)"으로 위장하지 않고 신뢰할 수 없는 값으로
-                # 간주해 N/A 처리합니다. 실제 무변동인지, 데이터 정체인지
-                # 구분할 수 없기 때문입니다.
+                # 마지막 봉이 그대로 복제되는 경우 포함) 분봉으로는 전일 대비를
+                # 알 수 없습니다. 예전에는 여기서 끝내 버려 전일 종가까지
+                # N/A로 사라졌는데, 일봉에는 직전 거래일 종가가 남아 있으므로
+                # 그걸로 보완합니다. 그래도 못 구하면 "변화 없음(0.00%)"으로
+                # 위장하지 않고 N/A로 둡니다.
+                if curr == prev:
+                    daily_prev = get_previous_close_from_daily(
+                        ticker, df.index[-1],
+                    )
+                    if daily_prev is not None and daily_prev * scale != curr:
+                        prev = daily_prev * scale
+                        prev_source = "일봉 직전 거래일 종가"
+
                 if curr == prev:
                     delta = None
                     pct = None
@@ -430,7 +696,11 @@ def get_collected_macro_data():
                     if delta is not None and pct is not None
                     else "N/A"
                 )
-                collected[cat_name].append({
+                # delta가 None이라는 것은 곧 "직전 봉이 현재 봉과 같아서
+                # 전일 종가로 쓸 수 없다"는 뜻입니다. 그 값을 "전일 종가"라고
+                # 이름 붙여 보여 주면 오히려 거짓말이 되므로 N/A로 둡니다.
+                # 진짜 전일 종가는 위의 일봉 폴백에서 채워집니다.
+                item_out = {
                     "name": name,
                     "price": curr,
                     "delta": delta,
@@ -440,14 +710,19 @@ def get_collected_macro_data():
                     "prev_str": f"{prev:,.2f}" if delta is not None else "N/A",
                     "status": "ok",
                     "last_ts": last_ts_str,
-                })
+                }
+                if prev_source:
+                    item_out["prev_source"] = prev_source
+                collected[cat_name].append(item_out)
                 if ticker == "^TNX":
                     rate_10y_curr, rate_10y_prev = curr, (prev if delta is not None else None)
                 elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
                     rate_2y_curr, rate_2y_prev = curr, (prev if delta is not None else None)
 
             elif df is not None and isinstance(df, pd.DataFrame) and len(df) == 1:
-                curr = float(df['Close'].iloc[-1])
+                raw_curr = float(df['Close'].iloc[-1])
+                scale = 100.0 if ("JPY/KRW" in name and raw_curr < 50) else 1.0
+                curr = raw_curr * scale
 
                 last_timestamp = df.index[-1]
                 is_intraday = bool(df.attrs.get("is_intraday", False))
@@ -469,24 +744,55 @@ def get_collected_macro_data():
                 except Exception:
                     last_ts_str = "N/A"
 
-                # [수정] 데이터가 1개뿐이면 직전값을 알 수 없으므로, curr를
+                # 봉이 하나뿐이면 분봉만으로는 직전값을 알 수 없습니다.
+                # 위의 정체된 분봉과 원인이 같으므로(얇은 피드) 같은 방식으로
+                # 일봉에서 직전 거래일 종가를 찾아봅니다. 못 찾으면 curr를
                 # prev처럼 위장해 "변화 없음(0.00%)"으로 표시하지 않고
                 # delta/pct를 명시적으로 None(N/A)으로 남깁니다.
-                collected[cat_name].append({
-                    "name": name,
-                    "price": curr,
-                    "delta": None,
-                    "pct": None,
-                    "price_str": f"{curr:,.2f}",
-                    "delta_str": "N/A",
-                    "prev_str": "N/A",
-                    "status": "single",
-                    "last_ts": last_ts_str,
-                })
+                daily_prev = get_previous_close_from_daily(
+                    ticker, last_timestamp,
+                )
+                prev_single = (
+                    daily_prev * scale if daily_prev is not None else None
+                )
+
+                if prev_single is not None and prev_single != curr:
+                    delta = curr - prev_single
+                    pct = (delta / prev_single) * 100 if prev_single != 0 else 0.0
+                    collected[cat_name].append({
+                        "name": name,
+                        "price": curr,
+                        "delta": delta,
+                        "pct": pct,
+                        "price_str": f"{curr:,.2f}",
+                        "delta_str": f"{delta:+,.2f} ({pct:+.2f}%)",
+                        "prev_str": f"{prev_single:,.2f}",
+                        "prev_source": "일봉 직전 거래일 종가",
+                        "status": "ok",
+                        "last_ts": last_ts_str,
+                    })
+                else:
+                    delta = None
+                    collected[cat_name].append({
+                        "name": name,
+                        "price": curr,
+                        "delta": None,
+                        "pct": None,
+                        "price_str": f"{curr:,.2f}",
+                        "delta_str": "N/A",
+                        "prev_str": "N/A",
+                        "status": "single",
+                        "last_ts": last_ts_str,
+                    })
+
                 if ticker == "^TNX":
-                    rate_10y_curr, rate_10y_prev = curr, None
+                    rate_10y_curr, rate_10y_prev = curr, (
+                        prev_single if delta is not None else None
+                    )
                 elif ticker in ["2YY=F", "^IRX", "ZT=F"]:
-                    rate_2y_curr, rate_2y_prev = curr, None
+                    rate_2y_curr, rate_2y_prev = curr, (
+                        prev_single if delta is not None else None
+                    )
             else:
                 collected[cat_name].append({"name": name, "status": "fail"})
 
@@ -571,6 +877,43 @@ def get_collected_macro_data():
 
 
 # ==============================================================================
+# 3-1. 저장본 우선 읽기 경로
+# ==============================================================================
+def _macro_payload_is_usable(payload) -> bool:
+    """저장본이 화면에서 쓸 수 있는 형태인지 확인합니다."""
+    return (
+        isinstance(payload, (list, tuple))
+        and len(payload) == 5
+        and isinstance(payload[0], dict)
+        and len(payload[0]) > 0
+    )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_collected_macro_data():
+    """
+    화면용 진입점. SQLite 저장본이 신선하면 그것을 쓰고, 오래됐으면
+    직접 수집한 뒤 저장합니다.
+
+    [주의] 저장본은 JSON을 거치므로 튜플이 리스트로 돌아옵니다.
+    호출부가 5개 값으로 언패킹하므로 반드시 튜플로 되돌려 줍니다.
+    """
+    payload = store.cached_or_live(
+        datasets.SNAP_MACRO_COLLECTED,
+        collect_macro_data,
+        max_age_seconds=datasets.MAX_AGE_REALTIME,
+    )
+
+    if not _macro_payload_is_usable(payload):
+        # 저장본도 없고 수집도 실패한 경우. 호출부가 빈 dict를 보고
+        # "데이터 수집 실패"를 표시할 수 있도록 형태만 맞춰 돌려줍니다.
+        return {}, None, None, None, None
+
+    collected, r10c, r10p, r2c, r2p = payload
+    return collected, r10c, r10p, r2c, r2p
+
+
+# ==============================================================================
 # 4. 리스크 지표 요약 헬퍼 및 전체 매크로 원본 텍스트 생성기
 # ==============================================================================
 def summarize_series_for_ai(df: pd.DataFrame, value_col: str = None, label: str = "") -> str:
@@ -592,10 +935,18 @@ def summarize_series_for_ai(df: pd.DataFrame, value_col: str = None, label: str 
         change = current - previous
         percentile = float(series.rank(pct=True).iloc[-1] * 100)
 
+        # 대용(proxy)/합성 시계열은 AI가 공식 지표로 오인하지 않도록
+        # 요약 문장 자체에 출처 경고를 붙입니다.
+        caveat = ""
+        if df.attrs.get("is_proxy") or df.attrs.get("is_synthetic"):
+            source_label = df.attrs.get("source_label", "추정치")
+            caveat = f" ⚠️ 주의: 공식 지표가 아닌 추정치입니다 — {source_label}"
+
         return (
             f"- {label}: {current:,.2f} "
             f"(직전 대비 {change:+,.2f}, "
             f"최근 표본 내 백분위 {percentile:.1f}%)"
+            f"{caveat}"
         )
     except Exception as e:
         return f"- {label}: 요약 실패 ({str(e)})"

@@ -12,7 +12,6 @@ from datetime import datetime
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import pytz
 import streamlit as st
 import yfinance as yf
 from services.liquidity_service import get_fed_liquidity_data
@@ -36,8 +35,6 @@ def fetch_overlay_index_data(ticker: str, start_date: str) -> pd.DataFrame:
 
 
 def render_liquidity_view():
-    now = datetime.now(pytz.timezone('Asia/Seoul'))
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S KST")
 
     st.markdown("""
     <div style="padding: 4px 0 12px 0;">
@@ -240,7 +237,7 @@ def render_liquidity_view():
                     tickfont=dict(color="#FF9F43")
                 )
 
-                st.plotly_chart(fig_overlay, use_container_width=True)
+                st.plotly_chart(fig_overlay, width="stretch")
             else:
                 st.warning("비교 지수와 순유동성 시계열 일치 데이터가 부족합니다.")
         else:
@@ -274,7 +271,7 @@ def render_liquidity_view():
             margin=dict(l=20, r=20, t=50, b=20),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        st.plotly_chart(fig_comp, use_container_width=True)
+        st.plotly_chart(fig_comp, width="stretch")
 
     # --------------------------------------------------------------------------
     # TAB 3: 작동 원리 가이드

@@ -11,10 +11,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
-import requests
+# 공용 커넥션 풀 세션을 사용해 요청마다 TCP/TLS 핸드셰이크를
+# 반복하지 않습니다 (services/http_client.py).
+from services.http_client import get_session
 import streamlit as st
 import yfinance as yf
 from config import get_krx_key, KRX_BASE_URL
+from services import datasets, store
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ def fetch_krx_derivatives_daily(date_str: str) -> pd.DataFrame:
     params = {"basDd": date_str}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=8)
+        response = get_session().get(url, headers=headers, params=params, timeout=8)
         if response.status_code == 200:
             data = response.json()
             if isinstance(data, dict):
@@ -60,7 +63,7 @@ def fetch_krx_derivatives_daily(date_str: str) -> pd.DataFrame:
 # 2. KRX Open API 지수 엔드포인트로 코스피200 현물 지수 조회
 # ==============================================================================
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_kospi200_index_close(date_str: str) -> float:
+def fetch_kospi200_index_close(date_str: str) -> float | None:
     """
     KRX Open API 지수 서비스(idx/kospi_dd_trd)로 코스피200 현물 지수
     종가를 조회합니다. pykrx 웹 스크래핑 대신 정식 AUTH_KEY 기반
@@ -78,7 +81,7 @@ def fetch_kospi200_index_close(date_str: str) -> float:
     params = {"basDd": date_str}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=8)
+        response = get_session().get(url, headers=headers, params=params, timeout=8)
         if response.status_code != 200:
             return None
 
@@ -115,8 +118,7 @@ def fetch_kospi200_index_close(date_str: str) -> float:
 # ==============================================================================
 # 3. 최근 N영업일 파생 시계열 수집 및 동기화 (NaN 결측치 완벽 방어)
 # ==============================================================================
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
+def collect_krx_futures_history(days: int = 40) -> pd.DataFrame:
     """
     최근 N영업일 동안의 KOSPI 200 선물 최근월물 종가, 거래량, 미결제약정 시계열을 수집.
     미확정/야간 데이터는 자동으로 직전 영업일 마감 확정치로 정제.
@@ -174,10 +176,23 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
         if close_val <= 0:
             return None
 
-        return {            
+        # [버그 수정] 예전에는 FLUC_RT가 없거나 파싱에 실패하면 safe_float이
+        # **0.0**을 돌려줬습니다. 그 0.0이 그대로 등락률로 쓰여 화면이 매일
+        # "+0.00%"를 보여줬고, 더 나쁜 것은 4대 국면 판정의 `p_up = 등락률 >= 0`
+        # 이 항상 True가 돼 **하락한 날에도 '신규 롱'(강세)으로 뒤집혀** 표시된
+        # 점입니다. 없으면 없다고(NaN) 두고, 아래에서 종가로 직접 계산합니다.
+        reported_pct = None
+        for field in ("FLUC_RT", "FLUC_RATE", "CMPPREVDD_RT"):
+            if field in row.index and str(row.get(field)).strip() not in ("", "nan"):
+                reported_pct = safe_float(row.get(field))
+                break
+
+        return {
             "Date": pd.to_datetime(d_str, format="%Y%m%d"),
             "Futures_Close": close_val,
-            "Change_Pct": safe_float(row.get("FLUC_RT", 0)),
+            "Change_Pct_Reported": (
+                np.nan if reported_pct is None else reported_pct
+            ),
             "Volume": safe_float(row.get("ACC_TRDVOL", row.get("TRDVOL", 0))),
             "Open_Interest": safe_float(row.get("ACC_OPNINT_QTY", row.get("OPNINT_QTY", 0))),
             "Contract_Name": str(row.get(name_col, "KOSPI 200 선물")),
@@ -240,7 +255,7 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
         records.append({
             "Date": rec["Date"],
             "Futures_Close": rec["Futures_Close"],
-            "Change_Pct": rec["Change_Pct"],
+            "Change_Pct_Reported": rec["Change_Pct_Reported"],
             "Volume": rec["Volume"],
             "Open_Interest": rec["Open_Interest"],
             "Theory_Price": theo_val,
@@ -265,10 +280,59 @@ def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
     # 미결제약정 증감
     df_hist["OI_Change"] = df_hist["Open_Interest"].diff().fillna(0)
 
+    # ----------------------------------------------------------------------
+    # 등락률: 연속된 확정 종가에서 직접 계산합니다.
+    #
+    # KRX 응답의 FLUC_RT를 그대로 믿지 않는 이유가 있습니다. 그 필드가 오지
+    # 않을 때 예전 코드는 0.0으로 메웠고, 화면은 매일 "+0.00%"를 보여줬습니다.
+    # 실제로 2026-09-10 → 09-11에 선물은 1,112.00 → 1,088.30으로 -2.13%
+    # 움직였는데 화면은 +0.00%였습니다.
+    #
+    # 종가 시계열은 KIS Open API와 소수점까지 일치하는 것이 교차 검증으로
+    # 확인됐으므로, 종가에서 계산한 등락률이 가장 신뢰할 수 있습니다.
+    # KRX가 준 값은 Change_Pct_Reported로 남겨 두어 대조에 씁니다.
+    # ----------------------------------------------------------------------
+    df_hist["Change_Pct"] = (
+        df_hist["Futures_Close"].pct_change() * 100.0
+    ).round(4)
+
+    if "Change_Pct_Reported" not in df_hist.columns:
+        df_hist["Change_Pct_Reported"] = np.nan
+
+    # 첫 행은 직전 종가가 없으므로 KRX가 준 값이 있으면 그것을 씁니다.
+    first_idx = df_hist.index[0]
+    if pd.isna(df_hist.at[first_idx, "Change_Pct"]):
+        df_hist.at[first_idx, "Change_Pct"] = df_hist.at[
+            first_idx, "Change_Pct_Reported"
+        ]
+
+    # KRX 보고값과 계산값이 크게 다르면 로그로 남깁니다(둘 중 하나가 이상함).
+    both = df_hist.dropna(subset=["Change_Pct", "Change_Pct_Reported"])
+    if not both.empty:
+        gap = (both["Change_Pct"] - both["Change_Pct_Reported"]).abs()
+        if (gap > 0.5).any():
+            logger.warning(
+                "KRX 등락률(FLUC_RT)과 종가 기반 계산값이 %d일에서 0.5%%p 넘게 "
+                "다릅니다. 화면은 종가 기반 계산값을 씁니다.",
+                int((gap > 0.5).sum()),
+            )
+
+    # ----------------------------------------------------------------------
     # 4대 국면 판별
+    #
+    # [버그 수정] 예전에는 `p_up = 등락률 >= 0`이었습니다. 등락률이 결측일 때
+    # 0.0으로 메워지면 이 식이 **항상 True**가 되어, 하락한 날에도 '신규 롱'
+    # (강세 신호)으로 뒤집혀 표시됐습니다. 모르면 모른다고 해야 합니다.
+    # ----------------------------------------------------------------------
     def diagnose_phase(row):
-        p_up = row["Change_Pct"] >= 0
-        oi_up = row["OI_Change"] >= 0
+        chg = row["Change_Pct"]
+        oi_delta = row["OI_Change"]
+
+        if pd.isna(chg) or pd.isna(oi_delta):
+            return "판정 불가 (등락률 미제공)"
+
+        p_up = chg >= 0
+        oi_up = oi_delta >= 0
         if p_up and oi_up:
             return "신규 롱 (Long Accumulation)"
         elif p_up and not oi_up:
@@ -330,7 +394,12 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
             scale_factor = 0.01 if last_close > 1000 else 1.0
 
             df["Futures_Close"] = (df["Close"] * scale_factor).round(2)
-            df["Change_Pct"] = df["Futures_Close"].pct_change().fillna(0.0).round(2) * 100.0
+            # 첫 행은 직전 종가가 없어 등락률을 알 수 없습니다. 0.0으로 메우면
+            # 국면 판정이 '상승'으로 기울므로 NaN으로 둡니다.
+            df["Change_Pct"] = (
+                df["Futures_Close"].pct_change() * 100.0
+            ).round(4)
+            df["Change_Pct_Reported"] = np.nan
 
             vol = df["Volume"] if "Volume" in df.columns else 150000
             df["Volume"] = pd.to_numeric(vol, errors='coerce').fillna(150000).replace(0, 150000).astype(int)
@@ -344,6 +413,8 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
             df["Contract_Name"] = "KOSPI 200 최근월물 (프록시 추정 모드)"
 
             def diagnose_phase(row):
+                if pd.isna(row["Change_Pct"]) or pd.isna(row["OI_Change"]):
+                    return "판정 불가 (등락률 미제공)"
                 p_up = row["Change_Pct"] >= 0
                 oi_up = row["OI_Change"] >= 0
                 if p_up and oi_up:
@@ -369,7 +440,8 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
             df["is_estimated"] = True
 
             return df[[
-                "Date", "Futures_Close", "Change_Pct", "Volume", "Open_Interest",
+                "Date", "Futures_Close", "Change_Pct", "Change_Pct_Reported",
+                "Volume", "Open_Interest",
                 "OI_Change", "Theory_Price", "Market_Basis", "Contract_Name",
                 "Market_Phase", "COT_OI_Index", "is_estimated"
             ]]
@@ -381,17 +453,74 @@ def _generate_fallback_derivatives_data(days: int) -> pd.DataFrame:
     return pd.DataFrame({
         "Date": dates,
         "Futures_Close": [365.0 + (i * 0.2) for i in range(days)],
-        "Change_Pct": [0.20] * days,
+        "Change_Pct": [np.nan] * days,
+        "Change_Pct_Reported": [np.nan] * days,
         "Volume": [150000] * days,
         "Open_Interest": [280000 + (i * 150) for i in range(days)],
         "OI_Change": [150] * days,
         "Theory_Price": [365.5 + (i * 0.2) for i in range(days)],
         "Market_Basis": [0.75] * days,
         "Contract_Name": "KOSPI 200 최근월물 (프록시 추정 모드)",
-        "Market_Phase": ["신규 롱 (Long Accumulation)"] * days,
+        "Market_Phase": ["판정 불가 (등락률 미제공)"] * days,
         "COT_OI_Index": [55.0] * days,
         "is_estimated": [True] * days,
     })
+
+
+def _is_estimated_frame(df: pd.DataFrame) -> bool:
+    """
+    DataFrame이 추정치(Fallback)인지 판정합니다.
+
+    추정치를 누적 이력 테이블에 쓰면 나중에 실제 확정치와 섞여 구분이
+    불가능해지므로, 누적 저장 전에 반드시 이 검사를 통과해야 합니다.
+    """
+    if df is None or df.empty or "is_estimated" not in df.columns:
+        return False
+    return bool(df["is_estimated"].any())
+
+
+# ==============================================================================
+# 3-1. 저장본 우선 읽기 경로
+# ==============================================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_krx_futures_history(days: int = 40) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본 우선 + 누적 이력 병합.
+
+    KRX Open API는 날짜별 조회가 가능하지만, 이 함수는 최근 N영업일을
+    매번 다시 긁습니다(요청 수십 건). 저장해 두면 그 왕복이 사라지고,
+    동시에 과거 확정치가 로컬에 축적됩니다.
+    """
+    def _collect():
+        df = collect_krx_futures_history(days)
+        if df is not None and not df.empty and not _is_estimated_frame(df):
+            # ⚠️ 추정치(is_estimated=True)는 누적 테이블에 절대 넣지 않습니다.
+            # 한 번 섞이면 나중에 실제 확정치와 구분할 수 없게 됩니다.
+            try:
+                indexed = df.set_index("Date") if "Date" in df.columns else df
+                store.put_frame_as_timeseries(datasets.TS_KRX_FUTURES, indexed)
+            except Exception as e:
+                logger.warning("KRX 선물 누적 저장 실패: %s", e)
+        return df
+
+    df = store.cached_or_live(
+        datasets.SNAP_KRX_FUTURES,
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_DAILY,
+        as_frame=True,
+        # views/krx_cot_view.py가 직접 인덱싱하는 컬럼들. 예전 버전이 저장한
+        # 스냅샷에 이 컬럼이 없으면 KeyError로 화면이 죽으므로, 저장본을
+        # 버리고 다시 수집하게 합니다.
+        required_columns=(
+            "Date", "Futures_Close", "Market_Basis",
+            "Open_Interest", "Volume", "is_estimated",
+            # 등락률을 종가에서 직접 계산하도록 바뀌기 전의 저장본에는
+            # 이 컬럼이 없습니다. 그 저장본은 등락률이 전부 0.00%라
+            # 국면 판정이 뒤집혀 있으므로 버리고 다시 수집해야 합니다.
+            "Change_Pct_Reported",
+        ),
+    )
+    return df if df is not None else pd.DataFrame()
 
 
 # ==============================================================================
@@ -416,18 +545,18 @@ DAUM_FUTURES_CATEGORY_MAP = [
 ]
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_daum_futures_investor_trend(
+def collect_daum_futures_investor_trend(
     lookback_days: int = 25,
-    measure: str = "CONTRACT",
 ) -> pd.DataFrame:
     """
     Daum 금융 '투자주체별 매매동향(선물)' 내부 JSON API에서
-    KOSPI 200 선물의 투자자별 일자별 순매수 데이터를 가져옵니다.
+    KOSPI 200 선물의 투자자별 일자별 순매수 **계약수**를 가져옵니다.
 
-    measure:
-    - CONTRACT: 계약수 기준 (기본값)
-    - PRICE: 금액 기준. Daum 원 단위 응답을 억 원 단위로 변환합니다.
+    [제거된 기능] 예전에는 measure="PRICE"로 금액(억원) 기준을 요청할 수
+    있었습니다. 그러나 이 엔드포인트는 금액을 제공하지 않습니다. type=PRICE를
+    붙여도 응답은 계약수 그대로였고(응답 필드도 *Settlement 계약수 필드가
+    전부입니다), 그 값을 1억으로 나누는 바람에 화면의 모든 금액이 0.0으로
+    표시됐습니다. 확인할 수 없는 모드를 유지하는 대신 계약수만 다룹니다.
 
     반환 컬럼:
     - 투자 주체
@@ -436,19 +565,9 @@ def fetch_daum_futures_investor_trend(
     - 20일 누적
     - 포지션 성향
     - is_placeholder
-    - data_measure
-    - data_unit
+    - data_measure ("CONTRACT" 고정)
+    - data_unit    ("계약" 고정)
     """
-    valid_measures = {"CONTRACT", "PRICE"}
-    measure = str(measure).upper().strip()
-
-    if measure not in valid_measures:
-        logger.warning(
-            "Daum 선물 수급 지원하지 않는 measure=%s. CONTRACT로 변경합니다.",
-            measure,
-        )
-        measure = "CONTRACT"
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -468,13 +587,8 @@ def fetch_daum_futures_investor_trend(
         "pagination": "true",
     }
 
-    # Daum API는 계약수 모드일 때 type 파라미터가 없고,
-    # 금액 모드일 때만 type=PRICE를 사용합니다.
-    if measure == "PRICE":
-        params["type"] = "PRICE"
-
     try:
-        response = requests.get(
+        response = get_session().get(
             DAUM_FUTURES_INVESTOR_URL,
             headers=headers,
             params=params,
@@ -483,9 +597,7 @@ def fetch_daum_futures_investor_trend(
 
         if response.status_code != 200:
             logger.warning(
-                "Daum 선물 투자주체별 매매동향 API HTTP 실패: "
-                "measure=%s, status=%s",
-                measure,
+                "Daum 선물 투자주체별 매매동향 API HTTP 실패: status=%s",
                 response.status_code,
             )
             return pd.DataFrame()
@@ -495,8 +607,8 @@ def fetch_daum_futures_investor_trend(
 
         if not isinstance(rows, list) or not rows:
             logger.warning(
-                "Daum 선물 투자주체별 매매동향 API 빈 응답: measure=%s",
-                measure,
+                "Daum 선물 투자주체별 매매동향 API 빈 응답 (lookback=%s)",
+                lookback_days,
             )
             return pd.DataFrame()
 
@@ -519,8 +631,8 @@ def fetch_daum_futures_investor_trend(
 
         if not parsed_rows:
             logger.warning(
-                "Daum 선물 수급 API 파싱 결과가 비어 있습니다: measure=%s",
-                measure,
+                "Daum 선물 수급 API 파싱 결과가 비어 있습니다 (lookback=%s)",
+                lookback_days,
             )
             return pd.DataFrame()
 
@@ -546,21 +658,12 @@ def fetch_daum_futures_investor_trend(
             numeric_only=True
         )
 
-        # type=PRICE 응답은 원 단위이므로 억 원 단위로 변환합니다.
-        divisor = 100_000_000 if measure == "PRICE" else 1
-        unit = "억 원" if measure == "PRICE" else "계약"
-        measure_label = "금액" if measure == "PRICE" else "계약수"
-
         records = []
 
         for label, field in DAUM_FUTURES_CATEGORY_MAP:
-            raw_today = float(today_row.get(field, 0.0) or 0.0)
-            raw_5d = float(cum_5d.get(field, 0.0) or 0.0)
-            raw_20d = float(cum_20d.get(field, 0.0) or 0.0)
-
-            net_today = raw_today / divisor
-            net_5d = raw_5d / divisor
-            net_20d = raw_20d / divisor
+            net_today = float(today_row.get(field, 0.0) or 0.0)
+            net_5d = float(cum_5d.get(field, 0.0) or 0.0)
+            net_20d = float(cum_20d.get(field, 0.0) or 0.0)
 
             # 포지션 성향은 최근 20거래일 누적값을 기준으로 판단합니다.
             if net_20d > 0:
@@ -570,14 +673,9 @@ def fetch_daum_futures_investor_trend(
             else:
                 stance = "⚪ 중립"
 
-            if measure == "PRICE":
-                net_today = round(net_today, 1)
-                net_5d = round(net_5d, 1)
-                net_20d = round(net_20d, 1)
-            else:
-                net_today = int(net_today)
-                net_5d = int(net_5d)
-                net_20d = int(net_20d)
+            net_today = int(net_today)
+            net_5d = int(net_5d)
+            net_20d = int(net_20d)
 
             records.append({
                 "투자 주체": label,
@@ -591,16 +689,15 @@ def fetch_daum_futures_investor_trend(
 
         # 뷰에서 토글별 표기·포맷을 결정하는 데 사용합니다.
         df_result["is_placeholder"] = False
-        df_result["data_measure"] = measure
-        df_result["data_unit"] = unit
+        df_result["data_measure"] = "CONTRACT"
+        df_result["data_unit"] = "계약"
         df_result["data_date"] = str(
             today_row.get("date", "")
         )[:10]
 
         logger.info(
             "Daum 선물 투자주체별 매매동향 수집 성공: "
-            "measure=%s, rows=%s, 기준일=%s",
-            measure_label,
+            "계약수 기준, rows=%s, 기준일=%s",
             len(df_result),
             today_row.get("date"),
         )
@@ -609,9 +706,8 @@ def fetch_daum_futures_investor_trend(
 
     except Exception as e:
         logger.warning(
-            "Daum 선물 투자주체별 매매동향 수집 실패: "
-            "measure=%s, error=%s",
-            measure,
+            "Daum 선물 투자주체별 매매동향 수집 실패: lookback=%s, error=%s",
+            lookback_days,
             e,
         )
         return pd.DataFrame()
@@ -620,6 +716,35 @@ def fetch_daum_futures_investor_trend(
 # ==============================================================================
 # 5. 주체별(외인/기관/개인) 선물 수급 요약 — Daum 실데이터 실패 시 폴백 placeholder
 # ==============================================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_daum_futures_investor_trend(
+    lookback_days: int = 25,
+) -> pd.DataFrame:
+    """
+    화면용 진입점. 저장본 우선.
+
+    Daum 내부 JSON API는 조회 기간별로 응답이 달라 스냅샷 키에 기간을
+    포함합니다. 일별 확정치라 수집기 주기(1시간)로 충분합니다.
+
+    required_columns를 지정해, 금액 모드를 쓰던 예전 스키마의 저장본이
+    남아 있어도 그대로 화면에 오지 않고 다시 수집하게 합니다.
+    """
+    def _collect():
+        return collect_daum_futures_investor_trend(lookback_days)
+
+    df = store.cached_or_live(
+        datasets.snap_daum_futures_trend(lookback_days),
+        _collect,
+        max_age_seconds=datasets.MAX_AGE_DAILY,
+        as_frame=True,
+        required_columns=(
+            "투자 주체", "당일 순매수", "5일 누적", "20일 누적",
+            "포지션 성향", "is_placeholder", "data_measure",
+        ),
+    )
+    return df if df is not None else pd.DataFrame()
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_krx_investor_derivatives_summary() -> pd.DataFrame:
     """
@@ -765,7 +890,7 @@ def fetch_daum_futures_intraday_acceleration(
     }
 
     try:
-        response = requests.get(
+        response = get_session().get(
             DAUM_FUTURES_INVESTOR_TIMES_URL,
             headers=headers,
             params=params,

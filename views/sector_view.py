@@ -5,7 +5,6 @@ views/sector_view.py
 """
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 import pandas as pd
 from datetime import datetime
 from config import SECTOR_ETFS, ASSET_CLASS_ETFS
@@ -80,6 +79,18 @@ def normalize_cumulative_return(series: pd.Series, lookback_days: int | None = N
     return ((clean / base) - 1) * 100
 
 
+def _fmt_pct(value) -> str:
+    """
+    수익률(%)을 메트릭 delta 문자열로 포맷합니다.
+
+    표본이 부족한 신규 상장 ETF는 수익률이 NaN으로 들어오므로,
+    "+nan%" 대신 "N/A"로 표시해 '보합'과 혼동되지 않게 합니다.
+    """
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value):+.2f}%"
+
+
 def render_sector_view():
     st.title("🔄 섹터 & 자산군 로테이션 맵 (Sector Momentum & Rotation)")
     st.caption("S&P 500 11대 섹터 및 글로벌 핵심 자산군의 단기/중기 자금 이동과 주도 섹터(공격 vs 방어)를 모니터링합니다.")
@@ -122,9 +133,9 @@ def render_sector_view():
     best_ytd = sector_df.sort_values(by="YTD", ascending=False).iloc[0]
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("최근 1개월 1등 주도 섹터", f"{best_1m['name'].split()[0]} ({best_1m['ticker']})", f"{best_1m['1M']:+.2f}%")
-    m2.metric("최근 1개월 최하위 섹터", f"{worst_1m['name'].split()[0]} ({worst_1m['ticker']})", f"{worst_1m['1M']:+.2f}%")
-    m3.metric("올해(YTD) 1등 주도 섹터", f"{best_ytd['name'].split()[0]} ({best_ytd['ticker']})", f"{best_ytd['YTD']:+.2f}%")
+    m1.metric("최근 1개월 1등 주도 섹터", f"{best_1m['name'].split()[0]} ({best_1m['ticker']})", _fmt_pct(best_1m['1M']))
+    m2.metric("최근 1개월 최하위 섹터", f"{worst_1m['name'].split()[0]} ({worst_1m['ticker']})", _fmt_pct(worst_1m['1M']))
+    m3.metric("올해(YTD) 1등 주도 섹터", f"{best_ytd['name'].split()[0]} ({best_ytd['ticker']})", _fmt_pct(best_ytd['YTD']))
 
     st.divider()
 
@@ -171,7 +182,7 @@ def render_sector_view():
             yaxis_title="",
             margin=dict(l=20, r=50, t=40, b=20)
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width="stretch")
 
         # 제목 및 기준일 (회색 글씨 적용)
         st.markdown(
@@ -363,7 +374,7 @@ def render_sector_view():
                     plot_bgcolor="#0E1117",
                 )
 
-                st.plotly_chart(fig_trend, use_container_width=True, key="sector_relative_return_chart")
+                st.plotly_chart(fig_trend, width="stretch", key="sector_relative_return_chart")
 
                 # 하단 기간 성과 요약 표
                 summary_rows = []
@@ -400,7 +411,7 @@ def render_sector_view():
                             subset=["SPY 대비 초과 성과"],
                             cmap="RdYlGn",
                         ),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
 
@@ -431,7 +442,7 @@ def render_sector_view():
                 xaxis_title="수익률 (%)", yaxis_title="",
                 margin=dict(l=20, r=50, t=40, b=20)
             )
-            st.plotly_chart(fig_asset, use_container_width=True)
+            st.plotly_chart(fig_asset, width="stretch")
 
             # 제목 및 기준일 (회색 글씨 적용)
             st.markdown(
